@@ -1,29 +1,19 @@
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
-import { inferOpenAiCompatibleBiller, redactHomePathUserSegments } from "@paperclipai/adapter-utils";
+import { inferOpenAiCompatibleBiller } from "@paperclipai/adapter-utils";
 import { asString, asNumber, asBoolean, parseObject, readPaperclipRuntimeSkillEntries, resolvePaperclipDesiredSkillNames } from "@paperclipai/adapter-utils/server-utils";
-import { readFile } from "node:fs/promises";
+import { readFile, open as fsOpen, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import {
   parseOpenCodeJsonl,
   isOpenCodeUnknownSessionError,
   isOpenCodeStepLimitResult,
 } from "./parse.js";
-import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
-import { buildJobManifest, LARGE_PROMPT_THRESHOLD_BYTES } from "./job-manifest.js";
-import { LogLineDedupFilter } from "./log-dedup.js";
+import { getSelfPodInfo, getBatchApi, getCoreApi, getPvc, createPvc } from "./k8s-client.js";
+import { buildJobManifest, LARGE_PROMPT_THRESHOLD_BYTES, buildPodLogPath } from "./job-manifest.js";
 import type * as k8s from "@kubernetes/client-node";
-import { Writable } from "node:stream";
 
 const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
-const LOG_STREAM_RECONNECT_DELAY_MS = 3_000;
-const LOG_STREAM_RECONNECT_MAX_DELAY_MS = 30_000;
-const MAX_LOG_RECONNECT_ATTEMPTS = 50;
-// Upper bound on how long streamPodLogsOnce will wait after stopSignal fires
-// before force-returning, even if logApi.log has not yet resolved. Defensive
-// against the K8s client library not propagating writable.destroy() into an
-// abort of the underlying HTTP request.
-const LOG_STREAM_BAIL_TIMEOUT_MS = 3_000;
 const LOG_EXIT_COMPLETION_GRACE_MS = parseInt(process.env.LOG_EXIT_COMPLETION_GRACE_MS ?? "30000", 10);
 
 export function isK8s404(err: unknown): boolean {
@@ -161,226 +151,6 @@ async function waitForPod(
   throw new Error(`Timed out waiting for pod to be scheduled (${Math.round(timeoutMs / 1000)}s)`);
 }
 
-/**
- * Stream pod logs once via follow. Returns accumulated stdout when the
- * stream ends (container exit, API disconnect, or abort signal).
- */
-async function streamPodLogsOnce(
-  namespace: string,
-  podName: string,
-  onLog: AdapterExecutionContext["onLog"],
-  kubeconfigPath?: string,
-  sinceSeconds?: number,
-  dedup?: LogLineDedupFilter,
-  stopSignal?: { stopped: boolean },
-): Promise<string> {
-  const logApi = getLogApi(kubeconfigPath);
-  const chunks: string[] = [];
-
-  const writable = new Writable({
-    write(chunk: Buffer, _encoding, callback) {
-      const text = redactHomePathUserSegments(chunk.toString("utf-8"));
-      chunks.push(text);
-      const emitted = dedup ? dedup.filter(text) : text;
-      if (!emitted) {
-        callback();
-        return;
-      }
-      void onLog("stdout", emitted).then(() => callback(), callback);
-    },
-  });
-
-  // When the job completion signal fires, destroy the writable to abort the
-  // in-flight follow stream. Without this, logApi.log can hang indefinitely
-  // when the pod terminates without closing the HTTP connection cleanly.
-  let stopPoller: ReturnType<typeof setInterval> | null = null;
-  let bailTimer: ReturnType<typeof setTimeout> | null = null;
-  let bailResolve: (() => void) | null = null;
-  const bailPromise = new Promise<void>((resolve) => {
-    bailResolve = resolve;
-  });
-  if (stopSignal) {
-    stopPoller = setInterval(() => {
-      if (stopSignal.stopped) {
-        if (!writable.destroyed) writable.destroy();
-        if (!bailTimer && bailResolve) {
-          bailTimer = setTimeout(() => {
-            onLog("stderr", "[paperclip] Log stream bail timer fired — forcing return\n").catch(() => {});
-            bailResolve!();
-          }, LOG_STREAM_BAIL_TIMEOUT_MS);
-        }
-      }
-    }, 200);
-  }
-
-  const logPromise = logApi.log(namespace, podName, "opencode", writable, {
-    follow: true,
-    pretty: false,
-    ...(sinceSeconds ? { sinceSeconds } : {}),
-  }).catch(() => {
-    // follow may fail if the container already exited, the API connection
-    // dropped, or we aborted via writable.destroy() — not fatal.
-  });
-
-  try {
-    if (stopSignal) {
-      await Promise.race([logPromise, bailPromise]);
-    } else {
-      await logPromise;
-    }
-  } finally {
-    if (stopPoller) clearInterval(stopPoller);
-    if (bailTimer) clearTimeout(bailTimer);
-  }
-
-  return chunks.join("");
-}
-
-/**
- * Stream pod logs with automatic reconnection. Keeps retrying the log
- * stream until the stop signal fires (job completed) or the container
- * exits normally. This handles silent K8s API connection drops that
- * would otherwise cause the UI to stop receiving real output.
- *
- * Capped at MAX_LOG_RECONNECT_ATTEMPTS to prevent infinite reconnect
- * loops during sustained API partitions.
- *
- * onFirstStreamExit is called the first time streamPodLogsOnce returns.
- * Used by execute() to start the LOG_EXIT_COMPLETION_GRACE_MS grace timer
- * without waiting for all reconnects to exhaust.
- */
-async function streamPodLogs(
-  namespace: string,
-  podName: string,
-  onLog: AdapterExecutionContext["onLog"],
-  kubeconfigPath?: string,
-  stopSignal?: { stopped: boolean },
-  dedup?: LogLineDedupFilter,
-  onFirstStreamExit?: () => void,
-): Promise<string> {
-  const allChunks: string[] = [];
-  let attempt = 0;
-  // Track the timestamp of the last successfully received log line so
-  // reconnects use a tight window instead of an ever-growing one anchored
-  // at stream start. This is the primary fix for duplicative logs on reconnect.
-  let lastLogReceivedAt = Math.floor(Date.now() / 1000);
-  if (!dedup) dedup = new LogLineDedupFilter();
-
-  while (!stopSignal?.stopped) {
-    if (attempt >= MAX_LOG_RECONNECT_ATTEMPTS) {
-      await onLog("stderr", `[paperclip] Log stream: max reconnect attempts (${MAX_LOG_RECONNECT_ATTEMPTS}) reached — giving up.\n`);
-      break;
-    }
-
-    // On reconnect, ask for logs since the last received line (+5s buffer)
-    // instead of since stream start. This keeps the window tight and
-    // avoids ever-growing duplicate output.
-    const sinceSeconds = attempt > 0
-      ? Math.max(1, Math.floor(Date.now() / 1000) - lastLogReceivedAt + 5)
-      : undefined;
-
-    if (attempt > 0) {
-      await onLog("stdout", `[paperclip] Log stream disconnected — reconnecting (attempt ${attempt}/${MAX_LOG_RECONNECT_ATTEMPTS})...\n`);
-    }
-
-    const preStreamTs = Math.floor(Date.now() / 1000);
-    const result = await streamPodLogsOnce(namespace, podName, onLog, kubeconfigPath, sinceSeconds, dedup, stopSignal);
-    // Signal first stream exit immediately so the grace-period timer in
-    // execute() can start without waiting for all reconnects to complete.
-    if (attempt === 0) onFirstStreamExit?.();
-    if (result) {
-      allChunks.push(result);
-      // Update last-received timestamp to now (the stream just ended,
-      // so any log lines in `result` were received up to this moment).
-      lastLogReceivedAt = Math.floor(Date.now() / 1000);
-    } else if (attempt === 0) {
-      // First attempt returned nothing — update timestamp so reconnect
-      // window stays reasonable.
-      lastLogReceivedAt = preStreamTs;
-    }
-    attempt++;
-
-    if (stopSignal?.stopped) break;
-
-    // Exponential backoff before reconnecting: start at 3s, double each
-    // attempt, cap at 30s. Avoids hammering the API server during prolonged
-    // network hiccups while staying responsive for brief disconnects.
-    // Sleep in 200ms chunks so a stop signal can interrupt the backoff
-    // without waiting for the full delay to expire.
-    const backoffMs = Math.min(
-      LOG_STREAM_RECONNECT_MAX_DELAY_MS,
-      LOG_STREAM_RECONNECT_DELAY_MS * 2 ** (attempt - 1),
-    );
-    const backoffDeadline = Date.now() + backoffMs;
-    while (!stopSignal?.stopped) {
-      const remaining = backoffDeadline - Date.now();
-      if (remaining <= 0) break;
-      await new Promise<void>((resolve) => setTimeout(resolve, Math.min(200, remaining)));
-    }
-  }
-
-  // Flush any buffered partial line so the final assistant/result chunk
-  // isn't dropped when the stream ends mid-line.
-  const tail = dedup.flush();
-  if (tail) await onLog("stdout", tail);
-
-  return allChunks.join("");
-}
-
-async function readPodLogs(
-  namespace: string,
-  podName: string,
-  kubeconfigPath?: string,
-): Promise<string> {
-  const coreApi = getCoreApi(kubeconfigPath);
-  try {
-    const log = await coreApi.readNamespacedPodLog({
-      name: podName,
-      namespace,
-      container: "opencode",
-    });
-    return typeof log === "string" ? log : "";
-  } catch {
-    return "";
-  }
-}
-
-/**
- * Wait until the named pod's phase transitions to Succeeded, Failed, or Unknown,
- * or until the pod is gone (404). Returns immediately if the pod is already in a
- * terminal phase. Used as a pre-flight before readPodLogs when the K8s log stream
- * returns empty while the container is still running (Node.js stdout buffering +
- * the @kubernetes/client-node v1.x follow-stream known premature-close issue).
- */
-async function waitForPodTermination(
-  namespace: string,
-  podName: string,
-  timeoutMs: number,
-  onLog: AdapterExecutionContext["onLog"],
-  kubeconfigPath?: string,
-): Promise<void> {
-  const coreApi = getCoreApi(kubeconfigPath);
-  const deadline = Date.now() + timeoutMs;
-  let notified = false;
-  while (Date.now() < deadline) {
-    try {
-      const pod = await coreApi.readNamespacedPod({ name: podName, namespace });
-      const phase = pod.status?.phase;
-      if (phase === "Succeeded" || phase === "Failed" || phase === "Unknown") return;
-      if (!notified) {
-        notified = true;
-        await onLog(
-          "stdout",
-          `[paperclip] Container still running — waiting up to ${Math.round(timeoutMs / 1000)}s for it to exit to capture output...\n`,
-        );
-      }
-    } catch {
-      return; // Pod gone (404) — nothing left to wait for
-    }
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
-  }
-}
-
 export type JobCompletionResult = { succeeded: boolean; timedOut: boolean; jobGone: boolean };
 
 async function waitForJobCompletion(
@@ -392,7 +162,10 @@ async function waitForJobCompletion(
   const batchApi = getBatchApi(kubeconfigPath);
   const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : 0;
 
-  while (deadline === 0 || Date.now() < deadline) {
+  while (true) {
+    if (deadline > 0 && Date.now() >= deadline) {
+      return { succeeded: false, timedOut: true, jobGone: false };
+    }
     let job: Awaited<ReturnType<typeof batchApi.readNamespacedJob>>;
     try {
       job = await batchApi.readNamespacedJob({ name: jobName, namespace });
@@ -413,8 +186,6 @@ async function waitForJobCompletion(
 
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
   }
-
-  return { succeeded: false, timedOut: true, jobGone: false };
 }
 
 export async function completionWithGrace(
@@ -451,12 +222,105 @@ async function getPodTerminatedInfo(
   };
 }
 
+interface TailOptions {
+  onLog: AdapterExecutionContext["onLog"];
+  stopSignal: { stopped: boolean };
+}
+
+/**
+ * Tail the pod's stdout log file from the shared PVC.
+ *
+ * Polls the file system with adaptive cadence: 250 ms while the file is
+ * growing, backing off to 1000 ms when idle for 5 consecutive polls.
+ * Buffers partial lines and emits complete lines to onLog.
+ */
+export async function tailPodLogFile(
+  filePath: string,
+  opts: TailOptions,
+): Promise<string> {
+  const { onLog, stopSignal } = opts;
+  const FILE_WAIT_TIMEOUT_MS = 30_000;
+  const POLL_ACTIVE_MS = 250;
+  const POLL_IDLE_MS = 1000;
+  const IDLE_THRESHOLD = 5; // consecutive idle polls before backing off
+
+  // Wait up to 30s for the file to appear
+  const waitDeadline = Date.now() + FILE_WAIT_TIMEOUT_MS;
+  while (Date.now() < waitDeadline) {
+    try {
+      await import("node:fs/promises").then((fs) => fs.stat(filePath));
+      break; // file exists
+    } catch {
+      if (stopSignal.stopped) return "";
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    }
+  }
+
+  // Check one more time before opening
+  let fh: FileHandle;
+  try {
+    fh = await fsOpen(filePath, "r");
+  } catch {
+    throw new Error(`Pod log file never appeared at ${filePath}`);
+  }
+
+  let offset = 0;
+  let pending = "";
+  let idleCount = 0;
+  const accumulator: string[] = [];
+
+  try {
+    while (!stopSignal.stopped) {
+      const pollMs = idleCount >= IDLE_THRESHOLD ? POLL_IDLE_MS : POLL_ACTIVE_MS;
+      await new Promise((r) => setTimeout(r, pollMs));
+      if (stopSignal.stopped) break;
+
+      let size: number;
+      try {
+        const stat = await fh.stat();
+        size = stat.size;
+      } catch {
+        break;
+      }
+
+      if (size > offset) {
+        const buf = Buffer.alloc(size - offset);
+        const { bytesRead } = await fh.read(buf, 0, buf.length, offset);
+        offset += bytesRead;
+        idleCount = 0;
+
+        const chunk = buf.slice(0, bytesRead).toString("utf-8");
+        const lineParts = (pending + chunk).split("\n");
+        pending = lineParts.pop() ?? "";
+
+        for (const line of lineParts) {
+          await onLog("stdout", line + "\n");
+          accumulator.push(line + "\n");
+        }
+      } else {
+        idleCount++;
+      }
+    }
+
+    // Final drain on stop
+    if (pending) {
+      await onLog("stdout", pending + "\n");
+      accumulator.push(pending + "\n");
+    }
+  } finally {
+    await fh.close();
+  }
+
+  return accumulator.join("");
+}
+
 async function cleanupJob(
   namespace: string,
   jobName: string,
   onLog: AdapterExecutionContext["onLog"],
   kubeconfigPath?: string,
   promptSecretName?: string,
+  podLogPath?: string,
 ): Promise<void> {
   try {
     const batchApi = getBatchApi(kubeconfigPath);
@@ -477,12 +341,18 @@ async function cleanupJob(
       // best-effort — Secret may already be GC'd via ownerReference
     }
   }
+  if (podLogPath) {
+    try {
+      const { unlink } = await import("node:fs/promises");
+      await unlink(podLogPath);
+    } catch {
+      // non-fatal
+    }
+  }
 }
 
 /**
- * Stream logs + await completion for an already-created Job, then harvest
- * and return the execution result. Used by both the normal create-then-run
- * path and the orphaned-job reattach path.
+ * Tail the pod log file and await completion for an already-created Job.
  */
 async function streamAndAwaitJob(
   ctx: AdapterExecutionContext,
@@ -492,6 +362,7 @@ async function streamAndAwaitJob(
   graceSec: number,
   kubeconfigPath: string | undefined,
   retainJobs: boolean,
+  podLogPath: string,
   promptSecretName?: string,
 ): Promise<AdapterExecutionResult> {
   const { onLog } = ctx;
@@ -524,8 +395,7 @@ async function streamAndAwaitJob(
     }
 
     const completionTimeoutMs = timeoutSec > 0 ? (timeoutSec + graceSec) * 1000 : 0;
-    const logStopSignal = { stopped: false };
-    const logDedup = new LogLineDedupFilter();
+    const stopSignal = { stopped: false };
 
     const issueId = asString(ctx.context.issueId ?? ctx.context.taskId, "").trim();
     let lastLogAt = Date.now();
@@ -557,17 +427,13 @@ async function streamAndAwaitJob(
       })();
     }, KEEPALIVE_INTERVAL_MS);
 
-    // External cancel poll: watches Paperclip issue status at keepalive cadence.
-    // Polls GET /api/issues/{issueId} (not /api/heartbeat-runs) because the adapter
-    // key has read access to issues but not to the internal heartbeat-runs endpoint.
-    // Uses await-setTimeout (not setInterval+void) so vi.advanceTimersByTimeAsync
-    // can drive it in tests. Fire-and-forget; exits when logStopSignal.stopped.
+    // External cancel poll
     void (async (): Promise<void> => {
       const apiUrl = process.env.PAPERCLIP_API_URL;
       if (!apiUrl || !issueId) return;
-      while (!logStopSignal.stopped && !cancelSignal.cancelled) {
+      while (!stopSignal.stopped && !cancelSignal.cancelled) {
         await new Promise<void>((resolve) => setTimeout(resolve, KEEPALIVE_INTERVAL_MS));
-        if (logStopSignal.stopped || cancelSignal.cancelled) break;
+        if (stopSignal.stopped || cancelSignal.cancelled) break;
         try {
           const apiKey = ctx.authToken ?? "";
           const resp = await fetch(`${apiUrl}/api/issues/${issueId}`, {
@@ -577,7 +443,7 @@ async function streamAndAwaitJob(
             const data = await resp.json() as { status?: string };
             if (typeof data.status === "string" && data.status === "cancelled") {
               cancelSignal.cancelled = true;
-              logStopSignal.stopped = true;
+              stopSignal.stopped = true;
               try {
                 await getBatchApi(kubeconfigPath).deleteNamespacedJob({
                   name: jobName,
@@ -596,110 +462,22 @@ async function streamAndAwaitJob(
       return onLog(stream, chunk);
     };
 
-    let logExitTime: number | null = null;
-    const trackedLogStream = streamPodLogs(
-      namespace, podName, wrappedOnLog, kubeconfigPath, logStopSignal, logDedup,
-      () => { logExitTime = Date.now(); },
-    );
+    const tailResult = await tailPodLogFile(podLogPath, { onLog: wrappedOnLog, stopSignal });
+    stdout = tailResult;
 
-    let gracePoller: ReturnType<typeof setInterval> | null = null;
-    // Maximum wall-clock time the grace poller will defer to pod-liveness checks.
-    // When completionTimeoutMs is 0 (unlimited job), cap at 20 minutes so we
-    // don't wait forever if the pod never exits but K8s never marks the job done.
-    const graceMaxWaitMs = completionTimeoutMs > 0 ? completionTimeoutMs : 20 * 60_000;
-    const graceStartTime = Date.now();
-    const completionGraced = new Promise<JobCompletionResult>((resolve, reject) => {
-      let settled = false;
-      let graceCheckPending = false;
-      const settleOk = (r: JobCompletionResult) => {
-        if (settled) return;
-        settled = true;
-        if (gracePoller) { clearInterval(gracePoller); gracePoller = null; }
-        logStopSignal.stopped = true;
-        resolve(r);
-      };
-      const settleErr = (err: unknown) => {
-        if (settled) return;
-        settled = true;
-        if (gracePoller) { clearInterval(gracePoller); gracePoller = null; }
-        logStopSignal.stopped = true;
-        reject(err);
-      };
-      waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath).then(settleOk).catch(settleErr);
-      gracePoller = setInterval(() => {
-        if (graceCheckPending || settled) return;
-        if (logExitTime !== null && Date.now() - logExitTime >= LOG_EXIT_COMPLETION_GRACE_MS) {
-          graceCheckPending = true;
-          void (async () => {
-            try {
-              // If we haven't exceeded the max wait, check whether the pod is still running.
-              // The K8s log client v1.x closes the follow-stream prematurely even when the
-              // container is still executing — the log exit does not mean the job is done.
-              if (Date.now() - graceStartTime < graceMaxWaitMs) {
-                try {
-                  const pod = await getCoreApi(kubeconfigPath).readNamespacedPod({ name: podName, namespace });
-                  const phase = pod.status?.phase;
-                  if (phase === "Running" || phase === "Pending") {
-                    // Pod still alive — reset the grace deadline and keep waiting
-                    logExitTime = Date.now();
-                    return;
-                  }
-                } catch {
-                  // Pod gone (404) or K8s error — fall through to settleOk
-                }
-              }
-              void onLog("stdout", `[paperclip] Log stream exited ${LOG_EXIT_COMPLETION_GRACE_MS / 1000}s ago without K8s Job condition update — proceeding with captured output\n`).catch(() => {});
-              settleOk({ succeeded: false, timedOut: false, jobGone: true });
-            } finally {
-              graceCheckPending = false;
-            }
-          })();
-        }
-      }, 1_000);
-    });
-
-    const [logResult, completionResult] = await Promise.allSettled([
-      trackedLogStream,
-      completionGraced,
-    ]);
+    // Wait for job completion (may already be done by the time we read the file)
+    const completionPromise = waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath);
+    const completionGraced = completionWithGrace(completionPromise, LOG_EXIT_COMPLETION_GRACE_MS);
+    const completion = await completionGraced;
 
     if (keepaliveTimer) {
       clearInterval(keepaliveTimer);
       keepaliveTimer = null;
     }
 
-    if (logResult.status === "fulfilled") {
-      stdout = logResult.value;
-    }
-
-    if (!stdout.trim()) {
-      await onLog("stdout", `[paperclip] Log stream returned empty — reading pod logs directly...\n`);
-      // The K8s client v1.x has a known issue where follow-stream closes prematurely,
-      // causing the log stream to return empty even when the container is still running.
-      // Node.js also buffers stdout when writing to a pipe, so logs only flush on exit.
-      // Wait for the pod to actually terminate before attempting to read its final output.
-      await waitForPodTermination(namespace, podName, 120_000, onLog, kubeconfigPath);
-      stdout = await readPodLogs(namespace, podName, kubeconfigPath);
-      if (stdout.trim()) {
-        await onLog("stdout", stdout);
-      }
-    } else if (!parseOpenCodeJsonl(stdout).sessionId) {
-      await onLog("stdout", `[paperclip] Partial stdout missing session result — reading pod logs directly...\n`);
-      const fallbackLogs = await readPodLogs(namespace, podName, kubeconfigPath);
-      if (fallbackLogs.trim()) {
-        stdout = fallbackLogs;
-        await onLog("stdout", fallbackLogs);
-      }
-    }
-
-    if (completionResult.status === "fulfilled") {
-      const completion = completionResult.value;
-      jobTimedOut = completion.timedOut;
-      if (completion.jobGone) {
-        await onLog("stdout", `[paperclip] Job ${jobName} not found (likely TTL-cleaned after completion).\n`);
-      }
-    } else {
-      jobTimedOut = true;
+    jobTimedOut = completion.timedOut;
+    if (completion.jobGone) {
+      await onLog("stdout", `[paperclip] Job ${jobName} not found (likely TTL-cleaned after completion).\n`);
     }
 
     const terminatedInfo = await getPodTerminatedInfo(namespace, jobName, kubeconfigPath);
@@ -712,7 +490,7 @@ async function streamAndAwaitJob(
     }
     activeJobs.delete(jobName);
     if (!retainJobs) {
-      await cleanupJob(namespace, jobName, onLog, kubeconfigPath, promptSecretName);
+      await cleanupJob(namespace, jobName, onLog, kubeconfigPath, promptSecretName, podLogPath);
     } else {
       await onLog("stdout", `[paperclip] Retaining job ${jobName} for debugging (retainJobs=true)\n`);
     }
@@ -947,9 +725,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   try {
     // Guard: single concurrency per agent (shared PVC/session) — fail-closed.
-    // When a concurrent job is detected, wait for it to finish and retry once rather
-    // than returning k8s_concurrent_run_blocked immediately (which caused permanent
-    // blocked state for all but the first task in a simultaneous batch assignment).
     let waitedForConcurrent = false;
     while (true) {
       try {
@@ -962,8 +737,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           (j) => !j.status?.conditions?.some((c) => (c.type === "Complete" || c.type === "Failed") && c.status === "True"),
         );
         if (running.length > 0) {
-          // Separate Jobs matching the current task (orphaned from a prior server instance)
-          // from Jobs belonging to a different concurrent task.
           const sameTaskJobs = taskId
             ? running.filter((j) => j.metadata?.labels?.["paperclip.io/task-id"] === taskId)
             : [];
@@ -971,7 +744,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
           if (otherJobs.length > 0) {
             if (waitedForConcurrent) {
-              // Already waited once — give up to avoid an infinite loop.
               const names = otherJobs.map((j) => j.metadata?.name).join(", ");
               await onLog("stderr", `[paperclip] Concurrent run blocked: existing Job(s) still running for this agent: ${names}\n`);
               return {
@@ -984,8 +756,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             }
             const names = otherJobs.map((j) => j.metadata?.name).join(", ");
             await onLog("stdout", `[paperclip] Waiting for concurrent Job(s) to finish before starting: ${names}\n`);
-            // Wait up to the configured job timeout (+ grace + buffer); for unlimited jobs
-            // cap at 1 hour so we don't block the mutex indefinitely.
             const concurrentWaitMs = timeoutSec > 0
               ? (timeoutSec + graceSec + 120) * 1000
               : 60 * 60_000;
@@ -1005,7 +775,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             if (reattachOrphanedJobs) {
               await onLog("stdout", `[paperclip] Reattaching to orphaned Job ${orphanJobName} from prior server instance (task: ${taskId})...\n`);
               activeJobs.set(orphanJobName, { namespace: guardNamespace, kubeconfigPath });
-              return streamAndAwaitJob(ctx, orphanJobName, guardNamespace, timeoutSec, graceSec, kubeconfigPath, retainJobs);
+              // Reattach needs podLogPath — compute it here for the orphaned job
+              const podLogPath = buildPodLogPath(ctx.agent.companyId, agentId, ctx.runId);
+              return streamAndAwaitJob(ctx, orphanJobName, guardNamespace, timeoutSec, graceSec, kubeconfigPath, retainJobs, podLogPath);
             }
             await onLog("stderr", `[paperclip] Orphaned Job ${orphanJobName} found for this task but reattachOrphanedJobs is disabled.\n`);
             return {
@@ -1031,7 +803,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       break; // no blocking jobs — proceed to job creation
     }
 
-  // Read agent instructions file (instructionsFilePath config field → system prompt prepend)
+  // Read agent instructions file
   const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
   let instructionsContent = "";
   if (instructionsFilePath) {
@@ -1042,12 +814,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
   }
 
-  // Resolve and read desired skill content (injected into prompt bundle)
+  // Resolve and read desired skill content
   let skillsBundleContent = "";
   try {
     const moduleDir = import.meta.dirname;
-    // Add the standard Paperclip skills dir as an additional candidate — the relative
-    // candidates in adapter-utils don't resolve to the PVC-mounted skills home.
     const paperclipSkillsHome = "/paperclip/.claude/skills";
     const availableEntries = await readPaperclipRuntimeSkillEntries(config, moduleDir, [paperclipSkillsHome]);
     const desiredSkillKeys = resolvePaperclipDesiredSkillNames(config, availableEntries);
@@ -1056,8 +826,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const entry = availableEntries.find((e) => e.key === key);
       if (entry?.source) {
         try {
-          // entry.source from listPaperclipSkillEntries is a directory; read SKILL.md from it.
-          // Fall back to reading entry.source directly for file-based paperclipRuntimeSkills entries.
           let text: string;
           try {
             text = (await readFile(path.join(entry.source, "SKILL.md"), "utf-8")).trim();
@@ -1075,7 +843,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // non-fatal: skill bundle is optional
   }
 
-  // Ensure per-agent DB PVC exists (or get null for ephemeral mode)
+  // Ensure per-agent DB PVC exists
   let agentDbClaimName: string | null | undefined;
   try {
     agentDbClaimName = await ensureAgentDbPvc(agentId, guardNamespace, config, kubeconfigPath);
@@ -1100,10 +868,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     retainJobs,
   };
   const firstBuild = buildJobManifest(buildArgs);
-  const { jobName, namespace, prompt, opencodeArgs, promptMetrics } = firstBuild;
+  const { jobName, namespace, prompt, opencodeArgs, promptMetrics, podLogPath } = firstBuild;
 
-  // For prompts larger than the threshold, store in a K8s Secret so the PodSpec
-  // stays within the 1 MiB API limit. The init container mounts and copies the file.
+  // For prompts larger than the threshold, store in a K8s Secret
   let promptSecretName: string | undefined;
   let job = firstBuild.job;
   if (Buffer.byteLength(prompt, "utf-8") > LARGE_PROMPT_THRESHOLD_BYTES) {
@@ -1130,7 +897,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const batchApi = getBatchApi(kubeconfigPath);
 
-  // Create the prompt Secret before the Job so the init container can mount it.
+  // Create the prompt Secret before the Job
   if (promptSecretName) {
     const coreApi = getCoreApi(kubeconfigPath);
     const promptSecret: k8s.V1Secret = {
@@ -1177,7 +944,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   }
 
-  // Set ownerReference on the prompt Secret so K8s GC deletes it when the Job is removed.
+  // Set ownerReference on the prompt Secret
   if (promptSecretName && createdJob?.metadata?.uid) {
     try {
       const coreApi = getCoreApi(kubeconfigPath);
@@ -1200,7 +967,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         } as k8s.V1Secret,
       });
     } catch {
-      // non-fatal — Secret will still be removed by cleanupJob in the finally block
+      // non-fatal
     }
   }
 
@@ -1209,9 +976,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     await onLog("stdout", `[paperclip] Created K8s Job: ${jobName} in namespace ${namespace} (deadline: ${timeoutSec > 0 ? `${timeoutSec}s` : "none"})\n`);
 
-    // return evaluates streamAndAwaitJob() (creating the promise) before finally runs,
-    // so the mutex releases as soon as the job is registered — not after the full lifecycle.
-    return streamAndAwaitJob(ctx, jobName, namespace, timeoutSec, graceSec, kubeconfigPath, retainJobs, promptSecretName);
+    return streamAndAwaitJob(ctx, jobName, namespace, timeoutSec, graceSec, kubeconfigPath, retainJobs, podLogPath, promptSecretName);
   } finally {
     releaseLock();
   }
