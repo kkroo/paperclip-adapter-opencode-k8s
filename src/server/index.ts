@@ -34,7 +34,11 @@ export function createServerAdapter(): ServerAdapterModule {
         maxSessionAgeHours: 24,
       },
     },
-  };
+    // Tells the reaper to skip local PID checks and use the staleness-based
+    // liveness window instead (adapter spawns K8s Jobs in separate pods).
+    // Cast required: adapter-utils ServerAdapterModule type predates this field.
+    hasOutOfProcessLiveness: true,
+  } as ServerAdapterModule;
 }
 
 export { execute, testEnvironment, sessionCodec };

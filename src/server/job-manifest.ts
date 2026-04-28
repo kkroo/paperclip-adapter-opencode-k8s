@@ -17,6 +17,17 @@ import type { SelfPodInfo } from "./k8s-client.js";
 
 export const LARGE_PROMPT_THRESHOLD_BYTES = 256 * 1024;
 
+function assertSafePathComponent(field: string, value: string): void {
+  // Allow alphanumeric, hyphens, and colons (UUIDs like "550e8400-e29b-41d4-a716-446655440000")
+  if (!/^[a-zA-Z0-9-:]+$/.test(value)) {
+    throw new Error(`Invalid ${field} for log path: ${value}`);
+  }
+}
+
+export function buildPodLogPath(companyId: string, agentId: string, runId: string): string {
+  return `/paperclip/instances/default/run-logs/${companyId}/${agentId}/${runId}.pod.ndjson`;
+}
+
 export interface JobBuildInput {
   ctx: AdapterExecutionContext;
   selfPod: SelfPodInfo;
@@ -45,6 +56,7 @@ export interface JobBuildResult {
   prompt: string;
   opencodeArgs: string[];
   promptMetrics: Record<string, number>;
+  podLogPath: string;
 }
 
 /**
@@ -219,6 +231,13 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const { runId, agent, runtime, config: rawConfig, context, onLog } = ctx;
   const warnLabel = (msg: string) => void onLog("stderr", msg).catch(() => {});
   const config = parseObject(rawConfig);
+
+  // Validate path components for log file safety
+  const companyId = agent.companyId;
+  const agentId = agent.id;
+  assertSafePathComponent("companyId", companyId);
+  assertSafePathComponent("agentId", agentId);
+  assertSafePathComponent("runId", runId);
 
   const namespace = asString(config.namespace, "") || selfPod.namespace;
   const image = asString(config.image, "") || selfPod.image;
@@ -401,12 +420,13 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
 
   // Build the main container command
   // 1. Optionally write opencode runtime config for permission bypass
-  // 2. Pipe prompt into opencode
+  // 2. Pipe prompt into opencode, tee stdout to the shared PVC log file
+  const podLogPath = buildPodLogPath(companyId, agentId, runId);
   const opencodeArgsEscaped = opencodeArgs.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(" ");
   const configSetup = runtimeConfigJson
     ? `mkdir -p ~/.config/opencode && echo '${runtimeConfigJson.replace(/'/g, "'\\''")}' > ~/.config/opencode/opencode.json && `
     : "";
-  const mainCommand = `${configSetup}cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped}`;
+  const mainCommand = `${configSetup}cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee ${podLogPath}`;
 
   const job: k8s.V1Job = {
     apiVersion: "batch/v1",
@@ -441,14 +461,14 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
               imagePullPolicy: "IfNotPresent",
               ...(input.promptSecretName
                 ? {
-                    command: ["sh", "-c", "cp /tmp/prompt-secret/prompt /tmp/prompt/prompt.txt"],
+                    command: ["sh", "-c", `mkdir -p /paperclip/instances/default/run-logs/${companyId}/${agentId} && cp /tmp/prompt-secret/prompt /tmp/prompt/prompt.txt`],
                     volumeMounts: [
                       { name: "prompt", mountPath: "/tmp/prompt" },
                       { name: "prompt-secret", mountPath: "/tmp/prompt-secret", readOnly: true },
                     ],
                   }
                 : {
-                    command: ["sh", "-c", "printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt"],
+                    command: ["sh", "-c", `mkdir -p /paperclip/instances/default/run-logs/${companyId}/${agentId} && printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt`],
                     env: [{ name: "PROMPT_CONTENT", value: prompt }],
                     volumeMounts: [{ name: "prompt", mountPath: "/tmp/prompt" }],
                   }),
@@ -479,5 +499,5 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     },
   };
 
-  return { job, jobName, namespace, prompt, opencodeArgs, promptMetrics };
+  return { job, jobName, namespace, prompt, opencodeArgs, promptMetrics, podLogPath };
 }
