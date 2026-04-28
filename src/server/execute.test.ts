@@ -6,26 +6,31 @@ import { buildJobManifest, buildPodLogPath } from "./job-manifest.js";
 
 // Mock node:fs/promises to prevent tailPodLogFile (used by execute()) from
 // hanging on unmocked fs.stat calls in test environment.
-// stat returns size 17; read returns 17 bytes once then 0 bytes (EOF)
-// so the tail loop reads the "file" once and exits when offset==size.
-vi.mock("node:fs/promises", () => {
-  let readCount = 0;
+// vi.hoisted creates shared module-level state; beforeEach resets it so every
+// test gets a clean first-read-success.
+const { readMock, resetFsMocks } = vi.hoisted(() => {
+  let readOffset = 0;
   return {
-    stat: vi.fn().mockResolvedValue({ size: 17 }),
-    open: vi.fn().mockResolvedValue({
-      stat: vi.fn().mockResolvedValue({ size: 17 }),
-      read: vi.fn().mockImplementation(async () => {
-        readCount++;
-        if (readCount === 1) {
-          return { bytesRead: 17, buffer: Buffer.from('{"type":"text"}\n') };
-        }
-        return { bytesRead: 0, buffer: Buffer.alloc(0) };
-      }),
-      close: vi.fn().mockResolvedValue(undefined),
+    readMock: vi.fn().mockImplementation(async () => {
+      if (readOffset === 0) {
+        readOffset = 17;
+        return { bytesRead: 17, buffer: Buffer.from('{"type":"text"}\n') };
+      }
+      return { bytesRead: 0, buffer: Buffer.alloc(0) };
     }),
-    unlink: vi.fn().mockResolvedValue(undefined),
+    resetFsMocks: () => { readOffset = 0; },
   };
 });
+
+vi.mock("node:fs/promises", () => ({
+  stat: vi.fn().mockResolvedValue({ size: 17 }),
+  open: vi.fn().mockResolvedValue({
+    stat: vi.fn().mockResolvedValue({ size: 17 }),
+    read: readMock,
+    close: vi.fn().mockResolvedValue(undefined),
+  }),
+  unlink: vi.fn().mockResolvedValue(undefined),
+}));
 
 vi.mock("./k8s-client.js", () => ({
   getSelfPodInfo: vi.fn(),
@@ -154,6 +159,7 @@ function makeCoreApi(
 
 beforeEach(() => {
   vi.clearAllMocks();
+  resetFsMocks();
 
   vi.mocked(getSelfPodInfo).mockResolvedValue(MOCK_SELF_POD as ReturnType<typeof getSelfPodInfo> extends Promise<infer T> ? T : never);
   vi.mocked(buildJobManifest).mockReturnValue({
