@@ -44,6 +44,10 @@ export function parseModelProvider(model: string | null): string | null {
   return trimmed.slice(0, trimmed.indexOf("/")).trim() || null;
 }
 
+function isTransientVolumeSchedulingMessage(message: string): boolean {
+  return /unbound immediate persistentvolumeclaims|waiting for a volume|pvc|persistentvolumeclaim|volume.*bind/i.test(message);
+}
+
 async function waitForPod(
   namespace: string,
   jobName: string,
@@ -58,6 +62,7 @@ async function waitForPod(
   await onLog("stdout", `[paperclip] Waiting for pod to be scheduled (job: ${jobName})...\n`);
 
   let lastStatus = "";
+  let lastUnschedulableMessage = "";
   while (Date.now() < deadline) {
     const podList = await coreApi.listNamespacedPod({
       namespace,
@@ -127,8 +132,13 @@ async function waitForPod(
     );
     if (unschedulable) {
       const msg = unschedulable.message ?? "insufficient resources";
-      if (/pvc|volume|bind|mount/i.test(msg)) {
-        throw new Error(`PVC bind failed: ${msg}`);
+      if (isTransientVolumeSchedulingMessage(msg)) {
+        if (msg !== lastUnschedulableMessage) {
+          await onLog("stdout", `[paperclip] Waiting for PVC/volume binding before scheduling: ${msg}\n`);
+          lastUnschedulableMessage = msg;
+        }
+        await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+        continue;
       }
       throw new Error(`Pod unschedulable: ${msg}`);
     }

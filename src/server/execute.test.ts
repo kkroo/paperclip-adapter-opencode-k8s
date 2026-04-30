@@ -509,6 +509,54 @@ describe("execute — pod scheduling failure", () => {
 
     expect(result.errorCode).toBe("k8s_pod_schedule_failed");
   });
+
+  it("waits through transient PVC binding before the pod schedules", async () => {
+    const coreApi = makeCoreApi();
+    coreApi.listNamespacedPod = vi.fn()
+      .mockResolvedValueOnce({
+        items: [
+          {
+            metadata: { name: POD_NAME },
+            status: {
+              phase: "Pending",
+              conditions: [
+                {
+                  type: "PodScheduled",
+                  status: "False",
+                  reason: "Unschedulable",
+                  message: "0/5 nodes are available: pod has unbound immediate PersistentVolumeClaims. not found",
+                },
+              ],
+            },
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        items: [{ metadata: { name: POD_NAME }, status: { phase: "Running" } }],
+      })
+      .mockResolvedValueOnce({
+        items: [
+          {
+            status: {
+              containerStatuses: [
+                { name: "opencode", state: { terminated: { exitCode: 0 } } },
+              ],
+            },
+          },
+        ],
+      });
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+    const ctx = makeCtx();
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.errorCode).toBeUndefined();
+    expect(ctx.onLog).toHaveBeenCalledWith(
+      "stdout",
+      expect.stringContaining("Waiting for PVC/volume binding before scheduling"),
+    );
+  });
 });
 
 describe("execute — happy path", () => {

@@ -1,6 +1,6 @@
 {
   "name": "paperclip-adapter-opencode-k8s",
-  "version": "0.1.38-kkroo.1",
+  "version": "0.1.38-kkroo.2",
   "description": "Paperclip adapter plugin that runs OpenCode agents as Kubernetes Jobs",
   "license": "MIT",
   "type": "module",
