@@ -359,8 +359,9 @@ describe("init container is unchanged by agentDbClaimName", () => {
   it("does not add extra env vars to init container for dedicated PVC mode", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, agentDbClaimName: "opencode-db-agent-abc" });
     const initCmd = result.job.spec?.template?.spec?.initContainers?.[0].command;
-    // mkdir is added for log directory but OPENCODE_DB_PATH env var is NOT added
-    expect(initCmd?.[2]).toContain("mkdir");
+    // init container only writes the prompt; no mkdir (log dir exists on PVC) and no OPENCODE_DB_PATH env var
+    expect(initCmd?.[2]).not.toContain("mkdir");
+    expect(initCmd?.[2]).toContain("/tmp/prompt/prompt.txt");
     const initEnv = result.job.spec?.template?.spec?.initContainers?.[0].env ?? [];
     expect(initEnv.some((e) => e.name === "OPENCODE_DB_PATH")).toBe(false);
   });

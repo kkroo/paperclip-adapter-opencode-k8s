@@ -269,40 +269,45 @@ export async function tailPodLogFile(
   let idleCount = 0;
   const accumulator: string[] = [];
 
+  const drain = async (): Promise<boolean> => {
+    let size: number;
+    try {
+      const stat = await fh.stat();
+      size = stat.size;
+    } catch {
+      return false;
+    }
+    if (size <= offset) return false;
+    const buf = Buffer.alloc(size - offset);
+    const { bytesRead } = await fh.read(buf, 0, buf.length, offset);
+    offset += bytesRead;
+    const chunk = buf.slice(0, bytesRead).toString("utf-8");
+    const lineParts = (pending + chunk).split("\n");
+    pending = lineParts.pop() ?? "";
+    for (const line of lineParts) {
+      await onLog("stdout", line + "\n");
+      accumulator.push(line + "\n");
+    }
+    return bytesRead > 0;
+  };
+
   try {
     while (!stopSignal.stopped) {
-      const pollMs = idleCount >= IDLE_THRESHOLD ? POLL_IDLE_MS : POLL_ACTIVE_MS;
-      await new Promise((r) => setTimeout(r, pollMs));
-      if (stopSignal.stopped) break;
-
-      let size: number;
-      try {
-        const stat = await fh.stat();
-        size = stat.size;
-      } catch {
-        break;
-      }
-
-      if (size > offset) {
-        const buf = Buffer.alloc(size - offset);
-        const { bytesRead } = await fh.read(buf, 0, buf.length, offset);
-        offset += bytesRead;
+      const grew = await drain();
+      if (grew) {
         idleCount = 0;
-
-        const chunk = buf.slice(0, bytesRead).toString("utf-8");
-        const lineParts = (pending + chunk).split("\n");
-        pending = lineParts.pop() ?? "";
-
-        for (const line of lineParts) {
-          await onLog("stdout", line + "\n");
-          accumulator.push(line + "\n");
-        }
       } else {
         idleCount++;
       }
+      if (stopSignal.stopped) break;
+      const pollMs = idleCount >= IDLE_THRESHOLD ? POLL_IDLE_MS : POLL_ACTIVE_MS;
+      await new Promise((r) => setTimeout(r, pollMs));
     }
 
-    // Final drain on stop
+    // Final drain after stopSignal — pick up any bytes written between the
+    // last read and the job reaching terminal state.
+    while (await drain()) { /* read until no more growth */ }
+
     if (pending) {
       await onLog("stdout", pending + "\n");
       accumulator.push(pending + "\n");
@@ -462,13 +467,22 @@ async function streamAndAwaitJob(
       return onLog(stream, chunk);
     };
 
-    const tailResult = await tailPodLogFile(podLogPath, { onLog: wrappedOnLog, stopSignal });
-    stdout = tailResult;
-
-    // Wait for job completion (may already be done by the time we read the file)
-    const completionPromise = waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath);
+    // Run the file tail and the job-completion poll in parallel so that the
+    // tail loop has a way to stop: when waitForJobCompletion resolves it sets
+    // stopSignal.stopped, which lets tailPodLogFile drain and return.
+    const completionPromise = waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath)
+      .then((r) => { stopSignal.stopped = true; return r; });
     const completionGraced = completionWithGrace(completionPromise, LOG_EXIT_COMPLETION_GRACE_MS);
-    const completion = await completionGraced;
+    const [tailSettled, completionSettled] = await Promise.allSettled([
+      tailPodLogFile(podLogPath, { onLog: wrappedOnLog, stopSignal }),
+      completionGraced,
+    ]);
+    stdout = tailSettled.status === "fulfilled" ? tailSettled.value : "";
+    if (completionSettled.status === "rejected") {
+      stopSignal.stopped = true;
+      throw completionSettled.reason;
+    }
+    const completion = completionSettled.value;
 
     if (keepaliveTimer) {
       clearInterval(keepaliveTimer);

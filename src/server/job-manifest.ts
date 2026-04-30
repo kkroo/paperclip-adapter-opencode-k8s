@@ -25,7 +25,7 @@ function assertSafePathComponent(field: string, value: string): void {
 }
 
 export function buildPodLogPath(companyId: string, agentId: string, runId: string): string {
-  return `/paperclip/instances/default/run-logs/${companyId}/${agentId}/${runId}.pod.ndjson`;
+  return `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/${runId}.pod.ndjson`;
 }
 
 export interface JobBuildInput {
@@ -461,14 +461,14 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
               imagePullPolicy: "IfNotPresent",
               ...(input.promptSecretName
                 ? {
-                    command: ["sh", "-c", `mkdir -p /paperclip/instances/default/run-logs/${companyId}/${agentId} && cp /tmp/prompt-secret/prompt /tmp/prompt/prompt.txt`],
+                    command: ["sh", "-c", `cp /tmp/prompt-secret/prompt /tmp/prompt/prompt.txt`],
                     volumeMounts: [
                       { name: "prompt", mountPath: "/tmp/prompt" },
                       { name: "prompt-secret", mountPath: "/tmp/prompt-secret", readOnly: true },
                     ],
                   }
                 : {
-                    command: ["sh", "-c", `mkdir -p /paperclip/instances/default/run-logs/${companyId}/${agentId} && printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt`],
+                    command: ["sh", "-c", `printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt`],
                     env: [{ name: "PROMPT_CONTENT", value: prompt }],
                     volumeMounts: [{ name: "prompt", mountPath: "/tmp/prompt" }],
                   }),
