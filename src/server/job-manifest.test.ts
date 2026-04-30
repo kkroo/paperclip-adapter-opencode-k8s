@@ -300,8 +300,8 @@ describe("buildJobManifest", () => {
   it("label values are sanitized to [a-z0-9._-]", () => {
     const ctx = {
       ...mockCtx,
-      agent: { ...mockCtx.agent, id: "Agent_ID/123", companyId: "Co:456" },
-      runId: "Run@789",
+      agent: { ...mockCtx.agent, id: "agent-id-123", companyId: "company-456" },
+      runId: "run-789",
     };
     const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
 
@@ -386,10 +386,12 @@ describe("agentDbClaimName — volume wiring", () => {
 });
 
 describe("init container is unchanged by agentDbClaimName", () => {
-  it("does not add mkdir or extra env vars to init container for dedicated PVC mode", () => {
+  it("does not add extra env vars to init container for dedicated PVC mode", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, agentDbClaimName: "opencode-db-agent-abc" });
     const initCmd = result.job.spec?.template?.spec?.initContainers?.[0].command;
+    // init container only writes the prompt; no mkdir (log dir exists on PVC) and no OPENCODE_DB_PATH env var
     expect(initCmd?.[2]).not.toContain("mkdir");
+    expect(initCmd?.[2]).toContain("/tmp/prompt/prompt.txt");
     const initEnv = result.job.spec?.template?.spec?.initContainers?.[0].env ?? [];
     expect(initEnv.some((e) => e.name === "OPENCODE_DB_PATH")).toBe(false);
   });
