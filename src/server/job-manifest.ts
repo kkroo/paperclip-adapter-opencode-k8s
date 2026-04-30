@@ -400,13 +400,27 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   };
 
   // Build the main container command
-  // 1. Optionally write opencode runtime config for permission bypass
-  // 2. Pipe prompt into opencode
+  // 1. Refresh OAuth credentials via ccrotate so opencode reads fresh codex auth
+  // 2. Optionally write opencode runtime config for permission bypass
+  // 3. Pipe prompt into opencode
+  //
+  // The codex auth file on the shared PVC may contain an expired access token
+  // (codex tokens expire ~30-60 min after issue and the paperclip pod doesn't
+  // refresh them automatically). Without a per-Job refresh, opencode in the
+  // Job pod fails authentication whenever the cached token is past expiry.
+  //
+  // `snap --force` saves the current account's just-refreshed tokens back to
+  // the codex profile (cron-equivalent of the Stop hook). `next --yes` then
+  // rotates: --yes is required because Job pods have no stdin, so without it
+  // ccrotate prompts and hangs/exits when all accounts are at extra usage.
+  // Failure is non-fatal: if ccrotate isn't on PATH or all accounts are
+  // exhausted, we still try opencode with whatever credentials are on disk.
   const opencodeArgsEscaped = opencodeArgs.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(" ");
+  const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate snap --force --target codex >/dev/null 2>&1; ccrotate next --yes --target codex >/dev/null 2>&1) || true`;
   const configSetup = runtimeConfigJson
     ? `mkdir -p ~/.config/opencode && echo '${runtimeConfigJson.replace(/'/g, "'\\''")}' > ~/.config/opencode/opencode.json && `
     : "";
-  const mainCommand = `${configSetup}cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped}`;
+  const mainCommand = `${ccrotateRefresh}; ${configSetup}cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped}`;
 
   const job: k8s.V1Job = {
     apiVersion: "batch/v1",
