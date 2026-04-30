@@ -555,3 +555,105 @@ describe("buildJobManifest — volume wiring branches", () => {
     expect(mounts.find((m) => m.name === "tls")).toEqual({ name: "tls", mountPath: "/etc/tls", readOnly: true });
   });
 });
+
+describe("buildJobManifest — MCP fleet wiring", () => {
+  it("emits no OPENCODE_CONFIG and no opencode.json init step when no baseline + no per-agent override", () => {
+    // The shared /paperclip/.mcp.json is absent in the test environment
+    // (loadSharedMcpBaseline returns {} on read failure), and config.mcpServers
+    // is empty. Result: opencode falls back to ~/.config/opencode/opencode.json
+    // exactly as before.
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+    const mainEnv = result.job.spec!.template.spec!.containers[0]!.env ?? [];
+    expect(mainEnv.find((e) => e.name === "OPENCODE_CONFIG")).toBeUndefined();
+    const init = result.job.spec!.template.spec!.initContainers![0]!;
+    const initEnvNames = (init.env ?? []).map((e) => e.name);
+    expect(initEnvNames).not.toContain("OPENCODE_CONFIG_JSON");
+    const initCmd = (init.command ?? []).join(" ");
+    expect(initCmd).not.toContain("opencode.json");
+  });
+
+  it("translates per-agent mcpServers (claude shape + native opencode shape) and ships OPENCODE_CONFIG", () => {
+    const ctx: JobBuildInput["ctx"] = {
+      ...mockCtx,
+      config: {
+        mcpServers: {
+          // claude shape: split command + args
+          paperclip: {
+            command: "node",
+            args: ["/app/packages/mcp-server/dist/stdio.js"],
+          },
+          // claude shape with env
+          github: {
+            command: "/usr/local/bin/github-mcp-server",
+            args: ["stdio"],
+            env: { LOG_LEVEL: "info" },
+          },
+          // claude http
+          prometheus: {
+            type: "http",
+            url: "http://prometheus-mcp-server.paperclip.svc.cluster.local:8080/mcp",
+          },
+          // claude sse — translates to remote (best-effort)
+          kubernetes: {
+            type: "sse",
+            url: "http://kubernetes-mcp-server-admin.paperclip.svc.cluster.local:8080/sse",
+          },
+          // already-opencode shape — pass through
+          figma: {
+            type: "remote",
+            url: "http://figma-mcp-server.paperclip.svc.cluster.local:8080/mcp",
+          },
+        },
+      },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+
+    const mainEnv = result.job.spec!.template.spec!.containers[0]!.env ?? [];
+    expect(mainEnv.find((e) => e.name === "OPENCODE_CONFIG")?.value).toBe("/tmp/prompt/opencode.json");
+
+    const init = result.job.spec!.template.spec!.initContainers![0]!;
+    const cfgEnv = (init.env ?? []).find((e) => e.name === "OPENCODE_CONFIG_JSON");
+    expect(cfgEnv).toBeDefined();
+    const parsed = JSON.parse(cfgEnv!.value!) as {
+      $schema: string;
+      permission: { external_directory: string };
+      mcp: Record<string, Record<string, unknown>>;
+    };
+    expect(parsed.$schema).toBe("https://opencode.ai/config.json");
+    expect(parsed.permission.external_directory).toBe("allow");
+
+    // claude split → opencode merged array
+    expect(parsed.mcp.paperclip).toEqual({
+      type: "local",
+      command: ["node", "/app/packages/mcp-server/dist/stdio.js"],
+    });
+
+    // env carried through as `environment`
+    expect(parsed.mcp.github).toEqual({
+      type: "local",
+      command: ["/usr/local/bin/github-mcp-server", "stdio"],
+      environment: { LOG_LEVEL: "info" },
+    });
+
+    // http → remote
+    expect(parsed.mcp.prometheus).toEqual({
+      type: "remote",
+      url: "http://prometheus-mcp-server.paperclip.svc.cluster.local:8080/mcp",
+    });
+
+    // sse → remote (lossy translation, documented)
+    expect(parsed.mcp.kubernetes).toEqual({
+      type: "remote",
+      url: "http://kubernetes-mcp-server-admin.paperclip.svc.cluster.local:8080/sse",
+    });
+
+    // already-opencode shape passes through
+    expect(parsed.mcp.figma).toEqual({
+      type: "remote",
+      url: "http://figma-mcp-server.paperclip.svc.cluster.local:8080/mcp",
+    });
+
+    const initCmd = (init.command ?? []).join(" ");
+    expect(initCmd).toContain('printf \'%s\' "$OPENCODE_CONFIG_JSON" > /tmp/prompt/opencode.json');
+  });
+});

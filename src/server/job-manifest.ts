@@ -1,4 +1,5 @@
 import { createHash } from "crypto";
+import { readFileSync } from "node:fs";
 import type * as k8s from "@kubernetes/client-node";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import {
@@ -14,6 +15,76 @@ import {
   renderPaperclipWakePrompt,
 } from "@paperclipai/adapter-utils/server-utils";
 import type { SelfPodInfo } from "./k8s-client.js";
+
+/**
+ * Path to the project-scope .mcp.json that paperclip's helm-chart seed-init
+ * writes on every pod start (claude-style schema). The opencode adapter
+ * runs inside the paperclip StatefulSet pod, which mounts the same
+ * /paperclip PVC the Job pods will mount, so reading this path here gives
+ * us the same baseline the claude_k8s adapter uses. We translate it into
+ * opencode's `mcp` schema (different from claude's `mcpServers`) and ship
+ * it via OPENCODE_CONFIG.
+ */
+const SHARED_MCP_BASELINE_PATH = "/paperclip/.mcp.json";
+
+function loadSharedMcpBaseline(): Record<string, unknown> {
+  try {
+    const raw = readFileSync(SHARED_MCP_BASELINE_PATH, "utf8");
+    const parsed = JSON.parse(raw) as { mcpServers?: unknown };
+    if (parsed && typeof parsed === "object" && parsed.mcpServers && typeof parsed.mcpServers === "object") {
+      return parsed.mcpServers as Record<string, unknown>;
+    }
+  } catch {
+    // Missing / unreadable / malformed baseline → start from empty.
+  }
+  return {};
+}
+
+/**
+ * Translate one MCP server entry from claude's .mcp.json schema into
+ * opencode's opencode.json `mcp` schema. The two schemas express the
+ * same intent with different field names:
+ *   claude  {command: "X", args: [...], env: {...}}
+ *     -> opencode {type: "local", command: ["X", ...args], environment: {...}}
+ *   claude  {type: "http", url: "..."} / {type: "sse", url: "..."}
+ *     -> opencode {type: "remote", url: "..."}
+ * SSE entries are emitted as remote — opencode's MCP client may surface a
+ * per-server transport error if it can't negotiate SSE; the rest of the
+ * fleet stays usable.
+ *
+ * Already-opencode-shaped entries (have `type: "local" | "remote"`) pass
+ * through unchanged so per-agent adapterConfig.mcpServers can be authored
+ * directly in opencode's native schema when the operator prefers it.
+ */
+function translateMcpEntryToOpencode(spec: unknown): Record<string, unknown> | null {
+  if (!spec || typeof spec !== "object") return null;
+  const s = spec as Record<string, unknown>;
+  if (s.type === "local" || s.type === "remote") {
+    return s;
+  }
+  if (typeof s.command === "string") {
+    const args = Array.isArray(s.args) ? (s.args as unknown[]).filter((x): x is string => typeof x === "string") : [];
+    const out: Record<string, unknown> = {
+      type: "local",
+      command: [s.command as string, ...args],
+    };
+    if (s.env && typeof s.env === "object") out.environment = s.env;
+    return out;
+  }
+  if (typeof s.url === "string") {
+    return { type: "remote", url: s.url };
+  }
+  return null;
+}
+
+function buildOpencodeMcpSection(merged: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [name, raw] of Object.entries(merged)) {
+    const translated = translateMcpEntryToOpencode(raw);
+    if (translated) out[name] = translated;
+  }
+  return out;
+}
 
 export const LARGE_PROMPT_THRESHOLD_BYTES = 256 * 1024;
 
@@ -333,6 +404,36 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     }
   }
 
+  // MCP fleet for this Job. Reads paperclip's seed-init baseline at
+  // /paperclip/.mcp.json (claude schema) and translates to opencode's
+  // schema, then spread-merges per-agent overrides from
+  // adapterConfig.mcpServers (operator can author in either schema —
+  // already-opencode-shaped entries pass through unchanged). The merged
+  // result is materialized into /tmp/prompt/opencode.json by the
+  // write-prompt init container, and OPENCODE_CONFIG points opencode at
+  // it. When the merged set is empty (no baseline + no overrides) we
+  // emit nothing — opencode falls back to ~/.config/opencode/opencode.json
+  // exactly as before.
+  const perAgentMcpServers = parseObject(config.mcpServers);
+  const baselineMcpServers = loadSharedMcpBaseline();
+  const mergedMcpServers = { ...baselineMcpServers, ...perAgentMcpServers };
+  const opencodeMcpSection = buildOpencodeMcpSection(mergedMcpServers);
+  const opencodeConfigJson =
+    Object.keys(opencodeMcpSection).length > 0
+      ? JSON.stringify({
+          $schema: "https://opencode.ai/config.json",
+          // permission.external_directory mirrors the chart-baseline at
+          // /paperclip/.config/opencode/opencode.json so we don't lose
+          // the "allow access outside cwd" behavior when overriding via
+          // OPENCODE_CONFIG (opencode does not merge config sources).
+          permission: { external_directory: "allow" },
+          mcp: opencodeMcpSection,
+        })
+      : null;
+  if (opencodeConfigJson) {
+    envVars.push({ name: "OPENCODE_CONFIG", value: "/tmp/prompt/opencode.json" });
+  }
+
   // Runtime config for permissions
   const runtimeConfigJson = buildRuntimeConfigJson(config);
 
@@ -471,31 +572,43 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
           ...(selfPod.dnsConfig ? { dnsConfig: selfPod.dnsConfig } : {}),
           ...(Object.keys(nodeSelector).length > 0 ? { nodeSelector: nodeSelector as Record<string, string> } : {}),
           ...(tolerations.length > 0 ? { tolerations: tolerations as k8s.V1Toleration[] } : {}),
-          initContainers: [
-            {
+          initContainers: [(() => {
+            // Build the init container command + env. Always writes prompt.txt;
+            // when an MCP fleet was assembled (baseline or per-agent override),
+            // also writes the merged opencode.json next to it. opencode.json is
+            // small (a few kB) so it travels via env var even when prompt itself
+            // goes the Secret-volume route.
+            const cmdParts = input.promptSecretName
+              ? ["cp /tmp/prompt-secret/prompt /tmp/prompt/prompt.txt"]
+              : [`printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt`];
+            const initEnv: k8s.V1EnvVar[] = input.promptSecretName
+              ? []
+              : [{ name: "PROMPT_CONTENT", value: prompt }];
+            if (opencodeConfigJson) {
+              cmdParts.push(`printf '%s' \"$OPENCODE_CONFIG_JSON\" > /tmp/prompt/opencode.json`);
+              initEnv.push({ name: "OPENCODE_CONFIG_JSON", value: opencodeConfigJson });
+            }
+            const initVolumeMounts: k8s.V1VolumeMount[] = [
+              { name: "prompt", mountPath: "/tmp/prompt" },
+            ];
+            if (input.promptSecretName) {
+              initVolumeMounts.push({ name: "prompt-secret", mountPath: "/tmp/prompt-secret", readOnly: true });
+            }
+            const initContainer: k8s.V1Container = {
               name: "write-prompt",
               image: "busybox:1.36",
               imagePullPolicy: "IfNotPresent",
-              ...(input.promptSecretName
-                ? {
-                    command: ["sh", "-c", `cp /tmp/prompt-secret/prompt /tmp/prompt/prompt.txt`],
-                    volumeMounts: [
-                      { name: "prompt", mountPath: "/tmp/prompt" },
-                      { name: "prompt-secret", mountPath: "/tmp/prompt-secret", readOnly: true },
-                    ],
-                  }
-                : {
-                    command: ["sh", "-c", `printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt`],
-                    env: [{ name: "PROMPT_CONTENT", value: prompt }],
-                    volumeMounts: [{ name: "prompt", mountPath: "/tmp/prompt" }],
-                  }),
+              command: ["sh", "-c", cmdParts.join("; ")],
+              ...(initEnv.length > 0 ? { env: initEnv } : {}),
+              volumeMounts: initVolumeMounts,
               securityContext,
               resources: {
                 requests: { cpu: "10m", memory: "16Mi" },
                 limits: { cpu: "100m", memory: "64Mi" },
               },
-            },
-          ],
+            };
+            return initContainer;
+          })()],
           containers: [
             {
               name: "opencode",
