@@ -228,8 +228,11 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const timeoutSec = asNumber(config.timeoutSec, 0);
   const ttlSeconds = asNumber(config.ttlSecondsAfterFinished, 300);
   const resources = parseObject(config.resources);
-  const nodeSelector = parseKeyValueOrObject(config.nodeSelector);
-  const tolerations = Array.isArray(config.tolerations) ? config.tolerations : [];
+  const hasConfigKey = (key: string) => Object.prototype.hasOwnProperty.call(config, key);
+  const configuredNodeSelector = parseKeyValueOrObject(config.nodeSelector);
+  const nodeSelector = hasConfigKey("nodeSelector") ? configuredNodeSelector : selfPod.nodeSelector;
+  const configuredTolerations = Array.isArray(config.tolerations) ? config.tolerations : [];
+  const tolerations = hasConfigKey("tolerations") ? configuredTolerations : selfPod.tolerations;
   const extraLabels = parseKeyValueOrObject(config.labels);
 
   // Resolve working directory

@@ -29,6 +29,8 @@ const MOCK_SELF_POD = {
   namespace: "test-ns",
   image: "test-image:latest",
   imagePullSecrets: [],
+  nodeSelector: {},
+  tolerations: [],
   dnsConfig: undefined,
   pvcClaimName: null,
   secretVolumes: [],

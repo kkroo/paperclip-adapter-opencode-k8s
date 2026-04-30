@@ -188,6 +188,8 @@ describe("getSelfPodInfo", () => {
         ],
         imagePullSecrets: [{ name: "registry-creds" }, { name: "" }, {}],
         dnsConfig: { nameservers: ["10.0.0.10"] },
+        nodeSelector: { workload: "paperclip" },
+        tolerations: [{ key: "dedicated", operator: "Equal", value: "paperclip", effect: "NoSchedule" }],
         ...overrides,
       },
     };
@@ -209,6 +211,10 @@ describe("getSelfPodInfo", () => {
     // imagePullSecrets with empty name are filtered out
     expect(info.imagePullSecrets).toEqual([{ name: "registry-creds" }]);
     expect(info.dnsConfig).toEqual({ nameservers: ["10.0.0.10"] });
+    expect(info.nodeSelector).toEqual({ workload: "paperclip" });
+    expect(info.tolerations).toEqual([
+      { key: "dedicated", operator: "Equal", value: "paperclip", effect: "NoSchedule" },
+    ]);
     expect(mockReadNamespacedPod).toHaveBeenCalledWith({ name: HOSTNAME, namespace: NAMESPACE });
   });
 
