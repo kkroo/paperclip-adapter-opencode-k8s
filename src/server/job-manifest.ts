@@ -554,7 +554,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const configSetup = runtimeConfigJson
     ? `mkdir -p ~/.config/opencode && echo '${runtimeConfigJson.replace(/'/g, "'\\''")}' > ~/.config/opencode/opencode.json && `
     : "";
-  const mainCommand = `${ccrotateRefresh}; ${configSetup}cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee ${podLogPath}`;
+  // `set -o pipefail` so an opencode binary crash surfaces as a non-zero
+  // shell exit code instead of being masked by tee's exit code. Mirrors
+  // the claude_k8s adapter's fix.
+  const mainCommand = `set -o pipefail; ${ccrotateRefresh}; ${configSetup}cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee ${podLogPath}`;
 
   const job: k8s.V1Job = {
     apiVersion: "batch/v1",
