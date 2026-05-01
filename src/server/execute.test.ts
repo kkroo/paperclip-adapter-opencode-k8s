@@ -1244,10 +1244,28 @@ describe("parseModelProvider", () => {
     expect(parseModelProvider(null)).toBeNull();
   });
 
-  it("returns null when model has no slash separator", async () => {
+  it("returns null for whitespace-only or empty input", async () => {
     const { parseModelProvider } = await import("./execute.js");
-    expect(parseModelProvider("gpt-4")).toBeNull();
     expect(parseModelProvider("  ")).toBeNull();
+    expect(parseModelProvider("")).toBeNull();
+  });
+
+  it("returns null for bare model ids that don't match a known prefix", async () => {
+    const { parseModelProvider } = await import("./execute.js");
+    expect(parseModelProvider("some-private-model")).toBeNull();
+    expect(parseModelProvider("custom123")).toBeNull();
+  });
+
+  it("infers provider from bare model id by name prefix", async () => {
+    const { parseModelProvider } = await import("./execute.js");
+    expect(parseModelProvider("gpt-4")).toBe("openai");
+    expect(parseModelProvider("gpt-5.5")).toBe("openai");
+    expect(parseModelProvider("o1-mini")).toBe("openai");
+    expect(parseModelProvider("o3")).toBe("openai");
+    expect(parseModelProvider("chatgpt-classic")).toBe("openai");
+    expect(parseModelProvider("claude-sonnet-4-6")).toBe("anthropic");
+    expect(parseModelProvider("opus")).toBe("anthropic");
+    expect(parseModelProvider("gemini-2.5-pro")).toBe("google");
   });
 
   it("returns the provider segment from a slash-separated model id", async () => {
