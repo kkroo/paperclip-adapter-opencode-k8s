@@ -532,15 +532,25 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // refresh them automatically). Without a per-Job refresh, opencode in the
   // Job pod fails authentication whenever the cached token is past expiry.
   //
-  // `snap --force` saves the current account's just-refreshed tokens back to
-  // the codex profile (cron-equivalent of the Stop hook). `next --yes` then
-  // rotates: --yes is required because Job pods have no stdin, so without it
-  // ccrotate prompts and hangs/exits when all accounts are at extra usage.
-  // Failure is non-fatal: if ccrotate isn't on PATH or all accounts are
-  // exhausted, we still try opencode with whatever credentials are on disk.
+  // Just `next --yes` — no pre-snap. The codex CLI's Stop-equivalent
+  // already snaps the active account's just-refreshed tokens at session
+  // end, so the previous Job's exit handles the normal save path. Doing
+  // an extra `snap --force` here under multiple-concurrent-Jobs raced
+  // with another Job's `next` mid-write of the active codex auth file;
+  // a pre-snap reading partial state then committed mismatched creds
+  // into a profile labeled with the previous account, clobbering tokens
+  // across unrelated profiles. Edge case lost: if a prior agent crashed
+  // without firing its snap path, its just-refreshed access token isn't
+  // saved — recoverable on the next switchTo via the refresh-token,
+  // costing one extra OAuth refresh.
+  // `--yes` is still required because Job pods have no stdin, so without
+  // it ccrotate prompts and hangs/exits when all accounts are at extra
+  // usage. Failure is non-fatal: if ccrotate isn't on PATH or all
+  // accounts are exhausted, we still try opencode with whatever
+  // credentials are on disk.
   const podLogPath = buildPodLogPath(companyId, agentId, runId);
   const opencodeArgsEscaped = opencodeArgs.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(" ");
-  const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate snap --force --target codex >/dev/null 2>&1; ccrotate next --yes --target codex >/dev/null 2>&1) || true`;
+  const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target codex >/dev/null 2>&1) || true`;
   const configSetup = runtimeConfigJson
     ? `mkdir -p ~/.config/opencode && echo '${runtimeConfigJson.replace(/'/g, "'\\''")}' > ~/.config/opencode/opencode.json && `
     : "";
