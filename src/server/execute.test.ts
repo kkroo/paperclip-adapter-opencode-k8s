@@ -1296,6 +1296,34 @@ describe("completionWithGrace", () => {
     const result = await completionWithGrace(Promise.reject(new Error("boom")), 1000);
     expect(result).toEqual({ succeeded: false, timedOut: true, jobGone: false });
   });
+
+  it("does not apply grace cap when graceMs <= 0 (no timeout configured) — BLO-2436", async () => {
+    const { completionWithGrace } = await import("./execute.js");
+    vi.useFakeTimers();
+    try {
+      const slowCompletion = new Promise<{ succeeded: boolean; timedOut: boolean; jobGone: boolean }>(
+        (resolve) => {
+          setTimeout(() => resolve({ succeeded: true, timedOut: false, jobGone: false }), 100_000);
+        },
+      );
+      const racePromise = completionWithGrace(slowCompletion, 0);
+      // Advance past what a buggy setTimeout(_, 0) would fire on, but well
+      // short of slowCompletion's 100s resolution.  After the fix, racePromise
+      // must still be pending — the grace cap must not have armed.
+      await vi.advanceTimersByTimeAsync(60_000);
+      const probe = await Promise.race([
+        racePromise.then(() => "race-resolved" as const),
+        Promise.resolve("still-pending" as const),
+      ]);
+      expect(probe).toBe("still-pending");
+      // Now let slowCompletion resolve and assert the underlying value passed through.
+      await vi.advanceTimersByTimeAsync(100_000);
+      const result = await racePromise;
+      expect(result).toEqual({ succeeded: true, timedOut: false, jobGone: false });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("execute — config edge paths", () => {
