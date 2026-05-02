@@ -714,4 +714,40 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
     const dataMount = mounts.find((m) => m.name === "data");
     expect(dataMount?.mountPath).toBe("/paperclip");
   });
+
+  describe("ccrotate preflight --accounts pool", () => {
+    it("appends --accounts to ccrotate when providers.openai.accounts is populated", () => {
+      const ctx = {
+        ...mockCtx,
+        config: {
+          providers: {
+            openai: { kind: "ccrotate", accounts: ["a@b.net", "c@d.net"] },
+          },
+        },
+      };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command;
+      expect(cmd?.[2]).toMatch(/ccrotate next --yes --target codex --accounts a@b\.net,c@d\.net/);
+    });
+
+    it("falls through to global ccrotate when providers is undefined", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command;
+      expect(cmd?.[2]).toMatch(/ccrotate next --yes --target codex(?! --accounts)/);
+    });
+
+    it("falls through to global ccrotate when only providers.anthropic is set (wrong key for opencode)", () => {
+      const ctx = {
+        ...mockCtx,
+        config: {
+          providers: {
+            anthropic: { kind: "ccrotate", accounts: ["x@y.net"] },
+          },
+        },
+      };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command;
+      expect(cmd?.[2]).not.toContain("--accounts");
+    });
+  });
 });

@@ -566,7 +566,20 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // credentials are on disk.
   const podLogPath = buildPodLogPath(companyId, agentId, runId);
   const opencodeArgsEscaped = opencodeArgs.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(" ");
-  const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target codex >/dev/null 2>&1) || true`;
+  // Phase G.5: per-env credential pool. When `providers.openai.accounts`
+  // is a non-empty string array (sourced from the resolved k8s execution
+  // target's environment config), pass it through as `--accounts <csv>` so
+  // ccrotate rotates only within the env's pool. Absent/empty preserves the
+  // existing global-rotation behavior bit-for-bit.
+  const openaiAccounts = Array.isArray(
+    (config.providers as { openai?: { accounts?: unknown } } | undefined)?.openai?.accounts,
+  )
+    ? ((config.providers as { openai: { accounts: unknown[] } }).openai.accounts as ReadonlyArray<unknown>).filter(
+        (s): s is string => typeof s === "string" && s.length > 0,
+      )
+    : [];
+  const accountsArg = openaiAccounts.length > 0 ? ` --accounts ${openaiAccounts.join(",")}` : "";
+  const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target codex${accountsArg} >/dev/null 2>&1) || true`;
   const configSetup = runtimeConfigJson
     ? `mkdir -p ~/.config/opencode && echo '${runtimeConfigJson.replace(/'/g, "'\\''")}' > ~/.config/opencode/opencode.json && `
     : "";
