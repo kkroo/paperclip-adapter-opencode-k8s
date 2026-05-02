@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { execute, ensureAgentDbPvc, tailPodLogFile } from "./execute.js";
+import { execute, ensureAgentDbPvc, tailPodLogFile, mergeEnvironmentConfig } from "./execute.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi, getPvc, createPvc } from "./k8s-client.js";
 import { buildJobManifest, buildPodLogPath } from "./job-manifest.js";
 
@@ -1666,3 +1666,145 @@ describe("execute — SIGTERM handler body (FAR-86 coverage)", () => {
 
 // tailPodLogFile tests deferred — requires file-system module isolation
 // not available in the shared test suite's vi.mock("node:fs/promises") setup
+
+describe("mergeEnvironmentConfig — Phase E.2 helper", () => {
+  it("returns adapter config unchanged when env config is undefined", () => {
+    const adapter = { foo: "a", bar: 1 };
+    expect(mergeEnvironmentConfig(adapter, undefined)).toEqual(adapter);
+  });
+
+  it("returns adapter config unchanged when env config is null", () => {
+    const adapter = { foo: "a", bar: 1 };
+    expect(mergeEnvironmentConfig(adapter, null)).toEqual(adapter);
+  });
+
+  it("env config wins for present fields", () => {
+    const adapter = { namespace: "adapter-ns", foo: "a" };
+    const env = { namespace: "env-ns" };
+    expect(mergeEnvironmentConfig(adapter, env)).toEqual({ namespace: "env-ns", foo: "a" });
+  });
+
+  it("skips null/undefined env values (does not clobber adapter config)", () => {
+    const adapter = { namespace: "adapter-ns", workspaceVolumeClaim: "adapter-claim" };
+    const env = { namespace: null, workspaceVolumeClaim: undefined, kubeconfig: "envcontent" };
+    const merged = mergeEnvironmentConfig(adapter, env);
+    expect(merged.namespace).toBe("adapter-ns");
+    expect(merged.workspaceVolumeClaim).toBe("adapter-claim");
+    expect(merged.kubeconfig).toBe("envcontent");
+  });
+
+  it("does not mutate either input", () => {
+    const adapter = { a: 1 };
+    const env = { a: 2 };
+    const merged = mergeEnvironmentConfig(adapter, env);
+    expect(adapter).toEqual({ a: 1 });
+    expect(env).toEqual({ a: 2 });
+    expect(merged).toEqual({ a: 2 });
+  });
+});
+
+describe("execute — environment.config (Phase E.2)", () => {
+  it("passes workspaceVolumeClaim from executionTarget to buildJobManifest", async () => {
+    const ctx = makeCtx();
+    (ctx as unknown as Record<string, unknown>).executionTarget = {
+      kind: "remote",
+      transport: "k8s",
+      remoteCwd: "/paperclip",
+      config: {
+        kubeconfig: null,
+        namespace: null,
+        workspaceVolumeClaim: "env-claim-name",
+        workspaceMountPath: null,
+        secretsNamespace: null,
+        nodeSelector: {},
+        tolerations: [],
+        labels: {},
+        serviceAccountName: null,
+        imagePullPolicy: null,
+        resources: null,
+      },
+    };
+
+    await execute(ctx);
+
+    expect(buildJobManifest).toHaveBeenCalledWith(
+      expect.objectContaining({ workspaceVolumeClaim: "env-claim-name" }),
+    );
+  });
+
+  it("passes workspaceMountPath from executionTarget to buildJobManifest", async () => {
+    const ctx = makeCtx();
+    (ctx as unknown as Record<string, unknown>).executionTarget = {
+      kind: "remote",
+      transport: "k8s",
+      remoteCwd: "/workspace",
+      config: {
+        kubeconfig: null,
+        namespace: null,
+        workspaceVolumeClaim: null,
+        workspaceMountPath: "/workspace",
+        secretsNamespace: null,
+        nodeSelector: {},
+        tolerations: [],
+        labels: {},
+        serviceAccountName: null,
+        imagePullPolicy: null,
+        resources: null,
+      },
+    };
+
+    await execute(ctx);
+
+    expect(buildJobManifest).toHaveBeenCalledWith(
+      expect.objectContaining({ workspaceMountPath: "/workspace" }),
+    );
+  });
+
+  it("environment namespace overrides adapter config namespace for downstream calls", async () => {
+    const ctx = makeCtx({ namespace: "adapter-ns" });
+    (ctx as unknown as Record<string, unknown>).executionTarget = {
+      kind: "remote",
+      transport: "k8s",
+      remoteCwd: "/paperclip",
+      config: {
+        kubeconfig: null,
+        namespace: "env-ns",
+        workspaceVolumeClaim: null,
+        workspaceMountPath: null,
+        secretsNamespace: null,
+        nodeSelector: {},
+        tolerations: [],
+        labels: {},
+        serviceAccountName: null,
+        imagePullPolicy: null,
+        resources: null,
+      },
+    };
+
+    await execute(ctx);
+
+    // The buildJobManifest stub's ctx config should have been merged with env config
+    const callArgs = vi.mocked(buildJobManifest).mock.calls[0]?.[0];
+    expect(callArgs?.ctx.config.namespace).toBe("env-ns");
+  });
+
+  it("does not override config when executionTarget is local", async () => {
+    const ctx = makeCtx({ namespace: "adapter-ns", workspaceVolumeClaim: "adapter-claim" });
+    (ctx as unknown as Record<string, unknown>).executionTarget = { kind: "local" };
+
+    await execute(ctx);
+
+    const callArgs = vi.mocked(buildJobManifest).mock.calls[0]?.[0];
+    expect(callArgs?.ctx.config.namespace).toBe("adapter-ns");
+    // workspaceVolumeClaim from adapter config is NOT plumbed when target isn't k8s
+    // (env-config wiring is gated on remote/k8s)
+    expect(callArgs?.workspaceVolumeClaim).toBeUndefined();
+  });
+
+  it("works when executionTarget is absent (legacy path)", async () => {
+    const ctx = makeCtx();
+    // No executionTarget at all
+    const result = await execute(ctx);
+    expect(result.exitCode).toBe(0);
+  });
+});

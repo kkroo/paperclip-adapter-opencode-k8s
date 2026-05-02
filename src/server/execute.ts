@@ -1,7 +1,8 @@
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { inferOpenAiCompatibleBiller } from "@paperclipai/adapter-utils";
 import { asString, asNumber, asBoolean, parseObject, readPaperclipRuntimeSkillEntries, resolvePaperclipDesiredSkillNames } from "@paperclipai/adapter-utils/server-utils";
-import { readFile, open as fsOpen, type FileHandle } from "node:fs/promises";
+import { readFile, open as fsOpen, writeFile as fsWriteFile, mkdtemp, type FileHandle } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   parseOpenCodeJsonl,
@@ -15,6 +16,75 @@ import type * as k8s from "@kubernetes/client-node";
 const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
 const LOG_EXIT_COMPLETION_GRACE_MS = parseInt(process.env.LOG_EXIT_COMPLETION_GRACE_MS ?? "30000", 10);
+
+/**
+ * Merge environment-supplied config (from a paperclip k8s execution target's
+ * `config` field) over the adapter's `adapter_config`. Environment fields win.
+ * Null and undefined env values are skipped so they cannot clobber an
+ * adapter-supplied value. Returns the adapter config unchanged when env is
+ * null/undefined.
+ *
+ * TODO(env-config): once a paperclip release exporting
+ * `mergeEnvironmentConfig` from `@paperclipai/adapter-utils` is consumable
+ * by this repo's pinned peerDep, dedupe by importing it instead of inlining.
+ * (Phase D shipped that helper to the paperclip workspace; cross-repo
+ * version coupling for a 7-line function is not worth it yet.)
+ */
+export function mergeEnvironmentConfig(
+  adapterConfig: Record<string, unknown>,
+  environmentConfig: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  if (!environmentConfig) return { ...adapterConfig };
+  const merged: Record<string, unknown> = { ...adapterConfig };
+  for (const [key, value] of Object.entries(environmentConfig)) {
+    if (value === null || value === undefined) continue;
+    merged[key] = value;
+  }
+  return merged;
+}
+
+/**
+ * Materialize a kubeconfig string (env-supplied content) onto disk so the
+ * existing kube client builders (which take a path) can consume it. Cached
+ * per content hash so repeated execute() calls with the same env config
+ * don't churn temp files. Returns the path; never throws — callers fall back
+ * to in-cluster auth if this returns null.
+ */
+const kubeconfigPathCache = new Map<string, string>();
+async function materializeKubeconfigContent(content: string): Promise<string | null> {
+  const cached = kubeconfigPathCache.get(content);
+  if (cached) return cached;
+  try {
+    const dir = await mkdtemp(path.join(tmpdir(), "opencode-k8s-kc-"));
+    const file = path.join(dir, "kubeconfig");
+    await fsWriteFile(file, content, { mode: 0o600 });
+    kubeconfigPathCache.set(content, file);
+    return file;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read the optional `executionTarget` field from an adapter execution context.
+ * Older `@paperclipai/adapter-utils` releases don't yet declare this field on
+ * `AdapterExecutionContext`, so we cast through unknown and validate at runtime.
+ */
+function readExecutionTarget(ctx: AdapterExecutionContext): {
+  kind: string;
+  transport?: string;
+  config?: Record<string, unknown> | null;
+} | null {
+  const target = (ctx as unknown as Record<string, unknown>).executionTarget;
+  if (!target || typeof target !== "object") return null;
+  const t = target as Record<string, unknown>;
+  if (typeof t.kind !== "string") return null;
+  return {
+    kind: t.kind,
+    transport: typeof t.transport === "string" ? t.transport : undefined,
+    config: t.config && typeof t.config === "object" ? (t.config as Record<string, unknown>) : null,
+  };
+}
 
 export function isK8s404(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
@@ -762,12 +832,64 @@ export async function ensureAgentDbPvc(
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { config: rawConfig, onLog, onMeta } = ctx;
-  const config = parseObject(rawConfig);
+  const adapterConfig = parseObject(rawConfig);
+
+  // Phase E.2: when paperclip dispatches a heartbeat with a remote/k8s
+  // execution target, merge `executionTarget.config` over `adapter_config`.
+  // Environment fields win; null/undefined env values are skipped.
+  // For non-k8s targets (or absent target), effectiveConfig === adapterConfig.
+  const execTarget = readExecutionTarget(ctx);
+  const isK8sRemote = execTarget?.kind === "remote" && execTarget?.transport === "k8s";
+  const effectiveConfig: Record<string, unknown> = isK8sRemote
+    ? mergeEnvironmentConfig(adapterConfig, execTarget?.config ?? null)
+    : adapterConfig;
+
+  // Replace ctx.config with the merged view so downstream callers
+  // (buildJobManifest, buildEnvVars, etc.) read environment-supplied
+  // overrides without further plumbing.
+  if (isK8sRemote && effectiveConfig !== adapterConfig) {
+    (ctx as unknown as { config: Record<string, unknown> }).config = effectiveConfig;
+  }
+
+  const config = effectiveConfig;
   const timeoutSec = asNumber(config.timeoutSec, 0);
   const graceSec = asNumber(config.graceSec, 60);
   const retainJobs = asBoolean(config.retainJobs, false);
   const reattachOrphanedJobs = asBoolean(config.reattachOrphanedJobs, false);
-  const kubeconfigPath = asString(config.kubeconfig, "") || undefined;
+
+  // kubeconfig: env config can supply either a path (legacy) or full content
+  // (k8s-env-driver). When content is supplied, materialize to a temp file.
+  // null/absent => fall through to in-cluster auth.
+  let kubeconfigPath: string | undefined;
+  const kubeconfigField = config.kubeconfig;
+  if (typeof kubeconfigField === "string" && kubeconfigField.trim().length > 0) {
+    const trimmed = kubeconfigField.trim();
+    // Heuristic: kubeconfig content begins with "apiVersion:" (YAML) or "{"
+    // (rare JSON form). Anything else is treated as a filesystem path.
+    const looksLikeContent = trimmed.startsWith("apiVersion:") || trimmed.startsWith("{");
+    if (looksLikeContent) {
+      kubeconfigPath = (await materializeKubeconfigContent(trimmed)) ?? undefined;
+    } else {
+      kubeconfigPath = trimmed;
+    }
+  }
+
+  // TODO(env-config): plumb cross-namespace secret resolution when
+  // effectiveConfig.secretsNamespace differs from the Job namespace. Today
+  // the adapter only reads secrets from the Job's own namespace, so this
+  // task scopes to the merge only — `secretsNamespace` flows into ctx.config
+  // and is available to future readers, but no resolver is wired yet.
+
+  // Workspace volume + mount path overrides (Phase E.2).
+  // Gated on remote/k8s targets: adapter_config-supplied workspace fields
+  // are intentionally ignored unless the heartbeat declares a k8s execution
+  // target — those settings are environment-driven, not agent-driven.
+  const workspaceVolumeClaim = isK8sRemote
+    ? (asString(config.workspaceVolumeClaim, "") || undefined)
+    : undefined;
+  const workspaceMountPath = isK8sRemote
+    ? (asString(config.workspaceMountPath, "") || undefined)
+    : undefined;
 
   const agentId = ctx.agent.id;
   const taskId = asString(ctx.context.taskId ?? ctx.context.issueId, "").trim();
@@ -927,6 +1049,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     skillsBundleContent: skillsBundleContent || undefined,
     agentDbClaimName,
     retainJobs,
+    // Phase E.2: env-config-supplied workspace overrides (k8s remote target).
+    // When unset, buildJobManifest falls back to selfPod.pvcClaimName and
+    // /paperclip respectively.
+    ...(workspaceVolumeClaim !== undefined ? { workspaceVolumeClaim } : {}),
+    ...(workspaceMountPath !== undefined ? { workspaceMountPath } : {}),
   };
   const firstBuild = buildJobManifest(buildArgs);
   const { jobName, namespace, prompt, opencodeArgs, promptMetrics, podLogPath } = firstBuild;

@@ -118,6 +118,17 @@ export interface JobBuildInput {
    * When undefined, no opencode-db volume is added.
    */
   agentDbClaimName?: string | null;
+  /**
+   * Phase E.2: workspace PVC claim name supplied by a paperclip k8s execution
+   * target's environment config. When set, overrides `selfPod.pvcClaimName`
+   * for the workspace `data` volume. When unset, falls back to selfPod.
+   */
+  workspaceVolumeClaim?: string;
+  /**
+   * Phase E.2: workspace mount path supplied by a paperclip k8s execution
+   * target's environment config. Defaults to `/paperclip` when unset.
+   */
+  workspaceMountPath?: string;
 }
 
 export interface JobBuildResult {
@@ -475,12 +486,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     volumes.push({ name: "prompt-secret", secret: { secretName: input.promptSecretName } });
   }
 
-  if (selfPod.pvcClaimName) {
+  // Phase E.2: workspace PVC/mount can be overridden by env config.
+  // workspaceVolumeClaim wins over selfPod.pvcClaimName when set.
+  // workspaceMountPath defaults to /paperclip when unset.
+  const workspaceClaim = input.workspaceVolumeClaim ?? selfPod.pvcClaimName;
+  const workspaceMountPath = input.workspaceMountPath ?? "/paperclip";
+  if (workspaceClaim) {
     volumes.push({
       name: "data",
-      persistentVolumeClaim: { claimName: selfPod.pvcClaimName },
+      persistentVolumeClaim: { claimName: workspaceClaim },
     });
-    volumeMounts.push({ name: "data", mountPath: "/paperclip" });
+    volumeMounts.push({ name: "data", mountPath: workspaceMountPath });
   }
 
   // OpenCode DB volume: dedicated PVC (string claim name) or ephemeral emptyDir (null)

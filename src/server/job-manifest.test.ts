@@ -657,3 +657,61 @@ describe("buildJobManifest — MCP fleet wiring", () => {
     expect(initCmd).toContain('printf \'%s\' "$OPENCODE_CONFIG_JSON" > /tmp/prompt/opencode.json');
   });
 });
+
+describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
+  it("uses workspaceVolumeClaim from input as the workspace PVC claim name", () => {
+    const selfPodWithPvc: JobBuildInput["selfPod"] = {
+      ...mockSelfPod,
+      pvcClaimName: "default-paperclip-pvc",
+    };
+    const result = buildJobManifest({
+      ctx: mockCtx,
+      selfPod: selfPodWithPvc,
+      workspaceVolumeClaim: "env-supplied-claim",
+    });
+
+    const volumes = result.job.spec?.template?.spec?.volumes ?? [];
+    const dataVol = volumes.find((v) => v.name === "data");
+    expect(dataVol?.persistentVolumeClaim?.claimName).toBe("env-supplied-claim");
+  });
+
+  it("falls back to selfPod.pvcClaimName when workspaceVolumeClaim is undefined", () => {
+    const selfPodWithPvc: JobBuildInput["selfPod"] = {
+      ...mockSelfPod,
+      pvcClaimName: "default-paperclip-pvc",
+    };
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: selfPodWithPvc });
+
+    const volumes = result.job.spec?.template?.spec?.volumes ?? [];
+    const dataVol = volumes.find((v) => v.name === "data");
+    expect(dataVol?.persistentVolumeClaim?.claimName).toBe("default-paperclip-pvc");
+  });
+
+  it("uses workspaceMountPath from input as the workspace volumeMount path", () => {
+    const selfPodWithPvc: JobBuildInput["selfPod"] = {
+      ...mockSelfPod,
+      pvcClaimName: "default-paperclip-pvc",
+    };
+    const result = buildJobManifest({
+      ctx: mockCtx,
+      selfPod: selfPodWithPvc,
+      workspaceMountPath: "/workspace",
+    });
+
+    const mounts = result.job.spec?.template?.spec?.containers?.[0]?.volumeMounts ?? [];
+    const dataMount = mounts.find((m) => m.name === "data");
+    expect(dataMount?.mountPath).toBe("/workspace");
+  });
+
+  it("defaults workspace mountPath to /paperclip when workspaceMountPath is unset", () => {
+    const selfPodWithPvc: JobBuildInput["selfPod"] = {
+      ...mockSelfPod,
+      pvcClaimName: "default-paperclip-pvc",
+    };
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: selfPodWithPvc });
+
+    const mounts = result.job.spec?.template?.spec?.containers?.[0]?.volumeMounts ?? [];
+    const dataMount = mounts.find((m) => m.name === "data");
+    expect(dataMount?.mountPath).toBe("/paperclip");
+  });
+});
