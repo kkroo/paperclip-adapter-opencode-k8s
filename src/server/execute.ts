@@ -27,11 +27,26 @@ export function isK8s404(err: unknown): boolean {
   return false;
 }
 
+// Map a bare model id (no `provider/` prefix) to a provider by name prefix.
+// opencode accepts both `openai/gpt-5` and bare `gpt-5`; without this fallback
+// the heartbeat ledger lands at provider="unknown" for any agent that doesn't
+// set adapter_config.model in canonical `provider/model` form.
+function inferProviderFromBareModelId(model: string): string | null {
+  const lower = model.trim().toLowerCase();
+  if (!lower) return null;
+  if (/^(gpt[-.]|chatgpt[-.]|o\d+(-|$)|codex[-.]?)/.test(lower)) return "openai";
+  if (/^(claude[-.]|sonnet|haiku|opus)/.test(lower)) return "anthropic";
+  if (/^gemini[-.]/.test(lower)) return "google";
+  return null;
+}
+
 export function parseModelProvider(model: string | null): string | null {
   if (!model) return null;
   const trimmed = model.trim();
-  if (!trimmed.includes("/")) return null;
-  return trimmed.slice(0, trimmed.indexOf("/")).trim() || null;
+  if (trimmed.includes("/")) {
+    return trimmed.slice(0, trimmed.indexOf("/")).trim() || null;
+  }
+  return inferProviderFromBareModelId(trimmed);
 }
 
 function isTransientVolumeSchedulingMessage(message: string): boolean {
@@ -577,7 +592,12 @@ async function streamAndAwaitJob(
       } as Record<string, unknown>
     : null;
 
-  const provider = parseModelProvider(model);
+  // opencode-k8s only ever invokes the opencode CLI, which on this fleet routes
+  // to codex (chatgpt auth) or to anthropic via opencode's own provider config.
+  // When no model is configured (`adapter_config.model` empty) opencode picks
+  // its default — codex-flavored — so we default provider to "openai" rather
+  // than letting it fall through to "unknown" in the heartbeat ledger.
+  const provider = parseModelProvider(model) ?? "openai";
   const biller = inferOpenAiCompatibleBiller(process.env, null) ?? provider ?? "unknown";
 
   const parsedError = typeof parsed.errorMessage === "string" ? parsed.errorMessage.trim() : "";
