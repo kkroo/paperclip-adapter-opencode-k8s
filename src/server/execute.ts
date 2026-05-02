@@ -17,31 +17,10 @@ const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
 const LOG_EXIT_COMPLETION_GRACE_MS = parseInt(process.env.LOG_EXIT_COMPLETION_GRACE_MS ?? "30000", 10);
 
-/**
- * Merge environment-supplied config (from a paperclip k8s execution target's
- * `config` field) over the adapter's `adapter_config`. Environment fields win.
- * Null and undefined env values are skipped so they cannot clobber an
- * adapter-supplied value. Returns the adapter config unchanged when env is
- * null/undefined.
- *
- * TODO(env-config): once a paperclip release exporting
- * `mergeEnvironmentConfig` from `@paperclipai/adapter-utils` is consumable
- * by this repo's pinned peerDep, dedupe by importing it instead of inlining.
- * (Phase D shipped that helper to the paperclip workspace; cross-repo
- * version coupling for a 7-line function is not worth it yet.)
- */
-export function mergeEnvironmentConfig(
-  adapterConfig: Record<string, unknown>,
-  environmentConfig: Record<string, unknown> | null | undefined,
-): Record<string, unknown> {
-  if (!environmentConfig) return { ...adapterConfig };
-  const merged: Record<string, unknown> = { ...adapterConfig };
-  for (const [key, value] of Object.entries(environmentConfig)) {
-    if (value === null || value === undefined) continue;
-    merged[key] = value;
-  }
-  return merged;
-}
+// Single source of truth lives in @paperclipai/adapter-utils. Re-exported
+// so existing test imports (`from "./execute.js"`) keep working.
+import { mergeEnvironmentConfig } from "@paperclipai/adapter-utils";
+export { mergeEnvironmentConfig };
 
 /**
  * Materialize a kubeconfig string (env-supplied content) onto disk so the
