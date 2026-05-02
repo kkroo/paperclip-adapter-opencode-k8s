@@ -1685,8 +1685,12 @@ describe("mergeEnvironmentConfig — Phase E.2 helper", () => {
   });
 
   it("skips null/undefined env values (does not clobber adapter config)", () => {
-    const adapter = { namespace: "adapter-ns", workspaceVolumeClaim: "adapter-claim" };
-    const env = { namespace: null, workspaceVolumeClaim: undefined, kubeconfig: "envcontent" };
+    // Type as Record<string, unknown> — passing { namespace: null } where
+    // namespace was string in adapter collapses the inferred A & E
+    // intersection to `never` and breaks property access. The runtime
+    // behavior we're testing is type-erased.
+    const adapter: Record<string, unknown> = { namespace: "adapter-ns", workspaceVolumeClaim: "adapter-claim" };
+    const env: Record<string, unknown> = { namespace: null, workspaceVolumeClaim: undefined, kubeconfig: "envcontent" };
     const merged = mergeEnvironmentConfig(adapter, env);
     expect(merged.namespace).toBe("adapter-ns");
     expect(merged.workspaceVolumeClaim).toBe("adapter-claim");
