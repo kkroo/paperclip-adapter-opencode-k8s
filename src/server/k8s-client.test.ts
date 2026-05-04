@@ -69,6 +69,9 @@ const ApiException = (k8s as unknown as { ApiException: new <T>(code: number, me
 beforeEach(() => {
   resetCache();
   vi.resetAllMocks();
+  // getKubeConfig() now refuses to call loadFromCluster() outside a pod.
+  // Tests mock the SDK and want the in-cluster branch, so pretend we're in one.
+  process.env.KUBERNETES_SERVICE_HOST = "10.0.0.1";
 });
 
 describe("getPvc — 404 detection (FAR-85 regression)", () => {
@@ -298,5 +301,23 @@ describe("getSelfPodInfo", () => {
     await getSelfPodInfo("/tmp/kubeconfig.yaml");
     expect(mockLoadFromFile).toHaveBeenCalledWith("/tmp/kubeconfig.yaml");
     expect(mockLoadFromCluster).not.toHaveBeenCalled();
+  });
+});
+
+describe("getKubeConfig — in-cluster auth diagnostics", () => {
+  it("throws an actionable error when KUBERNETES_SERVICE_HOST is unset", async () => {
+    delete process.env.KUBERNETES_SERVICE_HOST;
+    await expect(getSelfPodInfo()).rejects.toThrow(/KUBERNETES_SERVICE_HOST is unset/);
+    expect(mockLoadFromCluster).not.toHaveBeenCalled();
+  });
+
+  it("rewraps loadFromCluster ENOENT into an automountToken hint", async () => {
+    mockLoadFromCluster.mockImplementation(() => {
+      throw Object.assign(
+        new Error("ENOENT: no such file or directory, open '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'"),
+        { code: "ENOENT" },
+      );
+    });
+    await expect(getSelfPodInfo()).rejects.toThrow(/serviceAccount\.automountToken=true/);
   });
 });
