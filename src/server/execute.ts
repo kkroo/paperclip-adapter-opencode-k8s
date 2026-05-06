@@ -371,13 +371,9 @@ export async function tailPodLogFile(
   // and the alternative (kubectl logs streaming) would require a full
   // refactor of the tail interface.
   const drain = async (): Promise<boolean> => {
-    let fh: FileHandle;
+    let fh: FileHandle | undefined;
     try {
       fh = await fsOpen(filePath, "r");
-    } catch {
-      return false;
-    }
-    try {
       const stat = await fh.stat();
       const size = stat.size;
       if (size <= offset) return false;
@@ -392,8 +388,26 @@ export async function tailPodLogFile(
         accumulator.push(line + "\n");
       }
       return bytesRead > 0;
+    } catch (err) {
+      // Best-effort drain — a transient open / read error must not kill the
+      // outer poll loop. Swallow and let the next poll retry; if the failure
+      // mode persists, the run-log will show only `[paperclip] keepalive`
+      // lines (matching pre-fix behavior) rather than going completely
+      // silent because tailPodLogFile threw out of `Promise.allSettled`.
+      const message = err instanceof Error ? err.message : String(err);
+      try {
+        await onLog(
+          "stderr",
+          `[paperclip] tail drain error (will retry): ${message}\n`,
+        );
+      } catch {
+        // onLog itself can fail; ignore.
+      }
+      return false;
     } finally {
-      await fh.close();
+      if (fh !== undefined) {
+        await fh.close().catch(() => undefined);
+      }
     }
   };
 
