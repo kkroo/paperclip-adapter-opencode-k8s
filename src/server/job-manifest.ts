@@ -653,7 +653,16 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // `set -o pipefail` so an opencode binary crash surfaces as a non-zero
   // shell exit code instead of being masked by tee's exit code. Mirrors
   // the claude_k8s adapter's fix.
-  const baseMainCommand = `set -o pipefail; ${ccrotateRefresh}; ${configSetup}cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee ${podLogPath}`;
+  //
+  // mkdir + touch the podLogPath BEFORE invoking opencode so paperclip's
+  // tailPodLogFile (30s file-existence wait) doesn't time out on the empty
+  // string when opencode is slow to produce its first byte (e.g. ccrotate
+  // negotiation, MCP server fetches, large model handshakes). Without
+  // this, tail returns "" and the run is mis-classified as
+  // adapter_failed/empty-stdout even though opencode is still working.
+  // The marker line is also useful in pod logs for confirming the pod
+  // reached the tee step at all.
+  const baseMainCommand = `set -o pipefail; ${ccrotateRefresh}; ${configSetup}mkdir -p $(dirname ${podLogPath}) && : > ${podLogPath} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${podLogPath}`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket.
