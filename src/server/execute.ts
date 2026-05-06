@@ -370,6 +370,7 @@ export async function tailPodLogFile(
   // Open + read + close is cheap on a single-digit-KB-per-poll write rate
   // and the alternative (kubectl logs streaming) would require a full
   // refactor of the tail interface.
+  let firstGrowthLogged = false;
   const drain = async (): Promise<boolean> => {
     let fh: FileHandle | undefined;
     try {
@@ -379,6 +380,20 @@ export async function tailPodLogFile(
       if (size <= offset) return false;
       const buf = Buffer.alloc(size - offset);
       const { bytesRead } = await fh.read(buf, 0, buf.length, offset);
+      // Surface diagnostic on the FIRST poll where stat says the file grew
+      // beyond `offset`. If we keep seeing growth-with-zero-bytes-read, that
+      // is the smoking gun for CephFS data caching even after fresh open.
+      if (!firstGrowthLogged) {
+        firstGrowthLogged = true;
+        try {
+          await onLog(
+            "stderr",
+            `[paperclip] tail first-growth stat.size=${size} offset=${offset} bytesRead=${bytesRead}\n`,
+          );
+        } catch {
+          /* non-fatal */
+        }
+      }
       offset += bytesRead;
       const chunk = buf.slice(0, bytesRead).toString("utf-8");
       const lineParts = (pending + chunk).split("\n");
