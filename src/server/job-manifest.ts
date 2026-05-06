@@ -324,13 +324,51 @@ function buildEnvVars(
 }
 
 /**
- * Build the OpenCode runtime config JSON for permission.external_directory=allow.
- * Returned as a string to be written inside the Job container.
+ * Build the OpenCode runtime config JSON written to ~/.config/opencode/opencode.json.
+ *
+ * Two responsibilities:
+ *  1. `permission.external_directory: "allow"` — preserves the original behavior
+ *     of bypassing opencode's per-directory permission prompt (Job pods have no
+ *     stdin).
+ *  2. Force opencode away from the default `opencode.ai/zen` provider, which
+ *     anonymously returns `FreeUsageLimitError` 429 within seconds and then
+ *     wedges the pod (the AI SDK marks the error retryable but never retries).
+ *     Instead route to the bundled `openai` provider in chatgpt-OAuth mode,
+ *     using the refreshed codex tokens that ccrotate writes to
+ *     ~/.codex/auth.json (see buildOpencodeAuthBootstrapShell).
+ *
+ * `disabled_providers: ["opencode"]` makes the failure loud (opencode exits
+ * immediately if no other provider is configured) instead of silently
+ * falling through to zen.
  */
 function buildRuntimeConfigJson(config: Record<string, unknown>): string | null {
   const skipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
-  if (!skipPermissions) return null;
-  return JSON.stringify({ permission: { external_directory: "allow" } }, null, 2);
+  const runtime: Record<string, unknown> = {
+    disabled_providers: ["opencode"],
+  };
+  if (skipPermissions) {
+    runtime.permission = { external_directory: "allow" };
+  }
+  return JSON.stringify(runtime, null, 2);
+}
+
+/**
+ * Shell snippet that translates ccrotate's codex auth file
+ * (`~/.codex/auth.json`, chatgpt-OAuth shape) into opencode's auth store
+ * (`~/.local/share/opencode/auth.json`, openai-OAuth shape) so opencode's
+ * built-in `openai` provider authenticates against ChatGPT instead of
+ * falling through to the anonymous zen free tier.
+ *
+ * Runs after `ccrotate next --target codex` so the codex auth file is fresh.
+ * Best-effort: failures (missing codex auth, parse errors) leave the pod
+ * to fail loud at the opencode invocation rather than masking the issue.
+ *
+ * Expiry is read from the id_token's `exp` claim; opencode's openai provider
+ * will refresh through its codex device-flow refresh endpoint when the access
+ * token expires.
+ */
+function buildOpencodeAuthBootstrapShell(): string {
+  return `mkdir -p ~/.local/share/opencode && node -e 'const fs=require("fs"),p=require("path"),H=process.env.HOME||".";try{const c=JSON.parse(fs.readFileSync(p.join(H,".codex","auth.json"),"utf8"));if(c.auth_mode!=="chatgpt"||!c.tokens||!c.tokens.access_token||!c.tokens.refresh_token)process.exit(0);let exp=Date.now()+30*60*1000;try{const part=c.tokens.id_token.split(".")[1];const pad="=".repeat((4-part.length%4)%4);const payload=JSON.parse(Buffer.from((part+pad).replace(/-/g,"+").replace(/_/g,"/"),"base64").toString());if(payload.exp)exp=payload.exp*1000;}catch(e){}const out={openai:{type:"oauth",access:c.tokens.access_token,refresh:c.tokens.refresh_token,expires:exp,accountId:c.tokens.account_id||null}};fs.writeFileSync(p.join(H,".local","share","opencode","auth.json"),JSON.stringify(out));}catch(e){console.error("[opencode-auth-bootstrap] skipped:",e.message);}' || true`;
 }
 
 /**
@@ -530,6 +568,13 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
           // the "allow access outside cwd" behavior when overriding via
           // OPENCODE_CONFIG (opencode does not merge config sources).
           permission: { external_directory: "allow" },
+          // Disable opencode.ai/zen for the same reason as
+          // buildRuntimeConfigJson: it returns FreeUsageLimitError 429
+          // anonymously and wedges the pod. Opencode falls through to
+          // the bundled `openai` provider in chatgpt-OAuth mode, fed by
+          // the auth.json that buildOpencodeAuthBootstrapShell writes
+          // from ~/.codex/auth.json.
+          disabled_providers: ["opencode"],
           mcp: opencodeMcpSection,
         })
       : null;
@@ -686,6 +731,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     : [];
   const accountsArg = openaiAccounts.length > 0 ? ` --accounts ${openaiAccounts.join(",")}` : "";
   const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target codex${accountsArg} >/dev/null 2>&1) || true`;
+  const authBootstrap = buildOpencodeAuthBootstrapShell();
   const configSetup = runtimeConfigJson
     ? `mkdir -p ~/.config/opencode && echo '${runtimeConfigJson.replace(/'/g, "'\\''")}' > ~/.config/opencode/opencode.json && `
     : "";
@@ -701,7 +747,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // adapter_failed/empty-stdout even though opencode is still working.
   // The marker line is also useful in pod logs for confirming the pod
   // reached the tee step at all.
-  const baseMainCommand = `set -o pipefail; ${ccrotateRefresh}; ${configSetup}mkdir -p $(dirname ${podLogPath}) && : > ${podLogPath} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${podLogPath}`;
+  const baseMainCommand = `set -o pipefail; ${ccrotateRefresh}; ${authBootstrap}; ${configSetup}mkdir -p $(dirname ${podLogPath}) && : > ${podLogPath} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${podLogPath}`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket.
