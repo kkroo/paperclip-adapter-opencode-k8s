@@ -1,7 +1,7 @@
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { inferOpenAiCompatibleBiller } from "@paperclipai/adapter-utils";
 import { asString, asNumber, asBoolean, parseObject, readPaperclipRuntimeSkillEntries, resolvePaperclipDesiredSkillNames } from "@paperclipai/adapter-utils/server-utils";
-import { readFile, open as fsOpen, writeFile as fsWriteFile, mkdtemp, type FileHandle } from "node:fs/promises";
+import { readFile, open as fsOpen, stat as fsStat, writeFile as fsWriteFile, mkdtemp, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -354,10 +354,18 @@ export async function tailPodLogFile(
   let idleCount = 0;
   const accumulator: string[] = [];
 
+  // Stat by path, not via the held `fh`. The pod's `tee` writes to the same
+  // CephFS-backed file from a different client; the kernel's inode metadata
+  // cap on our open file handle does not invalidate when the writer-side
+  // client extends the file, so `fh.stat()` returns a stale size and the
+  // tail loop perpetually believes the file is empty (we observed 107 KiB
+  // of opencode JSONL on disk while paperclip's `<runId>.ndjson` had only
+  // [paperclip] keepalive lines). Pathwise stat goes through the kernel's
+  // dentry → MDS lookup which forces a fresh metadata read from CephFS.
   const drain = async (): Promise<boolean> => {
     let size: number;
     try {
-      const stat = await fh.stat();
+      const stat = await fsStat(filePath);
       size = stat.size;
     } catch {
       return false;
