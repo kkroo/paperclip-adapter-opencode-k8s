@@ -341,10 +341,10 @@ export async function tailPodLogFile(
     }
   }
 
-  // Check one more time before opening
-  let fh: FileHandle;
+  // Sanity-check existence before entering the loop; the loop reopens per
+  // poll so we don't hold an fh that would cache stale data on CephFS.
   try {
-    fh = await fsOpen(filePath, "r");
+    await fsStat(filePath);
   } catch {
     throw new Error(`Pod log file never appeared at ${filePath}`);
   }
@@ -354,59 +354,68 @@ export async function tailPodLogFile(
   let idleCount = 0;
   const accumulator: string[] = [];
 
-  // Stat by path, not via the held `fh`. The pod's `tee` writes to the same
-  // CephFS-backed file from a different client; the kernel's inode metadata
-  // cap on our open file handle does not invalidate when the writer-side
-  // client extends the file, so `fh.stat()` returns a stale size and the
-  // tail loop perpetually believes the file is empty (we observed 107 KiB
-  // of opencode JSONL on disk while paperclip's `<runId>.ndjson` had only
-  // [paperclip] keepalive lines). Pathwise stat goes through the kernel's
-  // dentry → MDS lookup which forces a fresh metadata read from CephFS.
+  // The pod-side `tee` and this paperclip-side reader are separate CephFS
+  // clients. A held FileHandle's data cap on the reader side does not
+  // invalidate when the writer extends the file — both `fh.stat()` and
+  // `fh.read(...)` will return the cached metadata + cached data from the
+  // moment the handle was opened, even after the writer has flushed
+  // hundreds of KB. We observed `<runId>.pod.ndjson` at 73 KiB / 107 KiB
+  // with real opencode JSONL on disk while paperclip's `<runId>.ndjson`
+  // (the run-log-store onLog target) had only `[paperclip] keepalive`
+  // lines, because tail's drain loop kept seeing size=0 / bytesRead=0 on
+  // the held fh.
+  //
+  // Open and close a fresh file handle per poll so each read goes through
+  // the kernel's dentry/MDS path and pulls fresh data caps from CephFS.
+  // Open + read + close is cheap on a single-digit-KB-per-poll write rate
+  // and the alternative (kubectl logs streaming) would require a full
+  // refactor of the tail interface.
   const drain = async (): Promise<boolean> => {
-    let size: number;
+    let fh: FileHandle;
     try {
-      const stat = await fsStat(filePath);
-      size = stat.size;
+      fh = await fsOpen(filePath, "r");
     } catch {
       return false;
     }
-    if (size <= offset) return false;
-    const buf = Buffer.alloc(size - offset);
-    const { bytesRead } = await fh.read(buf, 0, buf.length, offset);
-    offset += bytesRead;
-    const chunk = buf.slice(0, bytesRead).toString("utf-8");
-    const lineParts = (pending + chunk).split("\n");
-    pending = lineParts.pop() ?? "";
-    for (const line of lineParts) {
-      await onLog("stdout", line + "\n");
-      accumulator.push(line + "\n");
+    try {
+      const stat = await fh.stat();
+      const size = stat.size;
+      if (size <= offset) return false;
+      const buf = Buffer.alloc(size - offset);
+      const { bytesRead } = await fh.read(buf, 0, buf.length, offset);
+      offset += bytesRead;
+      const chunk = buf.slice(0, bytesRead).toString("utf-8");
+      const lineParts = (pending + chunk).split("\n");
+      pending = lineParts.pop() ?? "";
+      for (const line of lineParts) {
+        await onLog("stdout", line + "\n");
+        accumulator.push(line + "\n");
+      }
+      return bytesRead > 0;
+    } finally {
+      await fh.close();
     }
-    return bytesRead > 0;
   };
 
-  try {
-    while (!stopSignal.stopped) {
-      const grew = await drain();
-      if (grew) {
-        idleCount = 0;
-      } else {
-        idleCount++;
-      }
-      if (stopSignal.stopped) break;
-      const pollMs = idleCount >= IDLE_THRESHOLD ? POLL_IDLE_MS : POLL_ACTIVE_MS;
-      await new Promise((r) => setTimeout(r, pollMs));
+  while (!stopSignal.stopped) {
+    const grew = await drain();
+    if (grew) {
+      idleCount = 0;
+    } else {
+      idleCount++;
     }
+    if (stopSignal.stopped) break;
+    const pollMs = idleCount >= IDLE_THRESHOLD ? POLL_IDLE_MS : POLL_ACTIVE_MS;
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
 
-    // Final drain after stopSignal — pick up any bytes written between the
-    // last read and the job reaching terminal state.
-    while (await drain()) { /* read until no more growth */ }
+  // Final drain after stopSignal — pick up any bytes written between the
+  // last read and the job reaching terminal state.
+  while (await drain()) { /* read until no more growth */ }
 
-    if (pending) {
-      await onLog("stdout", pending + "\n");
-      accumulator.push(pending + "\n");
-    }
-  } finally {
-    await fh.close();
+  if (pending) {
+    await onLog("stdout", pending + "\n");
+    accumulator.push(pending + "\n");
   }
 
   return accumulator.join("");
