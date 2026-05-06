@@ -798,9 +798,39 @@ function ensureSigtermHandler(): void {
   });
 }
 
+export type AgentDbMode = "dedicated_pvc" | "ephemeral" | "workspace_subpath";
+
 /**
- * Ensure the per-agent dedicated PVC exists (dedicated_pvc mode) or return null (ephemeral).
- * Returns the PVC claim name on success, null when agentDbMode is "ephemeral".
+ * Sanitize a task_key for use as a filesystem path segment. UUIDs and
+ * `__heartbeat__` (the only currently-used shapes) pass through unchanged
+ * after lowercasing. Anything else is collapsed to underscores and capped
+ * so a hostile/oddly-shaped value can't escape its directory.
+ */
+export function sanitizeTaskKeyForPath(taskKey: string | null): string {
+  const raw = (taskKey ?? "").trim();
+  if (!raw) return "_no_task_";
+  return raw.toLowerCase().replace(/[^a-z0-9_-]/g, "_").slice(0, 128) || "_no_task_";
+}
+
+/**
+ * Build the subPath used for `workspace_subpath` agent DB mode. Per-task so
+ * that concurrent runs of the same agent on different tasks don't share a
+ * SQLite file. The heartbeat scheduler enforces one running pod per
+ * (company, agent, adapter, task_key), giving each subPath single-writer
+ * semantics.
+ */
+export function buildAgentDbWorkspaceSubPath(
+  companyId: string,
+  agentId: string,
+  taskKey: string | null,
+): string {
+  return `.opencode-db/${companyId}/${agentId}/${sanitizeTaskKeyForPath(taskKey)}`;
+}
+
+/**
+ * Ensure the per-agent dedicated PVC exists (dedicated_pvc mode) or return
+ * null (ephemeral / workspace_subpath, where no separate PVC is needed).
+ * Returns the PVC claim name on success.
  * Throws when agentDbStorageClass is missing in dedicated_pvc mode.
  */
 export async function ensureAgentDbPvc(
@@ -809,8 +839,8 @@ export async function ensureAgentDbPvc(
   config: Record<string, unknown>,
   kubeconfigPath?: string,
 ): Promise<string | null> {
-  const agentDbMode = (asString(config.agentDbMode, "dedicated_pvc").trim() || "dedicated_pvc") as "dedicated_pvc" | "ephemeral";
-  if (agentDbMode === "ephemeral") return null;
+  const agentDbMode = (asString(config.agentDbMode, "dedicated_pvc").trim() || "dedicated_pvc") as AgentDbMode;
+  if (agentDbMode === "ephemeral" || agentDbMode === "workspace_subpath") return null;
 
   // Build a K8s-safe PVC name from the agent ID (UUIDs are already alphanumeric+hyphens)
   const agentSlug = agentId.toLowerCase().replace(/[^a-z0-9-]/g, "").replace(/^-+|-+$/g, "").slice(0, 208);
@@ -1051,20 +1081,38 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // non-fatal: skill bundle is optional
   }
 
-  // Ensure per-agent DB PVC exists
+  // Resolve agent DB mounting strategy.
+  //
+  // - dedicated_pvc: per-agent PVC (RWO) — only one pod can mount at a time,
+  //   so this serializes runs of the same agent across all tasks.
+  // - ephemeral: emptyDir per pod — no cross-pod persistence; opencode session
+  //   resume always fails.
+  // - workspace_subpath: per-(agent, task) subdir on the workspace data PVC;
+  //   single-writer per task (heartbeat scheduler enforces one pod per
+  //   (agent, task)) and survives pod restart, so resume actually works.
+  const agentDbMode = (asString(config.agentDbMode, "dedicated_pvc").trim() || "dedicated_pvc") as AgentDbMode;
   let agentDbClaimName: string | null | undefined;
-  try {
-    agentDbClaimName = await ensureAgentDbPvc(agentId, guardNamespace, config, kubeconfigPath);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    await onLog("stderr", `[paperclip] Failed to ensure agent DB PVC: ${msg}\n`);
-    return {
-      exitCode: null,
-      signal: null,
-      timedOut: false,
-      errorMessage: msg,
-      errorCode: "k8s_job_create_failed",
-    };
+  let agentDbWorkspaceSubPath: string | undefined;
+  if (agentDbMode === "workspace_subpath") {
+    agentDbWorkspaceSubPath = buildAgentDbWorkspaceSubPath(
+      ctx.agent.companyId,
+      agentId,
+      ctx.runtime.taskKey,
+    );
+  } else {
+    try {
+      agentDbClaimName = await ensureAgentDbPvc(agentId, guardNamespace, config, kubeconfigPath);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await onLog("stderr", `[paperclip] Failed to ensure agent DB PVC: ${msg}\n`);
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        errorMessage: msg,
+        errorCode: "k8s_job_create_failed",
+      };
+    }
   }
 
   const buildArgs = {
@@ -1072,7 +1120,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     selfPod,
     instructionsContent: instructionsContent || undefined,
     skillsBundleContent: skillsBundleContent || undefined,
-    agentDbClaimName,
+    ...(agentDbWorkspaceSubPath !== undefined
+      ? { agentDbWorkspaceSubPath }
+      : { agentDbClaimName }),
     retainJobs,
     // Phase E.2: env-config-supplied workspace overrides (k8s remote target).
     // When unset, buildJobManifest falls back to selfPod.pvcClaimName and

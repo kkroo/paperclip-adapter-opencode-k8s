@@ -385,6 +385,59 @@ describe("agentDbClaimName — volume wiring", () => {
   });
 });
 
+describe("agentDbWorkspaceSubPath — workspace_subpath mode", () => {
+  // workspace_subpath needs a workspace data volume to live under, so these
+  // tests give selfPod a pvcClaimName.
+  const selfPodWithPvc = { ...mockSelfPod, pvcClaimName: "paperclip-data" };
+
+  it("sets OPENCODE_DB to /opencode-db/opencode.db when agentDbWorkspaceSubPath is set", () => {
+    const result = buildJobManifest({
+      ctx: mockCtx,
+      selfPod: selfPodWithPvc,
+      agentDbWorkspaceSubPath: ".opencode-db/co123/agent-abc/__heartbeat__",
+    });
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    expect(env.find((e) => e.name === "OPENCODE_DB")?.value).toBe("/opencode-db/opencode.db");
+  });
+
+  it("mounts /opencode-db on the data volume at the given subPath without adding a new volume", () => {
+    const result = buildJobManifest({
+      ctx: mockCtx,
+      selfPod: selfPodWithPvc,
+      agentDbWorkspaceSubPath: ".opencode-db/co123/agent-abc/issue-uuid",
+    });
+    const volumes = result.job.spec?.template?.spec?.volumes ?? [];
+    expect(volumes.find((v) => v.name === "opencode-db")).toBeUndefined();
+
+    const mounts = result.job.spec?.template?.spec?.containers?.[0].volumeMounts ?? [];
+    const dbMount = mounts.find((m) => m.mountPath === "/opencode-db");
+    expect(dbMount).toBeDefined();
+    expect(dbMount?.name).toBe("data");
+    expect(dbMount?.subPath).toBe(".opencode-db/co123/agent-abc/issue-uuid");
+  });
+
+  it("throws when agentDbClaimName and agentDbWorkspaceSubPath are both set", () => {
+    expect(() =>
+      buildJobManifest({
+        ctx: mockCtx,
+        selfPod: selfPodWithPvc,
+        agentDbClaimName: "opencode-db-agent-abc",
+        agentDbWorkspaceSubPath: ".opencode-db/co123/agent-abc/__heartbeat__",
+      }),
+    ).toThrow(/mutually exclusive/);
+  });
+
+  it("throws when agentDbWorkspaceSubPath is set without a workspace data volume", () => {
+    expect(() =>
+      buildJobManifest({
+        ctx: mockCtx,
+        selfPod: mockSelfPod, // pvcClaimName: null
+        agentDbWorkspaceSubPath: ".opencode-db/co123/agent-abc/__heartbeat__",
+      }),
+    ).toThrow(/requires a workspace data volume/);
+  });
+});
+
 describe("init container is unchanged by agentDbClaimName", () => {
   it("does not add extra env vars to init container for dedicated PVC mode", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, agentDbClaimName: "opencode-db-agent-abc" });

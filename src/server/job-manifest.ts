@@ -124,8 +124,25 @@ export interface JobBuildInput {
    * Claim name of the dedicated agent DB PVC (dedicated_pvc mode) or null for ephemeral emptyDir.
    * When provided (string or null), mounts /opencode-db and sets OPENCODE_DB=/opencode-db.
    * When undefined, no opencode-db volume is added.
+   *
+   * Mutually exclusive with `agentDbWorkspaceSubPath` — pass at most one.
    */
   agentDbClaimName?: string | null;
+  /**
+   * workspace_subpath mode: mount /opencode-db on the existing workspace
+   * (`data`) PVC at this subPath. Caller supplies the full relative path
+   * (e.g. `.opencode-db/<companyId>/<agentId>/<sanitized-taskKey>`); the
+   * kubelet creates the directory lazily on first write.
+   *
+   * Use a per-(agent, taskKey) path so concurrent runs of the same agent on
+   * different tasks each get their own SQLite file — the heartbeat scheduler
+   * already serializes runs per (agent, task), so this gives single-writer
+   * semantics on each opencode.db without needing RWX storage.
+   *
+   * Mutually exclusive with `agentDbClaimName`. When both are undefined, no
+   * opencode-db volume is added (legacy behavior).
+   */
+  agentDbWorkspaceSubPath?: string;
   /**
    * Phase E.2: workspace PVC claim name supplied by a paperclip k8s execution
    * target's environment config. When set, overrides `selfPod.pvcClaimName`
@@ -472,8 +489,16 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // Build env vars
   const envVars = buildEnvVars(ctx, selfPod, config);
 
-  // OPENCODE_DB: set when a DB volume is present (dedicated PVC or ephemeral emptyDir)
-  if (input.agentDbClaimName !== undefined) {
+  // OPENCODE_DB: set when a DB volume is present (dedicated PVC, ephemeral
+  // emptyDir, or workspace subPath)
+  if (input.agentDbClaimName !== undefined && input.agentDbWorkspaceSubPath !== undefined) {
+    throw new Error(
+      "agentDbClaimName and agentDbWorkspaceSubPath are mutually exclusive — pass at most one",
+    );
+  }
+  const hasAgentDb =
+    input.agentDbClaimName !== undefined || input.agentDbWorkspaceSubPath !== undefined;
+  if (hasAgentDb) {
     const dbEnvIdx = envVars.findIndex((e) => e.name === "OPENCODE_DB");
     if (dbEnvIdx >= 0) {
       envVars[dbEnvIdx] = { name: "OPENCODE_DB", value: "/opencode-db/opencode.db" };
@@ -566,7 +591,8 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     volumeMounts.push({ name: "data", mountPath: workspaceMountPath });
   }
 
-  // OpenCode DB volume: dedicated PVC (string claim name) or ephemeral emptyDir (null)
+  // OpenCode DB volume: dedicated PVC (string claim name), ephemeral emptyDir
+  // (null), or workspace subPath (reuses the data volume).
   if (input.agentDbClaimName !== undefined) {
     volumes.push(
       input.agentDbClaimName !== null
@@ -574,6 +600,19 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         : { name: "opencode-db", emptyDir: {} },
     );
     volumeMounts.push({ name: "opencode-db", mountPath: "/opencode-db" });
+  } else if (input.agentDbWorkspaceSubPath !== undefined) {
+    // Reuse the workspace `data` volume; mount at /opencode-db on the given
+    // subPath. No new volume entry needed — kubelet creates the subdir lazily.
+    if (!workspaceClaim) {
+      throw new Error(
+        "agentDbWorkspaceSubPath requires a workspace data volume (workspaceVolumeClaim or selfPod.pvcClaimName must be set)",
+      );
+    }
+    volumeMounts.push({
+      name: "data",
+      mountPath: "/opencode-db",
+      subPath: input.agentDbWorkspaceSubPath,
+    });
   }
 
   // Mount secret volumes inherited from the Deployment pod
