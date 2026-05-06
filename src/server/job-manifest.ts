@@ -86,7 +86,15 @@ function buildOpencodeMcpSection(merged: Record<string, unknown>): Record<string
   return out;
 }
 
-export const LARGE_PROMPT_THRESHOLD_BYTES = 256 * 1024;
+// Linux's per-env-var kernel limit is MAX_ARG_STRLEN = PAGE_SIZE * 32 =
+// 131072 bytes (128 KiB). Setting any single env var beyond that makes the
+// kernel reject the next exec with E2BIG ("argument list too long"), so the
+// busybox init container fails before it can `printf "$PROMPT_CONTENT"` to
+// disk. The previous 256 KiB threshold meant prompts in the 128–256 KiB
+// band were silently routed via env var instead of via Secret and crashed
+// the pod with exit code 255 at write-prompt. Pull the threshold below
+// MAX_ARG_STRLEN with headroom for command line + other env values.
+export const LARGE_PROMPT_THRESHOLD_BYTES = 100 * 1024;
 
 function assertSafePathComponent(field: string, value: string): void {
   // Allow alphanumeric, hyphens, and colons (UUIDs like "550e8400-e29b-41d4-a716-446655440000")
