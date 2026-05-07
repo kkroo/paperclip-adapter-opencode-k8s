@@ -670,10 +670,17 @@ describe("buildJobManifest — MCP fleet wiring", () => {
     const parsed = JSON.parse(cfgEnv!.value!) as {
       $schema: string;
       permission: { external_directory: string };
+      disabled_providers: string[];
       mcp: Record<string, Record<string, unknown>>;
     };
     expect(parsed.$schema).toBe("https://opencode.ai/config.json");
     expect(parsed.permission.external_directory).toBe("allow");
+    // disabled_providers includes "opencode" so the zen free tier never
+    // catches a Job pod (it returned FreeUsageLimitError 429 within 3s
+    // and opencode silently wedged on retryable errors). With zen
+    // disabled the pod falls through to the bundled `openai` chatgpt
+    // OAuth provider, populated by buildOpencodeAuthBootstrapShell.
+    expect(parsed.disabled_providers).toEqual(["opencode"]);
 
     // claude split → opencode merged array
     expect(parsed.mcp.paperclip).toEqual({
@@ -801,6 +808,54 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
       const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command;
       expect(cmd?.[2]).not.toContain("--accounts");
+    });
+  });
+
+  describe("opencode-auth-bootstrap (codex → opencode auth.json)", () => {
+    // Background: opencode's default provider is opencode.ai/zen. With no
+    // auth.json present, zen returns FreeUsageLimitError 429 within ~3s and
+    // the AI SDK marks it retryable but never retries — opencode CLI then
+    // sits in epoll_wait indefinitely, paperclip-0's keepalive keeps the
+    // run "alive", and the watchdog never trips. The fix: translate the
+    // codex chatgpt-OAuth tokens (which ccrotate refreshes per Job) into
+    // opencode's openai-OAuth auth store on each Job spawn.
+
+    it("emits the auth bootstrap step between ccrotateRefresh and the opencode invocation", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const ccrotateIdx = cmd.indexOf("ccrotate next --yes --target codex");
+      const bootstrapIdx = cmd.indexOf(".local/share/opencode");
+      const opencodeIdx = cmd.indexOf("| opencode ");
+      expect(ccrotateIdx).toBeGreaterThan(-1);
+      expect(bootstrapIdx).toBeGreaterThan(ccrotateIdx);
+      expect(opencodeIdx).toBeGreaterThan(bootstrapIdx);
+    });
+
+    it("translates the codex auth.json shape (auth_mode=chatgpt + tokens) into the openai-OAuth shape opencode expects", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      // Reads codex auth + checks chatgpt mode + writes opencode auth.json
+      expect(cmd).toContain('".codex","auth.json"');
+      expect(cmd).toContain('auth_mode!=="chatgpt"');
+      expect(cmd).toContain('"share","opencode","auth.json"');
+      // Output keys: openai provider, oauth type, expiry from id_token exp claim
+      expect(cmd).toContain('openai:{type:"oauth"');
+      expect(cmd).toContain("payload.exp");
+      // Best-effort: never fail the pod on bootstrap errors
+      expect(cmd).toContain("|| true");
+    });
+  });
+
+  describe("buildRuntimeConfigJson + opencodeConfigJson disable opencode.ai/zen", () => {
+    it("default opencode.json (no per-agent MCP) sets disabled_providers=['opencode']", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      // The default-path config is inlined into the main command via
+      // `echo '...' > ~/.config/opencode/opencode.json`. Extract and parse.
+      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > ~\/\.config\/opencode\/opencode\.json/);
+      expect(match).toBeTruthy();
+      const parsed = JSON.parse(match![1].replace(/'\\''/g, "'")) as { disabled_providers?: string[] };
+      expect(parsed.disabled_providers).toEqual(["opencode"]);
     });
   });
 });
