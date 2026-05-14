@@ -86,7 +86,15 @@ function buildOpencodeMcpSection(merged: Record<string, unknown>): Record<string
   return out;
 }
 
-export const LARGE_PROMPT_THRESHOLD_BYTES = 256 * 1024;
+// Linux's per-env-var kernel limit is MAX_ARG_STRLEN = PAGE_SIZE * 32 =
+// 131072 bytes (128 KiB). Setting any single env var beyond that makes the
+// kernel reject the next exec with E2BIG ("argument list too long"), so the
+// busybox init container fails before it can `printf "$PROMPT_CONTENT"` to
+// disk. The previous 256 KiB threshold meant prompts in the 128–256 KiB
+// band were silently routed via env var instead of via Secret and crashed
+// the pod with exit code 255 at write-prompt. Pull the threshold below
+// MAX_ARG_STRLEN with headroom for command line + other env values.
+export const LARGE_PROMPT_THRESHOLD_BYTES = 100 * 1024;
 
 function assertSafePathComponent(field: string, value: string): void {
   // Allow alphanumeric, hyphens, and colons (UUIDs like "550e8400-e29b-41d4-a716-446655440000")
@@ -116,8 +124,25 @@ export interface JobBuildInput {
    * Claim name of the dedicated agent DB PVC (dedicated_pvc mode) or null for ephemeral emptyDir.
    * When provided (string or null), mounts /opencode-db and sets OPENCODE_DB=/opencode-db.
    * When undefined, no opencode-db volume is added.
+   *
+   * Mutually exclusive with `agentDbWorkspaceSubPath` — pass at most one.
    */
   agentDbClaimName?: string | null;
+  /**
+   * workspace_subpath mode: mount /opencode-db on the existing workspace
+   * (`data`) PVC at this subPath. Caller supplies the full relative path
+   * (e.g. `.opencode-db/<companyId>/<agentId>/<sanitized-taskKey>`); the
+   * kubelet creates the directory lazily on first write.
+   *
+   * Use a per-(agent, taskKey) path so concurrent runs of the same agent on
+   * different tasks each get their own SQLite file — the heartbeat scheduler
+   * already serializes runs per (agent, task), so this gives single-writer
+   * semantics on each opencode.db without needing RWX storage.
+   *
+   * Mutually exclusive with `agentDbClaimName`. When both are undefined, no
+   * opencode-db volume is added (legacy behavior).
+   */
+  agentDbWorkspaceSubPath?: string;
   /**
    * Phase E.2: workspace PVC claim name supplied by a paperclip k8s execution
    * target's environment config. When set, overrides `selfPod.pvcClaimName`
@@ -299,14 +324,107 @@ function buildEnvVars(
 }
 
 /**
- * Build the OpenCode runtime config JSON for permission.external_directory=allow.
- * Returned as a string to be written inside the Job container.
+ * Build the OpenCode runtime config JSON written to ~/.config/opencode/opencode.json.
+ *
+ * Two responsibilities:
+ *  1. `permission.external_directory: "allow"` — preserves the original behavior
+ *     of bypassing opencode's per-directory permission prompt (Job pods have no
+ *     stdin).
+ *  2. Force opencode away from the default `opencode.ai/zen` provider, which
+ *     anonymously returns `FreeUsageLimitError` 429 within seconds and then
+ *     wedges the pod (the AI SDK marks the error retryable but never retries).
+ *     Instead route to the bundled `openai` provider in chatgpt-OAuth mode,
+ *     using the refreshed codex tokens that ccrotate writes to
+ *     ~/.codex/auth.json (see buildOpencodeAuthBootstrapShell).
+ *
+ * `disabled_providers: ["opencode"]` makes the failure loud (opencode exits
+ * immediately if no other provider is configured) instead of silently
+ * falling through to zen.
  */
 function buildRuntimeConfigJson(config: Record<string, unknown>): string | null {
   const skipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
-  if (!skipPermissions) return null;
-  return JSON.stringify({ permission: { external_directory: "allow" } }, null, 2);
+  const runtime: Record<string, unknown> = {
+    disabled_providers: ["opencode"],
+  };
+  if (skipPermissions) {
+    runtime.permission = { external_directory: "allow" };
+  }
+  return JSON.stringify(runtime, null, 2);
 }
+
+/**
+ * Shell snippet that translates ccrotate's codex auth file
+ * (`~/.codex/auth.json`, chatgpt-OAuth shape) into opencode's auth store
+ * (`~/.local/share/opencode/auth.json`, openai-OAuth shape) so opencode's
+ * built-in `openai` provider authenticates against ChatGPT instead of
+ * falling through to the anonymous zen free tier.
+ *
+ * Runs after `ccrotate next --target codex` so the codex auth file is fresh.
+ * Best-effort: failures (missing codex auth, parse errors) leave the pod
+ * to fail loud at the opencode invocation rather than masking the issue.
+ *
+ * Expiry is read from the id_token's `exp` claim; opencode's openai provider
+ * will refresh through its codex device-flow refresh endpoint when the access
+ * token expires.
+ */
+function buildOpencodeAuthBootstrapShell(): string {
+  return `mkdir -p ~/.local/share/opencode && node -e 'const fs=require("fs"),p=require("path"),H=process.env.HOME||".";try{const c=JSON.parse(fs.readFileSync(p.join(H,".codex","auth.json"),"utf8"));if(c.auth_mode!=="chatgpt"||!c.tokens||!c.tokens.access_token||!c.tokens.refresh_token)process.exit(0);let exp=Date.now()+30*60*1000;try{const part=c.tokens.id_token.split(".")[1];const pad="=".repeat((4-part.length%4)%4);const payload=JSON.parse(Buffer.from((part+pad).replace(/-/g,"+").replace(/_/g,"/"),"base64").toString());if(payload.exp)exp=payload.exp*1000;}catch(e){}const out={openai:{type:"oauth",access:c.tokens.access_token,refresh:c.tokens.refresh_token,expires:exp,accountId:c.tokens.account_id||null}};fs.writeFileSync(p.join(H,".local","share","opencode","auth.json"),JSON.stringify(out));}catch(e){console.error("[opencode-auth-bootstrap] skipped:",e.message);}' || true`;
+}
+
+/**
+ * docker:dind sidecar exposing /var/run/docker.sock to the agent container
+ * via a shared emptyDir. Deployed as a native Kubernetes 1.29+ sidecar
+ * (initContainer with restartPolicy: "Always"): starts before the main
+ * container, lives for the duration of the Job, terminates when main exits.
+ *
+ * Privileged because dockerd needs cgroups + devices. The cluster does not
+ * enforce PodSecurityStandards (see the k8s repo's
+ * feedback_pss_enforcement.md), so a privileged Pod is acceptable for
+ * opt-in agent toolchain use.
+ *
+ * DOCKER_TLS_CERTDIR="" disables dockerd's auto-TLS bootstrap — traffic
+ * stays on the unix socket inside the pod network namespace, no TCP
+ * exposure, no TLS handshakes adding to startup time.
+ */
+function buildDindSidecar(opts: {
+  image: string;
+  cpuLimit: string;
+  memoryLimit: string;
+}): k8s.V1Container {
+  // restartPolicy: "Always" on an init container is the native sidecar
+  // pattern (k8s 1.29 GA, 1.28 beta). The @kubernetes/client-node
+  // V1Container type predates this addition, so we declare an intersection
+  // type that adds the field instead of any-casting the whole container.
+  type SidecarContainer = k8s.V1Container & { restartPolicy?: string };
+  const sidecar: SidecarContainer = {
+    name: "dind",
+    image: opts.image,
+    imagePullPolicy: "IfNotPresent",
+    args: ["dockerd", "--host=unix:///var/run/docker.sock", "--storage-driver=overlay2"],
+    securityContext: { privileged: true, runAsUser: 0, runAsNonRoot: false },
+    env: [{ name: "DOCKER_TLS_CERTDIR", value: "" }],
+    resources: {
+      requests: { cpu: "100m", memory: "256Mi" },
+      limits: { cpu: opts.cpuLimit, memory: opts.memoryLimit },
+    },
+    volumeMounts: [
+      { name: "docker-graph", mountPath: "/var/lib/docker" },
+      { name: "docker-sock", mountPath: "/var/run" },
+    ],
+    restartPolicy: "Always",
+  };
+  return sidecar;
+}
+
+/**
+ * Shell snippet the main container prepends to its command when the DinD
+ * sidecar is enabled. Polls for /var/run/docker.sock to appear (sidecar
+ * dockerd needs ~5–15 s to come up) and bails out if it never does, so
+ * agent runs never silently proceed without docker available.
+ */
+const DIND_WAIT_PREAMBLE =
+  `i=0; while [ ! -S /var/run/docker.sock ] && [ $i -lt 60 ]; do sleep 0.5; i=$((i+1)); done; ` +
+  `if [ ! -S /var/run/docker.sock ]; then echo "dind sidecar socket /var/run/docker.sock never appeared after 30s" >&2; exit 1; fi`;
 
 export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const { ctx, selfPod } = input;
@@ -323,6 +441,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
 
   const namespace = asString(config.namespace, "") || selfPod.namespace;
   const image = asString(config.image, "") || selfPod.image;
+  const enableDocker = asBoolean(config.enableDocker, false);
+  const dockerImage = asString(config.dockerImage, "docker:28-dind");
+  const dockerCpuLimit = asString(config.dockerCpuLimit, "2");
+  const dockerMemoryLimit = asString(config.dockerMemoryLimit, "2Gi");
   const model = asString(config.model, "").trim();
   const variant = asString(config.variant, "").trim();
   const extraArgs = asStringArray(config.extraArgs);
@@ -405,8 +527,16 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // Build env vars
   const envVars = buildEnvVars(ctx, selfPod, config);
 
-  // OPENCODE_DB: set when a DB volume is present (dedicated PVC or ephemeral emptyDir)
-  if (input.agentDbClaimName !== undefined) {
+  // OPENCODE_DB: set when a DB volume is present (dedicated PVC, ephemeral
+  // emptyDir, or workspace subPath)
+  if (input.agentDbClaimName !== undefined && input.agentDbWorkspaceSubPath !== undefined) {
+    throw new Error(
+      "agentDbClaimName and agentDbWorkspaceSubPath are mutually exclusive — pass at most one",
+    );
+  }
+  const hasAgentDb =
+    input.agentDbClaimName !== undefined || input.agentDbWorkspaceSubPath !== undefined;
+  if (hasAgentDb) {
     const dbEnvIdx = envVars.findIndex((e) => e.name === "OPENCODE_DB");
     if (dbEnvIdx >= 0) {
       envVars[dbEnvIdx] = { name: "OPENCODE_DB", value: "/opencode-db/opencode.db" };
@@ -438,6 +568,13 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
           // the "allow access outside cwd" behavior when overriding via
           // OPENCODE_CONFIG (opencode does not merge config sources).
           permission: { external_directory: "allow" },
+          // Disable opencode.ai/zen for the same reason as
+          // buildRuntimeConfigJson: it returns FreeUsageLimitError 429
+          // anonymously and wedges the pod. Opencode falls through to
+          // the bundled `openai` provider in chatgpt-OAuth mode, fed by
+          // the auth.json that buildOpencodeAuthBootstrapShell writes
+          // from ~/.codex/auth.json.
+          disabled_providers: ["opencode"],
           mcp: opencodeMcpSection,
         })
       : null;
@@ -499,7 +636,8 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     volumeMounts.push({ name: "data", mountPath: workspaceMountPath });
   }
 
-  // OpenCode DB volume: dedicated PVC (string claim name) or ephemeral emptyDir (null)
+  // OpenCode DB volume: dedicated PVC (string claim name), ephemeral emptyDir
+  // (null), or workspace subPath (reuses the data volume).
   if (input.agentDbClaimName !== undefined) {
     volumes.push(
       input.agentDbClaimName !== null
@@ -507,6 +645,19 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         : { name: "opencode-db", emptyDir: {} },
     );
     volumeMounts.push({ name: "opencode-db", mountPath: "/opencode-db" });
+  } else if (input.agentDbWorkspaceSubPath !== undefined) {
+    // Reuse the workspace `data` volume; mount at /opencode-db on the given
+    // subPath. No new volume entry needed — kubelet creates the subdir lazily.
+    if (!workspaceClaim) {
+      throw new Error(
+        "agentDbWorkspaceSubPath requires a workspace data volume (workspaceVolumeClaim or selfPod.pvcClaimName must be set)",
+      );
+    }
+    volumeMounts.push({
+      name: "data",
+      mountPath: "/opencode-db",
+      subPath: input.agentDbWorkspaceSubPath,
+    });
   }
 
   // Mount secret volumes inherited from the Deployment pod
@@ -580,13 +731,40 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     : [];
   const accountsArg = openaiAccounts.length > 0 ? ` --accounts ${openaiAccounts.join(",")}` : "";
   const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target codex${accountsArg} >/dev/null 2>&1) || true`;
+  const authBootstrap = buildOpencodeAuthBootstrapShell();
   const configSetup = runtimeConfigJson
     ? `mkdir -p ~/.config/opencode && echo '${runtimeConfigJson.replace(/'/g, "'\\''")}' > ~/.config/opencode/opencode.json && `
     : "";
   // `set -o pipefail` so an opencode binary crash surfaces as a non-zero
   // shell exit code instead of being masked by tee's exit code. Mirrors
   // the claude_k8s adapter's fix.
-  const mainCommand = `set -o pipefail; ${ccrotateRefresh}; ${configSetup}cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee ${podLogPath}`;
+  //
+  // mkdir + touch the podLogPath BEFORE invoking opencode so paperclip's
+  // tailPodLogFile (30s file-existence wait) doesn't time out on the empty
+  // string when opencode is slow to produce its first byte (e.g. ccrotate
+  // negotiation, MCP server fetches, large model handshakes). Without
+  // this, tail returns "" and the run is mis-classified as
+  // adapter_failed/empty-stdout even though opencode is still working.
+  // The marker line is also useful in pod logs for confirming the pod
+  // reached the tee step at all.
+  const baseMainCommand = `set -o pipefail; ${ccrotateRefresh}; ${authBootstrap}; ${configSetup}mkdir -p $(dirname ${podLogPath}) && : > ${podLogPath} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${podLogPath}`;
+  // When the DinD sidecar is wired in, prepend the wait-for-socket loop
+  // so the agent never starts before dockerd is listening on the shared
+  // unix socket.
+  const mainCommand = enableDocker ? `${DIND_WAIT_PREAMBLE}; ${baseMainCommand}` : baseMainCommand;
+
+  // Wire the DinD sidecar's shared volumes + DOCKER_HOST env into the main
+  // container. Done after volumes/volumeMounts/envVars are otherwise built
+  // so this is a single localized change, easy to remove if we later move
+  // dockerd to a dedicated pod.
+  if (enableDocker) {
+    volumes.push(
+      { name: "docker-graph", emptyDir: {} },
+      { name: "docker-sock", emptyDir: {} },
+    );
+    volumeMounts.push({ name: "docker-sock", mountPath: "/var/run" });
+    envVars.push({ name: "DOCKER_HOST", value: "unix:///var/run/docker.sock" });
+  }
 
   const job: k8s.V1Job = {
     apiVersion: "batch/v1",
@@ -614,43 +792,48 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
           ...(selfPod.dnsConfig ? { dnsConfig: selfPod.dnsConfig } : {}),
           ...(Object.keys(nodeSelector).length > 0 ? { nodeSelector: nodeSelector as Record<string, string> } : {}),
           ...(tolerations.length > 0 ? { tolerations: tolerations as k8s.V1Toleration[] } : {}),
-          initContainers: [(() => {
-            // Build the init container command + env. Always writes prompt.txt;
-            // when an MCP fleet was assembled (baseline or per-agent override),
-            // also writes the merged opencode.json next to it. opencode.json is
-            // small (a few kB) so it travels via env var even when prompt itself
-            // goes the Secret-volume route.
-            const cmdParts = input.promptSecretName
-              ? ["cp /tmp/prompt-secret/prompt /tmp/prompt/prompt.txt"]
-              : [`printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt`];
-            const initEnv: k8s.V1EnvVar[] = input.promptSecretName
-              ? []
-              : [{ name: "PROMPT_CONTENT", value: prompt }];
-            if (opencodeConfigJson) {
-              cmdParts.push(`printf '%s' \"$OPENCODE_CONFIG_JSON\" > /tmp/prompt/opencode.json`);
-              initEnv.push({ name: "OPENCODE_CONFIG_JSON", value: opencodeConfigJson });
-            }
-            const initVolumeMounts: k8s.V1VolumeMount[] = [
-              { name: "prompt", mountPath: "/tmp/prompt" },
-            ];
-            if (input.promptSecretName) {
-              initVolumeMounts.push({ name: "prompt-secret", mountPath: "/tmp/prompt-secret", readOnly: true });
-            }
-            const initContainer: k8s.V1Container = {
-              name: "write-prompt",
-              image: "busybox:1.36",
-              imagePullPolicy: "IfNotPresent",
-              command: ["sh", "-c", cmdParts.join("; ")],
-              ...(initEnv.length > 0 ? { env: initEnv } : {}),
-              volumeMounts: initVolumeMounts,
-              securityContext,
-              resources: {
-                requests: { cpu: "10m", memory: "16Mi" },
-                limits: { cpu: "100m", memory: "64Mi" },
-              },
-            };
-            return initContainer;
-          })()],
+          initContainers: [
+            (() => {
+              // Build the init container command + env. Always writes prompt.txt;
+              // when an MCP fleet was assembled (baseline or per-agent override),
+              // also writes the merged opencode.json next to it. opencode.json is
+              // small (a few kB) so it travels via env var even when prompt itself
+              // goes the Secret-volume route.
+              const cmdParts = input.promptSecretName
+                ? ["cp /tmp/prompt-secret/prompt /tmp/prompt/prompt.txt"]
+                : [`printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt`];
+              const initEnv: k8s.V1EnvVar[] = input.promptSecretName
+                ? []
+                : [{ name: "PROMPT_CONTENT", value: prompt }];
+              if (opencodeConfigJson) {
+                cmdParts.push(`printf '%s' \"$OPENCODE_CONFIG_JSON\" > /tmp/prompt/opencode.json`);
+                initEnv.push({ name: "OPENCODE_CONFIG_JSON", value: opencodeConfigJson });
+              }
+              const initVolumeMounts: k8s.V1VolumeMount[] = [
+                { name: "prompt", mountPath: "/tmp/prompt" },
+              ];
+              if (input.promptSecretName) {
+                initVolumeMounts.push({ name: "prompt-secret", mountPath: "/tmp/prompt-secret", readOnly: true });
+              }
+              const initContainer: k8s.V1Container = {
+                name: "write-prompt",
+                image: "busybox:1.36",
+                imagePullPolicy: "IfNotPresent",
+                command: ["sh", "-c", cmdParts.join("; ")],
+                ...(initEnv.length > 0 ? { env: initEnv } : {}),
+                volumeMounts: initVolumeMounts,
+                securityContext,
+                resources: {
+                  requests: { cpu: "10m", memory: "16Mi" },
+                  limits: { cpu: "100m", memory: "64Mi" },
+                },
+              };
+              return initContainer;
+            })(),
+            ...(enableDocker
+              ? [buildDindSidecar({ image: dockerImage, cpuLimit: dockerCpuLimit, memoryLimit: dockerMemoryLimit })]
+              : []),
+          ],
           containers: [
             {
               name: "opencode",

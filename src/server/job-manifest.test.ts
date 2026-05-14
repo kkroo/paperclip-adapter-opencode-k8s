@@ -385,6 +385,59 @@ describe("agentDbClaimName — volume wiring", () => {
   });
 });
 
+describe("agentDbWorkspaceSubPath — workspace_subpath mode", () => {
+  // workspace_subpath needs a workspace data volume to live under, so these
+  // tests give selfPod a pvcClaimName.
+  const selfPodWithPvc = { ...mockSelfPod, pvcClaimName: "paperclip-data" };
+
+  it("sets OPENCODE_DB to /opencode-db/opencode.db when agentDbWorkspaceSubPath is set", () => {
+    const result = buildJobManifest({
+      ctx: mockCtx,
+      selfPod: selfPodWithPvc,
+      agentDbWorkspaceSubPath: ".opencode-db/co123/agent-abc/__heartbeat__",
+    });
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    expect(env.find((e) => e.name === "OPENCODE_DB")?.value).toBe("/opencode-db/opencode.db");
+  });
+
+  it("mounts /opencode-db on the data volume at the given subPath without adding a new volume", () => {
+    const result = buildJobManifest({
+      ctx: mockCtx,
+      selfPod: selfPodWithPvc,
+      agentDbWorkspaceSubPath: ".opencode-db/co123/agent-abc/issue-uuid",
+    });
+    const volumes = result.job.spec?.template?.spec?.volumes ?? [];
+    expect(volumes.find((v) => v.name === "opencode-db")).toBeUndefined();
+
+    const mounts = result.job.spec?.template?.spec?.containers?.[0].volumeMounts ?? [];
+    const dbMount = mounts.find((m) => m.mountPath === "/opencode-db");
+    expect(dbMount).toBeDefined();
+    expect(dbMount?.name).toBe("data");
+    expect(dbMount?.subPath).toBe(".opencode-db/co123/agent-abc/issue-uuid");
+  });
+
+  it("throws when agentDbClaimName and agentDbWorkspaceSubPath are both set", () => {
+    expect(() =>
+      buildJobManifest({
+        ctx: mockCtx,
+        selfPod: selfPodWithPvc,
+        agentDbClaimName: "opencode-db-agent-abc",
+        agentDbWorkspaceSubPath: ".opencode-db/co123/agent-abc/__heartbeat__",
+      }),
+    ).toThrow(/mutually exclusive/);
+  });
+
+  it("throws when agentDbWorkspaceSubPath is set without a workspace data volume", () => {
+    expect(() =>
+      buildJobManifest({
+        ctx: mockCtx,
+        selfPod: mockSelfPod, // pvcClaimName: null
+        agentDbWorkspaceSubPath: ".opencode-db/co123/agent-abc/__heartbeat__",
+      }),
+    ).toThrow(/requires a workspace data volume/);
+  });
+});
+
 describe("init container is unchanged by agentDbClaimName", () => {
   it("does not add extra env vars to init container for dedicated PVC mode", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, agentDbClaimName: "opencode-db-agent-abc" });
@@ -617,10 +670,17 @@ describe("buildJobManifest — MCP fleet wiring", () => {
     const parsed = JSON.parse(cfgEnv!.value!) as {
       $schema: string;
       permission: { external_directory: string };
+      disabled_providers: string[];
       mcp: Record<string, Record<string, unknown>>;
     };
     expect(parsed.$schema).toBe("https://opencode.ai/config.json");
     expect(parsed.permission.external_directory).toBe("allow");
+    // disabled_providers includes "opencode" so the zen free tier never
+    // catches a Job pod (it returned FreeUsageLimitError 429 within 3s
+    // and opencode silently wedged on retryable errors). With zen
+    // disabled the pod falls through to the bundled `openai` chatgpt
+    // OAuth provider, populated by buildOpencodeAuthBootstrapShell.
+    expect(parsed.disabled_providers).toEqual(["opencode"]);
 
     // claude split → opencode merged array
     expect(parsed.mcp.paperclip).toEqual({
@@ -748,6 +808,54 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
       const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command;
       expect(cmd?.[2]).not.toContain("--accounts");
+    });
+  });
+
+  describe("opencode-auth-bootstrap (codex → opencode auth.json)", () => {
+    // Background: opencode's default provider is opencode.ai/zen. With no
+    // auth.json present, zen returns FreeUsageLimitError 429 within ~3s and
+    // the AI SDK marks it retryable but never retries — opencode CLI then
+    // sits in epoll_wait indefinitely, paperclip-0's keepalive keeps the
+    // run "alive", and the watchdog never trips. The fix: translate the
+    // codex chatgpt-OAuth tokens (which ccrotate refreshes per Job) into
+    // opencode's openai-OAuth auth store on each Job spawn.
+
+    it("emits the auth bootstrap step between ccrotateRefresh and the opencode invocation", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const ccrotateIdx = cmd.indexOf("ccrotate next --yes --target codex");
+      const bootstrapIdx = cmd.indexOf(".local/share/opencode");
+      const opencodeIdx = cmd.indexOf("| opencode ");
+      expect(ccrotateIdx).toBeGreaterThan(-1);
+      expect(bootstrapIdx).toBeGreaterThan(ccrotateIdx);
+      expect(opencodeIdx).toBeGreaterThan(bootstrapIdx);
+    });
+
+    it("translates the codex auth.json shape (auth_mode=chatgpt + tokens) into the openai-OAuth shape opencode expects", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      // Reads codex auth + checks chatgpt mode + writes opencode auth.json
+      expect(cmd).toContain('".codex","auth.json"');
+      expect(cmd).toContain('auth_mode!=="chatgpt"');
+      expect(cmd).toContain('"share","opencode","auth.json"');
+      // Output keys: openai provider, oauth type, expiry from id_token exp claim
+      expect(cmd).toContain('openai:{type:"oauth"');
+      expect(cmd).toContain("payload.exp");
+      // Best-effort: never fail the pod on bootstrap errors
+      expect(cmd).toContain("|| true");
+    });
+  });
+
+  describe("buildRuntimeConfigJson + opencodeConfigJson disable opencode.ai/zen", () => {
+    it("default opencode.json (no per-agent MCP) sets disabled_providers=['opencode']", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      // The default-path config is inlined into the main command via
+      // `echo '...' > ~/.config/opencode/opencode.json`. Extract and parse.
+      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > ~\/\.config\/opencode\/opencode\.json/);
+      expect(match).toBeTruthy();
+      const parsed = JSON.parse(match![1].replace(/'\\''/g, "'")) as { disabled_providers?: string[] };
+      expect(parsed.disabled_providers).toEqual(["opencode"]);
     });
   });
 });

@@ -27,6 +27,13 @@ describe("ensureAgentDbPvc", () => {
     expect(createPvc).not.toHaveBeenCalled();
   });
 
+  it("returns null in workspace_subpath mode without calling K8s", async () => {
+    const result = await ensureAgentDbPvc(AGENT_ID, NAMESPACE, { agentDbMode: "workspace_subpath" });
+    expect(result).toBeNull();
+    expect(getPvc).not.toHaveBeenCalled();
+    expect(createPvc).not.toHaveBeenCalled();
+  });
+
   it("returns the PVC name when it already exists (dedicated_pvc)", async () => {
     vi.mocked(getPvc).mockResolvedValue({ metadata: { name: `opencode-db-${AGENT_ID}` } } as never);
     const result = await ensureAgentDbPvc(AGENT_ID, NAMESPACE, {
@@ -96,5 +103,53 @@ describe("ensureAgentDbPvc", () => {
     expect(result).toMatch(/^opencode-db-[a-z0-9-]+$/);
     expect(result).not.toContain("/");
     expect(result).not.toContain("@");
+  });
+});
+
+describe("sanitizeTaskKeyForPath", () => {
+  it("preserves UUIDs as lowercase", async () => {
+    const { sanitizeTaskKeyForPath } = await import("./execute.js");
+    expect(sanitizeTaskKeyForPath("E47C7A01-580D-48F3-AC1D-1A670D77BE8D"))
+      .toBe("e47c7a01-580d-48f3-ac1d-1a670d77be8d");
+  });
+
+  it("preserves __heartbeat__ marker", async () => {
+    const { sanitizeTaskKeyForPath } = await import("./execute.js");
+    expect(sanitizeTaskKeyForPath("__heartbeat__")).toBe("__heartbeat__");
+  });
+
+  it("collapses path-traversal characters into underscores", async () => {
+    const { sanitizeTaskKeyForPath } = await import("./execute.js");
+    expect(sanitizeTaskKeyForPath("../../etc/passwd")).toBe("______etc_passwd");
+    expect(sanitizeTaskKeyForPath("foo/bar")).toBe("foo_bar");
+  });
+
+  it("returns _no_task_ for null/empty input", async () => {
+    const { sanitizeTaskKeyForPath } = await import("./execute.js");
+    expect(sanitizeTaskKeyForPath(null)).toBe("_no_task_");
+    expect(sanitizeTaskKeyForPath("")).toBe("_no_task_");
+    expect(sanitizeTaskKeyForPath("   ")).toBe("_no_task_");
+  });
+
+  it("caps to 128 chars to prevent overlong path components", async () => {
+    const { sanitizeTaskKeyForPath } = await import("./execute.js");
+    const long = "a".repeat(500);
+    expect(sanitizeTaskKeyForPath(long)).toHaveLength(128);
+  });
+});
+
+describe("buildAgentDbWorkspaceSubPath", () => {
+  it("composes a stable per-(company, agent, task) path", async () => {
+    const { buildAgentDbWorkspaceSubPath } = await import("./execute.js");
+    expect(buildAgentDbWorkspaceSubPath("co123", "agent-abc", "__heartbeat__"))
+      .toBe(".opencode-db/co123/agent-abc/__heartbeat__");
+    expect(buildAgentDbWorkspaceSubPath("co123", "agent-abc", "e47c7a01-580d-48f3-ac1d-1a670d77be8d"))
+      .toBe(".opencode-db/co123/agent-abc/e47c7a01-580d-48f3-ac1d-1a670d77be8d");
+  });
+
+  it("uses _no_task_ when taskKey is null", async () => {
+    const { buildAgentDbWorkspaceSubPath } = await import("./execute.js");
+    expect(buildAgentDbWorkspaceSubPath("co123", "agent-abc", null))
+      .toBe(".opencode-db/co123/agent-abc/_no_task_");
   });
 });

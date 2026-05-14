@@ -1,7 +1,7 @@
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { inferOpenAiCompatibleBiller } from "@paperclipai/adapter-utils";
 import { asString, asNumber, asBoolean, parseObject, readPaperclipRuntimeSkillEntries, resolvePaperclipDesiredSkillNames } from "@paperclipai/adapter-utils/server-utils";
-import { readFile, open as fsOpen, writeFile as fsWriteFile, mkdtemp, type FileHandle } from "node:fs/promises";
+import { readFile, open as fsOpen, stat as fsStat, writeFile as fsWriteFile, mkdtemp, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -341,10 +341,10 @@ export async function tailPodLogFile(
     }
   }
 
-  // Check one more time before opening
-  let fh: FileHandle;
+  // Sanity-check existence before entering the loop; the loop reopens per
+  // poll so we don't hold an fh that would cache stale data on CephFS.
   try {
-    fh = await fsOpen(filePath, "r");
+    await fsStat(filePath);
   } catch {
     throw new Error(`Pod log file never appeared at ${filePath}`);
   }
@@ -354,51 +354,97 @@ export async function tailPodLogFile(
   let idleCount = 0;
   const accumulator: string[] = [];
 
+  // The pod-side `tee` and this paperclip-side reader are separate CephFS
+  // clients. A held FileHandle's data cap on the reader side does not
+  // invalidate when the writer extends the file — both `fh.stat()` and
+  // `fh.read(...)` will return the cached metadata + cached data from the
+  // moment the handle was opened, even after the writer has flushed
+  // hundreds of KB. We observed `<runId>.pod.ndjson` at 73 KiB / 107 KiB
+  // with real opencode JSONL on disk while paperclip's `<runId>.ndjson`
+  // (the run-log-store onLog target) had only `[paperclip] keepalive`
+  // lines, because tail's drain loop kept seeing size=0 / bytesRead=0 on
+  // the held fh.
+  //
+  // Open and close a fresh file handle per poll so each read goes through
+  // the kernel's dentry/MDS path and pulls fresh data caps from CephFS.
+  // Open + read + close is cheap on a single-digit-KB-per-poll write rate
+  // and the alternative (kubectl logs streaming) would require a full
+  // refactor of the tail interface.
+  let firstGrowthLogged = false;
   const drain = async (): Promise<boolean> => {
-    let size: number;
+    let fh: FileHandle | undefined;
     try {
+      fh = await fsOpen(filePath, "r");
       const stat = await fh.stat();
-      size = stat.size;
-    } catch {
+      const size = stat.size;
+      if (size <= offset) return false;
+      const buf = Buffer.alloc(size - offset);
+      const { bytesRead } = await fh.read(buf, 0, buf.length, offset);
+      // Surface diagnostic on the FIRST poll where stat says the file grew
+      // beyond `offset`. If we keep seeing growth-with-zero-bytes-read, that
+      // is the smoking gun for CephFS data caching even after fresh open.
+      if (!firstGrowthLogged) {
+        firstGrowthLogged = true;
+        try {
+          await onLog(
+            "stderr",
+            `[paperclip] tail first-growth stat.size=${size} offset=${offset} bytesRead=${bytesRead}\n`,
+          );
+        } catch {
+          /* non-fatal */
+        }
+      }
+      offset += bytesRead;
+      const chunk = buf.slice(0, bytesRead).toString("utf-8");
+      const lineParts = (pending + chunk).split("\n");
+      pending = lineParts.pop() ?? "";
+      for (const line of lineParts) {
+        await onLog("stdout", line + "\n");
+        accumulator.push(line + "\n");
+      }
+      return bytesRead > 0;
+    } catch (err) {
+      // Best-effort drain — a transient open / read error must not kill the
+      // outer poll loop. Swallow and let the next poll retry; if the failure
+      // mode persists, the run-log will show only `[paperclip] keepalive`
+      // lines (matching pre-fix behavior) rather than going completely
+      // silent because tailPodLogFile threw out of `Promise.allSettled`.
+      const message = err instanceof Error ? err.message : String(err);
+      try {
+        await onLog(
+          "stderr",
+          `[paperclip] tail drain error (will retry): ${message}\n`,
+        );
+      } catch {
+        // onLog itself can fail; ignore.
+      }
       return false;
+    } finally {
+      if (fh !== undefined) {
+        await fh.close().catch(() => undefined);
+      }
     }
-    if (size <= offset) return false;
-    const buf = Buffer.alloc(size - offset);
-    const { bytesRead } = await fh.read(buf, 0, buf.length, offset);
-    offset += bytesRead;
-    const chunk = buf.slice(0, bytesRead).toString("utf-8");
-    const lineParts = (pending + chunk).split("\n");
-    pending = lineParts.pop() ?? "";
-    for (const line of lineParts) {
-      await onLog("stdout", line + "\n");
-      accumulator.push(line + "\n");
-    }
-    return bytesRead > 0;
   };
 
-  try {
-    while (!stopSignal.stopped) {
-      const grew = await drain();
-      if (grew) {
-        idleCount = 0;
-      } else {
-        idleCount++;
-      }
-      if (stopSignal.stopped) break;
-      const pollMs = idleCount >= IDLE_THRESHOLD ? POLL_IDLE_MS : POLL_ACTIVE_MS;
-      await new Promise((r) => setTimeout(r, pollMs));
+  while (!stopSignal.stopped) {
+    const grew = await drain();
+    if (grew) {
+      idleCount = 0;
+    } else {
+      idleCount++;
     }
+    if (stopSignal.stopped) break;
+    const pollMs = idleCount >= IDLE_THRESHOLD ? POLL_IDLE_MS : POLL_ACTIVE_MS;
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
 
-    // Final drain after stopSignal — pick up any bytes written between the
-    // last read and the job reaching terminal state.
-    while (await drain()) { /* read until no more growth */ }
+  // Final drain after stopSignal — pick up any bytes written between the
+  // last read and the job reaching terminal state.
+  while (await drain()) { /* read until no more growth */ }
 
-    if (pending) {
-      await onLog("stdout", pending + "\n");
-      accumulator.push(pending + "\n");
-    }
-  } finally {
-    await fh.close();
+  if (pending) {
+    await onLog("stdout", pending + "\n");
+    accumulator.push(pending + "\n");
   }
 
   return accumulator.join("");
@@ -752,9 +798,39 @@ function ensureSigtermHandler(): void {
   });
 }
 
+export type AgentDbMode = "dedicated_pvc" | "ephemeral" | "workspace_subpath";
+
 /**
- * Ensure the per-agent dedicated PVC exists (dedicated_pvc mode) or return null (ephemeral).
- * Returns the PVC claim name on success, null when agentDbMode is "ephemeral".
+ * Sanitize a task_key for use as a filesystem path segment. UUIDs and
+ * `__heartbeat__` (the only currently-used shapes) pass through unchanged
+ * after lowercasing. Anything else is collapsed to underscores and capped
+ * so a hostile/oddly-shaped value can't escape its directory.
+ */
+export function sanitizeTaskKeyForPath(taskKey: string | null): string {
+  const raw = (taskKey ?? "").trim();
+  if (!raw) return "_no_task_";
+  return raw.toLowerCase().replace(/[^a-z0-9_-]/g, "_").slice(0, 128) || "_no_task_";
+}
+
+/**
+ * Build the subPath used for `workspace_subpath` agent DB mode. Per-task so
+ * that concurrent runs of the same agent on different tasks don't share a
+ * SQLite file. The heartbeat scheduler enforces one running pod per
+ * (company, agent, adapter, task_key), giving each subPath single-writer
+ * semantics.
+ */
+export function buildAgentDbWorkspaceSubPath(
+  companyId: string,
+  agentId: string,
+  taskKey: string | null,
+): string {
+  return `.opencode-db/${companyId}/${agentId}/${sanitizeTaskKeyForPath(taskKey)}`;
+}
+
+/**
+ * Ensure the per-agent dedicated PVC exists (dedicated_pvc mode) or return
+ * null (ephemeral / workspace_subpath, where no separate PVC is needed).
+ * Returns the PVC claim name on success.
  * Throws when agentDbStorageClass is missing in dedicated_pvc mode.
  */
 export async function ensureAgentDbPvc(
@@ -763,8 +839,8 @@ export async function ensureAgentDbPvc(
   config: Record<string, unknown>,
   kubeconfigPath?: string,
 ): Promise<string | null> {
-  const agentDbMode = (asString(config.agentDbMode, "dedicated_pvc").trim() || "dedicated_pvc") as "dedicated_pvc" | "ephemeral";
-  if (agentDbMode === "ephemeral") return null;
+  const agentDbMode = (asString(config.agentDbMode, "dedicated_pvc").trim() || "dedicated_pvc") as AgentDbMode;
+  if (agentDbMode === "ephemeral" || agentDbMode === "workspace_subpath") return null;
 
   // Build a K8s-safe PVC name from the agent ID (UUIDs are already alphanumeric+hyphens)
   const agentSlug = agentId.toLowerCase().replace(/[^a-z0-9-]/g, "").replace(/^-+|-+$/g, "").slice(0, 208);
@@ -1005,20 +1081,38 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // non-fatal: skill bundle is optional
   }
 
-  // Ensure per-agent DB PVC exists
+  // Resolve agent DB mounting strategy.
+  //
+  // - dedicated_pvc: per-agent PVC (RWO) — only one pod can mount at a time,
+  //   so this serializes runs of the same agent across all tasks.
+  // - ephemeral: emptyDir per pod — no cross-pod persistence; opencode session
+  //   resume always fails.
+  // - workspace_subpath: per-(agent, task) subdir on the workspace data PVC;
+  //   single-writer per task (heartbeat scheduler enforces one pod per
+  //   (agent, task)) and survives pod restart, so resume actually works.
+  const agentDbMode = (asString(config.agentDbMode, "dedicated_pvc").trim() || "dedicated_pvc") as AgentDbMode;
   let agentDbClaimName: string | null | undefined;
-  try {
-    agentDbClaimName = await ensureAgentDbPvc(agentId, guardNamespace, config, kubeconfigPath);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    await onLog("stderr", `[paperclip] Failed to ensure agent DB PVC: ${msg}\n`);
-    return {
-      exitCode: null,
-      signal: null,
-      timedOut: false,
-      errorMessage: msg,
-      errorCode: "k8s_job_create_failed",
-    };
+  let agentDbWorkspaceSubPath: string | undefined;
+  if (agentDbMode === "workspace_subpath") {
+    agentDbWorkspaceSubPath = buildAgentDbWorkspaceSubPath(
+      ctx.agent.companyId,
+      agentId,
+      ctx.runtime.taskKey,
+    );
+  } else {
+    try {
+      agentDbClaimName = await ensureAgentDbPvc(agentId, guardNamespace, config, kubeconfigPath);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await onLog("stderr", `[paperclip] Failed to ensure agent DB PVC: ${msg}\n`);
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        errorMessage: msg,
+        errorCode: "k8s_job_create_failed",
+      };
+    }
   }
 
   const buildArgs = {
@@ -1026,7 +1120,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     selfPod,
     instructionsContent: instructionsContent || undefined,
     skillsBundleContent: skillsBundleContent || undefined,
-    agentDbClaimName,
+    ...(agentDbWorkspaceSubPath !== undefined
+      ? { agentDbWorkspaceSubPath }
+      : { agentDbClaimName }),
     retainJobs,
     // Phase E.2: env-config-supplied workspace overrides (k8s remote target).
     // When unset, buildJobManifest falls back to selfPod.pvcClaimName and

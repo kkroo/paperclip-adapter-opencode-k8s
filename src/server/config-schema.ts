@@ -161,6 +161,40 @@ export function getConfigSchema(): AdapterConfigSchema {
         group: "Kubernetes",
       },
 
+      // Docker-in-Docker sidecar — opt-in. When enabled, a docker:dind
+      // sidecar runs alongside the agent container and exposes
+      // /var/run/docker.sock to it. Required for `docker build`,
+      // `kind create cluster`, and similar tooling. Pod becomes privileged.
+      {
+        key: "enableDocker",
+        label: "Enable Docker (DinD sidecar)",
+        type: "toggle",
+        default: false,
+        hint: "Add a docker:dind sidecar that exposes /var/run/docker.sock to the agent. Required for `docker build` and `kind create cluster`. Pod becomes privileged.",
+        group: "Docker",
+      },
+      {
+        key: "dockerImage",
+        label: "DinD Image",
+        type: "text",
+        hint: "Container image for the DinD sidecar (default docker:28-dind). Only used when Enable Docker is on.",
+        group: "Docker",
+      },
+      {
+        key: "dockerCpuLimit",
+        label: "DinD CPU Limit",
+        type: "text",
+        hint: "CPU limit for the DinD sidecar (default '2'). e.g. '2', '4000m'.",
+        group: "Docker",
+      },
+      {
+        key: "dockerMemoryLimit",
+        label: "DinD Memory Limit",
+        type: "text",
+        hint: "Memory limit for the DinD sidecar (default '2Gi'). e.g. '2Gi', '4Gi'.",
+        group: "Docker",
+      },
+
       // Operational fields (timeoutSec and graceSec are provided by the platform)
     ],
   };
