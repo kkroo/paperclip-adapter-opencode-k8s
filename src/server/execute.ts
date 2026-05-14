@@ -1111,30 +1111,46 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   }
 
-  // Set ownerReference on the prompt Secret
+  // Set ownerReference on the prompt Secret so kubelet cascade-deletes the
+  // Secret when the Job is garbage-collected. Without this the per-run Secret
+  // leaks forever (BLO-5310). The @kubernetes/client-node PATCH defaults to
+  // `application/json-patch+json` content-type, which expects an RFC 6902
+  // array-of-ops body — not the strategic-merge object we used to send. The
+  // claude_k8s adapter (which has never leaked Secrets) uses the JSON Patch
+  // shape below; mirror it here. blockOwnerDeletion=false so a stuck Secret
+  // never blocks Job GC.
   if (promptSecretName && createdJob?.metadata?.uid) {
     try {
       const coreApi = getCoreApi(kubeconfigPath);
       await coreApi.patchNamespacedSecret({
         name: promptSecretName,
         namespace,
-        body: {
-          metadata: {
-            ownerReferences: [
+        body: [
+          {
+            op: "add",
+            path: "/metadata/ownerReferences",
+            value: [
               {
                 apiVersion: "batch/v1",
                 kind: "Job",
                 name: jobName,
                 uid: createdJob.metadata.uid,
-                controller: true,
-                blockOwnerDeletion: true,
+                blockOwnerDeletion: false,
               },
             ],
           },
-        } as k8s.V1Secret,
+        ] as unknown as k8s.V1Secret,
       });
-    } catch {
-      // non-fatal
+    } catch (err) {
+      // Non-fatal: explicit cleanup paths still run on success/error/SIGTERM.
+      // We log the failure so operators don't have to grep the cluster for
+      // leaked Secrets (the pre-fix mode where the patch silently failed for
+      // months and orphan Secrets piled up to 3,395 in the paperclip ns).
+      const msg = err instanceof Error ? err.message : String(err);
+      await onLog(
+        "stderr",
+        `[paperclip] Warning: failed to set ownerReference on prompt Secret ${promptSecretName}: ${msg}\n`,
+      );
     }
   }
 

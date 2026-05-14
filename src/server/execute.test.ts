@@ -1059,22 +1059,29 @@ describe("execute — large-prompt Secret path", () => {
     const ctx = makeCtx();
     await execute(ctx);
 
+    // JSON Patch (RFC 6902) body shape — matches @kubernetes/client-node's
+    // default application/json-patch+json content-type. Previously this was
+    // a strategic-merge object which the client-node SDK rejected silently,
+    // letting the Secret leak (BLO-5310).
     expect(coreApi.patchNamespacedSecret).toHaveBeenCalledWith(
       expect.objectContaining({
         name: `${JOB_NAME}-prompt`,
         namespace: NAMESPACE,
-        body: expect.objectContaining({
-          metadata: expect.objectContaining({
-            ownerReferences: [
+        body: [
+          expect.objectContaining({
+            op: "add",
+            path: "/metadata/ownerReferences",
+            value: [
               expect.objectContaining({
+                apiVersion: "batch/v1",
                 kind: "Job",
                 name: JOB_NAME,
                 uid: "uid-abc-123",
-                controller: true,
+                blockOwnerDeletion: false,
               }),
             ],
           }),
-        }),
+        ],
       }),
     );
   });
