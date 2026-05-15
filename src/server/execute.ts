@@ -10,7 +10,8 @@ import {
   isOpenCodeStepLimitResult,
   isOpenCodeContextOverflowResult,
 } from "./parse.js";
-import { getSelfPodInfo, getBatchApi, getCoreApi, getPvc, createPvc } from "./k8s-client.js";
+import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
+import { PassThrough } from "node:stream";
 import { buildJobManifest, LARGE_PROMPT_THRESHOLD_BYTES, buildPodLogPath } from "./job-manifest.js";
 import type * as k8s from "@kubernetes/client-node";
 
@@ -451,6 +452,112 @@ export async function tailPodLogFile(
   return accumulator.join("");
 }
 
+/**
+ * Stream pod container logs via the Kubernetes API instead of polling the
+ * tee'd PVC file. Solves the cephfs cross-client stale-stat problem that
+ * silently truncated long agent runs to their first ~300 bytes of output.
+ *
+ * Background (2026-05-15 debugging session): paperclip-0 and the agent
+ * pod are separate cephfs clients sharing the same RWX `paperclip-data`
+ * PVC. Even with `open + stat + read + close` per poll, paperclip's stat
+ * cap stayed pinned at the size from the moment the file first appeared.
+ * The hundreds of KB the pod kept tee-ing past that point were on disk
+ * and visible from the pod's perspective, but `fh.stat().size` from
+ * paperclip-0 reported `304` forever — so the drain loop's
+ * `if (size <= offset) return false;` short-circuited every subsequent
+ * poll. The `tail first-growth stat.size=304 offset=0 bytesRead=304`
+ * diagnostic across hundreds of Staff Engineer run-logs confirmed this.
+ *
+ * Switching to the kubelet's container-log streaming endpoint sidesteps
+ * cephfs entirely: kubelet reads the container's stdout from its
+ * runtime-level capture (containerd's log file on the agent node) and
+ * proxies it through the API server. Both writer and reader see the
+ * same authoritative byte stream, end of story.
+ *
+ * The pod-side `tee -a <podLogPath>` is left in place by job-manifest.ts
+ * as forensic backup (operators can still `cat` the file when the API
+ * is unavailable), but this function does not depend on it.
+ */
+export async function tailPodContainerLogs(
+  namespace: string,
+  podName: string,
+  containerName: string,
+  opts: TailOptions & { kubeconfigPath?: string },
+): Promise<string> {
+  const { onLog, stopSignal, kubeconfigPath } = opts;
+  const STOP_POLL_MS = 250;
+  const DRAIN_AFTER_STOP_MS = 1000;
+
+  // The caller (streamAndAwaitJob) already resolved the pod name via
+  // waitForPod() before calling us — by the time we run, the container
+  // is in Running phase (or terminal). No need to re-poll listNamespacedPod
+  // here; the @kubernetes/client-node Log API will block-and-retry until
+  // the container log buffer is readable.
+
+  const logApi = getLogApi(kubeconfigPath);
+  const accumulator: string[] = [];
+  let pending = "";
+  let firstByteLogged = false;
+  let streamEnded = false;
+
+  // PassThrough acts as the Writable sink that @kubernetes/client-node's
+  // Log.log() writes the proxied container output into. We split on
+  // newlines and emit each complete line via onLog so heartbeat-side
+  // parsing sees them in the same shape it would from the polled file.
+  const stream = new PassThrough();
+  stream.setEncoding("utf-8");
+  stream.on("data", (chunk: string) => {
+    if (!firstByteLogged) {
+      firstByteLogged = true;
+      void onLog("stderr", `[paperclip] kubectl-logs stream live (first chunk ${chunk.length}B)\n`).catch(
+        () => undefined,
+      );
+    }
+    const lineParts = (pending + chunk).split("\n");
+    pending = lineParts.pop() ?? "";
+    for (const line of lineParts) {
+      void onLog("stdout", line + "\n").catch(() => undefined);
+      accumulator.push(line + "\n");
+    }
+  });
+  stream.on("end", () => {
+    streamEnded = true;
+  });
+
+  let abortController: AbortController | undefined;
+  try {
+    abortController = await logApi.log(namespace, podName, containerName, stream, { follow: true });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`Failed to open log stream for ${namespace}/${podName}/${containerName}: ${message}`);
+  }
+
+  // Hold the function open until the heartbeat caller flips stopSignal
+  // (waitForJobCompletion fired) OR the underlying stream ends on its
+  // own (container terminated and kubelet closed the connection).
+  while (!stopSignal.stopped && !streamEnded) {
+    await new Promise((r) => setTimeout(r, STOP_POLL_MS));
+  }
+
+  // Give kubelet a moment to flush the tail of the buffer before we
+  // abort the connection. Without this, the last few hundred bytes of
+  // a fast-exiting container are sometimes dropped on the floor.
+  await new Promise((r) => setTimeout(r, DRAIN_AFTER_STOP_MS));
+
+  try {
+    abortController?.abort();
+  } catch {
+    /* non-fatal */
+  }
+
+  if (pending) {
+    await onLog("stdout", pending + "\n").catch(() => undefined);
+    accumulator.push(pending + "\n");
+  }
+
+  return accumulator.join("");
+}
+
 async function cleanupJob(
   namespace: string,
   jobName: string,
@@ -611,8 +718,19 @@ async function streamAndAwaitJob(
       completionPromise,
       completionTimeoutMs > 0 ? LOG_EXIT_COMPLETION_GRACE_MS : 0,
     );
+    // Stream pod stdout via the Kubernetes log API instead of polling
+    // the tee'd PVC file. The previous file-polling path silently
+    // truncated long runs to ~300 bytes because cephfs's metadata cap
+    // pinned `stat().size` on this side even after the agent pod kept
+    // writing — see tailPodContainerLogs doc-comment for the full
+    // post-mortem. The tee is preserved by job-manifest.ts for forensic
+    // backup but no longer participates in the live tail.
     const [tailSettled, completionSettled] = await Promise.allSettled([
-      tailPodLogFile(podLogPath, { onLog: wrappedOnLog, stopSignal }),
+      tailPodContainerLogs(namespace, podName, "opencode", {
+        onLog: wrappedOnLog,
+        stopSignal,
+        kubeconfigPath,
+      }),
       completionGraced,
     ]);
     stdout = tailSettled.status === "fulfilled" ? tailSettled.value : "";
