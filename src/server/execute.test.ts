@@ -1,13 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { execute, ensureAgentDbPvc, tailPodLogFile, mergeEnvironmentConfig } from "./execute.js";
-import { getSelfPodInfo, getBatchApi, getCoreApi, getPvc, createPvc } from "./k8s-client.js";
+import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
+import { PassThrough } from "node:stream";
 import { buildJobManifest, buildPodLogPath } from "./job-manifest.js";
 
 // Mock node:fs/promises so tailPodLogFile (used by execute()) reads a
 // configurable JSONL payload and returns. Individual tests override the
 // payload via setMockJsonl(...) before calling execute().
-const { readMock, statMock, fhStatMock, resetFsMocks, setMockJsonl } = vi.hoisted(() => {
+const { readMock, statMock, fhStatMock, resetFsMocks, setMockJsonl, getMockPayload } = vi.hoisted(() => {
   const HAPPY = [
     JSON.stringify({ type: "text", part: { text: "Task complete" }, sessionID: "ses_happy" }),
     JSON.stringify({ type: "step_finish", part: { tokens: { input: 100, output: 50, cache: { read: 20 } }, cost: 0.002 } }),
@@ -29,6 +30,9 @@ const { readMock, statMock, fhStatMock, resetFsMocks, setMockJsonl } = vi.hoiste
     fhStatMock: vi.fn().mockImplementation(async () => ({ size: buffer.byteLength })),
     resetFsMocks: () => { apply(HAPPY); },
     setMockJsonl: (jsonl: string) => { apply(jsonl); },
+    // Exposed so makeLogApiFromFsMock() can pull the *current* payload
+    // at the moment .log() is called (after any per-test setMockJsonl).
+    getMockPayload: () => payload,
   };
 });
 
@@ -50,6 +54,7 @@ vi.mock("./k8s-client.js", () => ({
   getSelfPodInfo: vi.fn(),
   getBatchApi: vi.fn(),
   getCoreApi: vi.fn(),
+  getLogApi: vi.fn(),
   getPvc: vi.fn().mockResolvedValue({ metadata: { name: "opencode-db-agent-id-test" } }),
   createPvc: vi.fn().mockResolvedValue({}),
 }));
@@ -123,6 +128,58 @@ function makeCtx(configOverrides: Record<string, unknown> = {}, contextOverrides
   } as unknown as AdapterExecutionContext;
 }
 
+/**
+ * Mock for `getLogApi()` — returns an object whose `.log()` matches the
+ * @kubernetes/client-node Log.log signature: writes the configured
+ * payload into the Writable stream then resolves with an AbortController.
+ *
+ * `payload` defaults to "" — tests that need to assert on streamed
+ * stdout (happy path, reattach, etc.) override per-test by passing the
+ * full pod stdout JSONL string. Empty payload is the right default for
+ * tests that exercise other code paths (concurrency guard, SIGTERM,
+ * scheduling failure) and don't care what the tail emits.
+ */
+/**
+ * Variant of makeLogApi that pulls the streamed payload from the fs
+ * mock's current buffer at the moment `.log()` is called. This lets
+ * tests that override the fs payload via `setMockJsonl(...)` also drive
+ * the new k8s-logs streaming path without per-test getLogApi setup.
+ */
+function makeLogApiFromFsMock() {
+  return {
+    log: vi.fn(async (
+      _namespace: string,
+      _podName: string,
+      _container: string,
+      stream: import("node:stream").Writable,
+    ) => {
+      // Pull the current shared payload (mutated by setMockJsonl per test).
+      const payload = getMockPayload();
+      if (payload) stream.write(payload);
+      stream.end();
+      return { abort: vi.fn() } as unknown as AbortController;
+    }),
+  };
+}
+
+function makeLogApi(payload: string = "") {
+  return {
+    log: vi.fn(async (
+      _namespace: string,
+      _podName: string,
+      _container: string,
+      stream: import("node:stream").Writable,
+    ) => {
+      // Push the payload then end the stream so the consumer flips
+      // `streamEnded=true` and exits its hold loop without waiting for
+      // the test's job-completion poll to fire.
+      if (payload) stream.write(payload);
+      stream.end();
+      return { abort: vi.fn() } as unknown as AbortController;
+    }),
+  };
+}
+
 function makeBatchApi(runningJobItems: unknown[] = []) {
   return {
     listNamespacedJob: vi.fn().mockResolvedValue({ items: runningJobItems }),
@@ -193,6 +250,20 @@ beforeEach(() => {
 
   vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
   vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+  // Default log-stream mock: tailPodContainerLogs calls
+  // `getLogApi().log(ns, pod, container, stream)` which writes the
+  // current fs mock payload into the Writable + returns an
+  // AbortController. We delegate the payload to the fs mock helper
+  // (`setMockJsonl` mutates the same shared buffer) so existing tests
+  // that call setMockJsonl(...) continue to drive both surfaces from a
+  // single source of truth. Default is the same HAPPY_JSONL the
+  // file-based mock used (sessionID: ses_happy + step_finish with
+  // tokens) so happy-path assertions on result.sessionId / usage pass
+  // unchanged.
+  vi.mocked(getLogApi).mockReturnValue(
+    makeLogApiFromFsMock() as unknown as ReturnType<typeof getLogApi>,
+  );
 });
 
 describe("execute — concurrency guard", () => {
