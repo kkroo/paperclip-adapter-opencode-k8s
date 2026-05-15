@@ -20,12 +20,21 @@ export const sessionCodec: AdapterSessionCodec = {
     const workspaceId = readNonEmptyString(record.workspaceId) ?? readNonEmptyString(record.workspace_id);
     const repoUrl = readNonEmptyString(record.repoUrl) ?? readNonEmptyString(record.repo_url);
     const repoRef = readNonEmptyString(record.repoRef) ?? readNonEmptyString(record.repo_ref);
+    // Lifecycle flag set by execute.ts when a run fails with
+    // ContextOverflowError. job-manifest.ts reads it on the next run to
+    // inject `/compact` as a prefix before the main prompt. Must survive
+    // the persistence round-trip (heartbeat.ts serializes the adapter's
+    // returned sessionParams into agent_runtime_state.state_json via
+    // this codec). Without this entry the flag is silently dropped and
+    // auto-compact never fires.
+    const needsCompactBeforeNextRun = record.needsCompactBeforeNextRun === true;
     return {
       sessionId,
       ...(cwd ? { cwd } : {}),
       ...(workspaceId ? { workspaceId } : {}),
       ...(repoUrl ? { repoUrl } : {}),
       ...(repoRef ? { repoRef } : {}),
+      ...(needsCompactBeforeNextRun ? { needsCompactBeforeNextRun: true } : {}),
     };
   },
   serialize(params: Record<string, unknown> | null) {
@@ -42,12 +51,14 @@ export const sessionCodec: AdapterSessionCodec = {
     const workspaceId = readNonEmptyString(params.workspaceId) ?? readNonEmptyString(params.workspace_id);
     const repoUrl = readNonEmptyString(params.repoUrl) ?? readNonEmptyString(params.repo_url);
     const repoRef = readNonEmptyString(params.repoRef) ?? readNonEmptyString(params.repo_ref);
+    const needsCompactBeforeNextRun = params.needsCompactBeforeNextRun === true;
     return {
       sessionId,
       ...(cwd ? { cwd } : {}),
       ...(workspaceId ? { workspaceId } : {}),
       ...(repoUrl ? { repoUrl } : {}),
       ...(repoRef ? { repoRef } : {}),
+      ...(needsCompactBeforeNextRun ? { needsCompactBeforeNextRun: true } : {}),
     };
   },
   getDisplayId(params: Record<string, unknown> | null) {

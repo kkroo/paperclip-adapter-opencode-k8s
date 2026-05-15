@@ -122,6 +122,20 @@ describe("sessionCodec.deserialize", () => {
     expect(result && "workspaceId" in result).toBe(false);
     expect(result && "repoUrl" in result).toBe(false);
     expect(result && "repoRef" in result).toBe(false);
+    expect(result && "needsCompactBeforeNextRun" in result).toBe(false);
+  });
+
+  it("passes needsCompactBeforeNextRun=true through", () => {
+    const result = sessionCodec.deserialize({ sessionId: "s1", needsCompactBeforeNextRun: true });
+    expect(result?.needsCompactBeforeNextRun).toBe(true);
+  });
+
+  it("drops needsCompactBeforeNextRun when not strictly true", () => {
+    // Defensive: a truthy non-boolean ("yes", 1, {}) shouldn't trigger
+    // /compact injection on the next run.
+    expect(sessionCodec.deserialize({ sessionId: "s1", needsCompactBeforeNextRun: false })?.needsCompactBeforeNextRun).toBeUndefined();
+    expect(sessionCodec.deserialize({ sessionId: "s1", needsCompactBeforeNextRun: "true" } as unknown as Record<string, unknown>)?.needsCompactBeforeNextRun).toBeUndefined();
+    expect(sessionCodec.deserialize({ sessionId: "s1", needsCompactBeforeNextRun: 1 } as unknown as Record<string, unknown>)?.needsCompactBeforeNextRun).toBeUndefined();
   });
 
   it("includes all fields when all are present", () => {
@@ -200,6 +214,22 @@ describe("sessionCodec.serialize", () => {
   it("omits absent optional fields", () => {
     const result = sessionCodec.serialize({ sessionId: "s1" });
     expect(result).toEqual({ sessionId: "s1" });
+  });
+
+  it("passes needsCompactBeforeNextRun=true through (auto-compact lifecycle flag)", () => {
+    // Without this, execute.ts can set the flag on its adapter result
+    // but the next run won't see it — auto-compact never fires. See
+    // session.ts for the full chain.
+    const result = sessionCodec.serialize({
+      sessionId: "ses_overflowed",
+      needsCompactBeforeNextRun: true,
+    });
+    expect(result?.needsCompactBeforeNextRun).toBe(true);
+  });
+
+  it("drops needsCompactBeforeNextRun when false/unset/non-boolean", () => {
+    expect(sessionCodec.serialize({ sessionId: "s1", needsCompactBeforeNextRun: false })?.needsCompactBeforeNextRun).toBeUndefined();
+    expect(sessionCodec.serialize({ sessionId: "s1" })?.needsCompactBeforeNextRun).toBeUndefined();
   });
 });
 
