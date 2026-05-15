@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { parseOpenCodeJsonl, isOpenCodeUnknownSessionError, isOpenCodeStepLimitResult } from "./parse.js";
+import {
+  parseOpenCodeJsonl,
+  isOpenCodeUnknownSessionError,
+  isOpenCodeStepLimitResult,
+  isOpenCodeContextOverflowResult,
+} from "./parse.js";
 
 describe("parseOpenCodeJsonl", () => {
   it("parses text messages", () => {
@@ -222,5 +227,74 @@ describe("parseOpenCodeJsonl — errorText fallback paths", () => {
     });
     const result = parseOpenCodeJsonl(stdout);
     expect(result.errorMessage).toContain("unexpectedShape");
+  });
+});
+
+describe("isOpenCodeContextOverflowResult", () => {
+  it("detects the ContextOverflowError shape opencode emits", () => {
+    const stdout = JSON.stringify({
+      type: "error",
+      error: {
+        name: "ContextOverflowError",
+        data: { message: "Input exceeds context window of this model" },
+      },
+      sessionID: "ses_overflow",
+    });
+    expect(isOpenCodeContextOverflowResult(stdout)).toBe(true);
+  });
+
+  it("detects nested responseBody with context_length_exceeded (openai surface)", () => {
+    const stdout = JSON.stringify({
+      type: "error",
+      error: {
+        name: "SomeOtherError",
+        data: {
+          responseBody: JSON.stringify({
+            type: "error",
+            error: {
+              type: "invalid_request_error",
+              code: "context_length_exceeded",
+              message: "Your input exceeds the context window of this model.",
+            },
+          }),
+        },
+      },
+    });
+    expect(isOpenCodeContextOverflowResult(stdout)).toBe(true);
+  });
+
+  it("detects bare context_length_exceeded on an error line (defensive)", () => {
+    const stdout = `{"type":"error","error":{"code":"context_length_exceeded"}}`;
+    expect(isOpenCodeContextOverflowResult(stdout)).toBe(true);
+  });
+
+  it("returns false for unrelated error events", () => {
+    const stdout = JSON.stringify({
+      type: "error",
+      error: { name: "ProviderAuthError", data: { message: "Invalid API key" } },
+    });
+    expect(isOpenCodeContextOverflowResult(stdout)).toBe(false);
+  });
+
+  it("returns false for non-error events even if they mention overflow", () => {
+    const stdout = JSON.stringify({
+      type: "text",
+      part: { text: "context_length_exceeded was the prior error" },
+    });
+    expect(isOpenCodeContextOverflowResult(stdout)).toBe(false);
+  });
+
+  it("returns false for empty stdout", () => {
+    expect(isOpenCodeContextOverflowResult("")).toBe(false);
+  });
+
+  it("only treats error-type lines as evidence, not arbitrary text matching the code", () => {
+    // Defensive: a tool_use output that happens to mention the code string
+    // should not trigger the detector.
+    const stdout = JSON.stringify({
+      type: "tool_use",
+      part: { state: { status: "ok", output: "{\"code\":\"context_length_exceeded\"}" } },
+    });
+    expect(isOpenCodeContextOverflowResult(stdout)).toBe(false);
   });
 });

@@ -8,6 +8,7 @@ import {
   parseOpenCodeJsonl,
   isOpenCodeUnknownSessionError,
   isOpenCodeStepLimitResult,
+  isOpenCodeContextOverflowResult,
 } from "./parse.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi, getPvc, createPvc } from "./k8s-client.js";
 import { buildJobManifest, LARGE_PROMPT_THRESHOLD_BYTES, buildPodLogPath } from "./job-manifest.js";
@@ -718,6 +719,32 @@ async function streamAndAwaitJob(
     await onLog("stdout", `[paperclip] OpenCode step limit reached; clearing session for next run.\n`);
   }
 
+  // Context-overflow auto-remediation. When the model rejects the prompt
+  // because the session's accumulated history blew past the context window,
+  // schedule a `/compact` for the next wake (handled in job-manifest's
+  // command pipeline). Compaction is preferred over session rotation
+  // because it preserves the agent's working context.
+  //
+  // Pairs with the proactive threshold below: between the two, we should
+  // rarely actually hit the overflow path in steady state.
+  const contextOverflow = failed && isOpenCodeContextOverflowResult(stdout);
+  if (contextOverflow) {
+    await onLog(
+      "stdout",
+      `[paperclip] Context window overflow detected; scheduling /compact for next wake (session preserved).\n`,
+    );
+    return {
+      exitCode: synthesizedExitCode,
+      signal: null,
+      timedOut: false,
+      errorMessage: "Context window exhausted; compaction scheduled for next wake",
+      errorCode: "context_overflow",
+      sessionId: resolvedSessionId,
+      sessionParams: { ...resolvedSessionParams, needsCompactBeforeNextRun: true } as Record<string, unknown>,
+      resultJson: { stdout },
+    };
+  }
+
   const hasLlmOutput = parsed.usage.outputTokens > 0 || !!parsed.summary;
   if (!jobTimedOut && parsed.sessionId !== null && !hasLlmOutput && !parsedError) {
     await onLog("stderr", `[paperclip] LLM returned empty response (0 output tokens).\n`);
@@ -741,6 +768,33 @@ async function streamAndAwaitJob(
   const fallbackErrorMessage =
     errorParts.join("; ") || firstStderrLine || `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
 
+  // Proactive compaction gate. opencode reports `inputTokens` for the full
+  // payload sent to the model (system + history + new prompt). When that's
+  // close to the model's context window, compact the next wake before the
+  // session actually overflows. Threshold is conservative: 90k matches
+  // ~70% of a 128k window (the smallest mainstream window we ship — claude
+  // 3.5 sonnet is 200k, openai/gpt-5.5 is larger still, codex/gpt-4 is
+  // 128k). Better to compact a few wakes too early than burn a wake on a
+  // hard overflow.
+  const INPUT_TOKEN_COMPACT_THRESHOLD = 90_000;
+  const approachingWindow = parsed.usage.inputTokens > INPUT_TOKEN_COMPACT_THRESHOLD;
+  if (approachingWindow) {
+    await onLog(
+      "stdout",
+      `[paperclip] Input tokens ${parsed.usage.inputTokens} > threshold ${INPUT_TOKEN_COMPACT_THRESHOLD}; scheduling /compact for next wake.\n`,
+    );
+  }
+
+  // Whatever was set on the incoming sessionParams has already been
+  // consumed by job-manifest (the /compact prefix ran at the start of this
+  // pod). Always clear it on the return; re-set only if the proactive gate
+  // tripped this run.
+  const nextSessionParams: Record<string, unknown> = { ...resolvedSessionParams };
+  delete nextSessionParams.needsCompactBeforeNextRun;
+  if (approachingWindow) {
+    nextSessionParams.needsCompactBeforeNextRun = true;
+  }
+
   return {
     exitCode: synthesizedExitCode,
     signal: null,
@@ -752,7 +806,7 @@ async function streamAndAwaitJob(
       cachedInputTokens: parsed.usage.cachedInputTokens,
     },
     sessionId: resolvedSessionId,
-    sessionParams: resolvedSessionParams,
+    sessionParams: nextSessionParams,
     sessionDisplayId: resolvedSessionId,
     provider,
     model: model || null,
