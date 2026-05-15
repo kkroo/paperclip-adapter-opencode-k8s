@@ -936,41 +936,68 @@ describe("execute — log dedup (waitForPod status dedup)", () => {
   });
 
   it("logs each distinct pod phase transition exactly once", async () => {
-    const logMessages: string[] = [];
-    const coreApi = {
-      listNamespacedPod: vi.fn()
-        .mockResolvedValueOnce({
-          items: [{ metadata: { name: POD_NAME }, status: { phase: "Pending" } }],
-        })
-        .mockResolvedValueOnce({
-          // Same Pending state — should NOT produce duplicate log
-          items: [{ metadata: { name: POD_NAME }, status: { phase: "Pending" } }],
-        })
-        .mockResolvedValueOnce({
-          items: [{ metadata: { name: POD_NAME }, status: { phase: "Running" } }],
-        })
-        .mockResolvedValueOnce({
-          // getPodExitCode call
-          items: [{
-            status: { containerStatuses: [{ name: "opencode", state: { terminated: { exitCode: 0 } } }] },
-          }],
+    // Two Pending observations + one Running observation force waitForPod
+    // to sleep POLL_INTERVAL_MS (2s) twice. Under real timers that's >4s
+    // of wall time, blowing vitest's 5s testTimeout. Use fake timers and
+    // advance manually so the loop completes in test time.
+    vi.useFakeTimers();
+    try {
+      const logMessages: string[] = [];
+      const coreApi = {
+        listNamespacedPod: vi.fn()
+          .mockResolvedValueOnce({
+            items: [{ metadata: { name: POD_NAME }, status: { phase: "Pending" } }],
+          })
+          .mockResolvedValueOnce({
+            // Same Pending state — should NOT produce duplicate log
+            items: [{ metadata: { name: POD_NAME }, status: { phase: "Pending" } }],
+          })
+          .mockResolvedValueOnce({
+            items: [{ metadata: { name: POD_NAME }, status: { phase: "Running" } }],
+          })
+          .mockResolvedValueOnce({
+            // getPodExitCode call
+            items: [{
+              status: { containerStatuses: [{ name: "opencode", state: { terminated: { exitCode: 0 } } }] },
+            }],
+          }),
+        readNamespacedPodLog: vi.fn().mockResolvedValue(HAPPY_JSONL),
+        // execute() creates a prompt Secret before streaming and cleans
+        // it up in the finally block. Without these stubs the calls
+        // return undefined; non-fatal in practice but leaves a hanging
+        // promise that gets blamed on subsequent tests' coreApi mocks
+        // when this one times out (cascading "podList.items is undefined"
+        // in unrelated tests).
+        createNamespacedSecret: vi.fn().mockResolvedValue({}),
+        deleteNamespacedSecret: vi.fn().mockResolvedValue({}),
+        patchNamespacedSecret: vi.fn().mockResolvedValue({}),
+      };
+      vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+      const ctx = {
+        ...makeCtx(),
+        onLog: vi.fn(async (_type: string, msg: string) => {
+          logMessages.push(msg);
         }),
-      readNamespacedPodLog: vi.fn().mockResolvedValue(HAPPY_JSONL),
-    };
-    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+      } as unknown as AdapterExecutionContext;
 
-    const ctx = {
-      ...makeCtx(),
-      onLog: vi.fn(async (_type: string, msg: string) => {
-        logMessages.push(msg);
-      }),
-    } as unknown as AdapterExecutionContext;
+      const executePromise = execute(ctx);
 
-    await execute(ctx);
+      // Drain the two POLL_INTERVAL_MS sleeps in waitForPod plus the
+      // log-streaming completion path. Advance in 1s steps so each
+      // microtask level settles before the next.
+      for (let i = 0; i < 10; i++) {
+        await vi.advanceTimersByTimeAsync(1_000);
+      }
 
-    // Pending status should appear exactly once even though listNamespacedPod was called twice
-    const pendingMsgs = logMessages.filter((m) => m.includes("phase=Pending"));
-    expect(pendingMsgs.length).toBe(1);
+      await executePromise;
+
+      // Pending status should appear exactly once even though listNamespacedPod was called twice
+      const pendingMsgs = logMessages.filter((m) => m.includes("phase=Pending"));
+      expect(pendingMsgs.length).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
