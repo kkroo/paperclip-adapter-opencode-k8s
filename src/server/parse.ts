@@ -116,3 +116,40 @@ export function isOpenCodeUnknownSessionError(stdout: string, stderr: string): b
     haystack,
   );
 }
+
+// Detect when the model rejected the prompt because the session's accumulated
+// context exceeded the model's context window. Without auto-remediation, the
+// same poisoned session is re-used on every retry and the agent burns wakes
+// forever (observed 2026-05-15 on Staff Engineer / opencode_k8s /
+// openai/gpt-5.5 — every retry produced an empty stdout + `adapter_failed`
+// stopReason because the model rejected the prompt before any output).
+//
+// Pairs with `sessionParams.needsCompactBeforeNextRun: true` in execute.ts:
+// the next wake's command pipeline prepends `/compact` (handled in
+// job-manifest.ts) so the session history is summarized BEFORE the real
+// prompt is sent. This preserves the agent's working context (vs. rotating
+// the session, which loses it) while making sure the next prompt fits.
+//
+// Surfaces:
+//   {"type":"error","error":{"name":"ContextOverflowError", ...}}
+//   nested responseBody containing {"code":"context_length_exceeded"}
+// Codex/openai surface the latter inside `responseBody`; opencode emits the
+// outer ContextOverflowError. Match either to be provider-agnostic.
+export function isOpenCodeContextOverflowResult(stdout: string): boolean {
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const event = parseJson(line);
+    if (!event) continue;
+    if (asString(event.type, "") !== "error") continue;
+    const errorObj = parseObject(event.error);
+    if (asString(errorObj.name, "") === "ContextOverflowError") return true;
+    const data = parseObject(errorObj.data);
+    const responseBody = asString(data.responseBody, "");
+    if (responseBody && /["']code["']\s*:\s*["']context_length_exceeded["']/.test(responseBody)) {
+      return true;
+    }
+    if (/["']code["']\s*:\s*["']context_length_exceeded["']/.test(line)) return true;
+  }
+  return false;
+}

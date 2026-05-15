@@ -32,6 +32,72 @@ const mockCtx: JobBuildInput["ctx"] = {
   onLog: async () => {},
 };
 
+describe("buildJobManifest — context-overflow auto-remediation (/compact prefix)", () => {
+  // Pairs with parse.ts isOpenCodeContextOverflowResult + execute.ts which
+  // sets sessionParams.needsCompactBeforeNextRun = true when overflow is
+  // detected (or proactively when inputTokens > threshold). The next pod's
+  // shell pipeline must invoke `/compact` against the prior session before
+  // the real prompt so the context window has room.
+  const sessionId = "ses_overflow_recovery";
+
+  function getMainShellCommand(result: ReturnType<typeof buildJobManifest>) {
+    const containers = result.job.spec?.template?.spec?.containers ?? [];
+    const main = containers.find((c) => c.name === "opencode");
+    const cmd = main?.command ?? [];
+    // `command: ["sh", "-c", "<script>"]`
+    return cmd[2] ?? "";
+  }
+
+  it("does NOT inject /compact when sessionParams.needsCompactBeforeNextRun is unset", () => {
+    const ctx = {
+      ...mockCtx,
+      runtime: { sessionId, sessionParams: { sessionId }, sessionDisplayId: sessionId, taskKey: null },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    expect(getMainShellCommand(result)).not.toContain("/compact");
+  });
+
+  it("injects /compact before the main prompt when the flag is true", () => {
+    const ctx = {
+      ...mockCtx,
+      runtime: {
+        sessionId,
+        sessionParams: { sessionId, needsCompactBeforeNextRun: true },
+        sessionDisplayId: sessionId,
+        taskKey: null,
+      },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const script = getMainShellCommand(result);
+    // Compact step appears
+    expect(script).toContain("echo '/compact' | opencode");
+    expect(script).toContain(`--session' '${sessionId}'`);
+    // Best-effort: trailing `|| echo ...` keeps the main run alive on failure
+    expect(script).toMatch(/\/compact[\s\S]*\|\| echo "\[paperclip\] \/compact returned non-zero/);
+    // /compact precedes the cat-of-prompt step (order matters)
+    const compactIdx = script.indexOf("'/compact'");
+    const promptIdx = script.indexOf("cat /tmp/prompt/prompt.txt");
+    expect(compactIdx).toBeGreaterThan(-1);
+    expect(promptIdx).toBeGreaterThan(compactIdx);
+  });
+
+  it("does NOT inject /compact when the flag is true but no session id exists (fresh-session case)", () => {
+    // Without a session, /compact has nothing to compact. The detector in
+    // execute.ts shouldn't set the flag in that case, but defend in depth.
+    const ctx = {
+      ...mockCtx,
+      runtime: {
+        sessionId: null,
+        sessionParams: { needsCompactBeforeNextRun: true },
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    expect(getMainShellCommand(result)).not.toContain("/compact");
+  });
+});
+
 describe("buildJobManifest", () => {
   it("creates job with agent-opencode- prefix in name", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });

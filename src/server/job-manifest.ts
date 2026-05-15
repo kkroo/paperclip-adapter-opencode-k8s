@@ -747,7 +747,31 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // adapter_failed/empty-stdout even though opencode is still working.
   // The marker line is also useful in pod logs for confirming the pod
   // reached the tee step at all.
-  const baseMainCommand = `set -o pipefail; ${ccrotateRefresh}; ${authBootstrap}; ${configSetup}mkdir -p $(dirname ${podLogPath}) && : > ${podLogPath} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${podLogPath}`;
+  // Context-overflow auto-remediation: when the prior run set
+  // sessionParams.needsCompactBeforeNextRun (overflow detected, or
+  // proactive token-budget gate tripped — see execute.ts), prefix the
+  // pipeline with a best-effort `/compact` invocation. `/compact` is an
+  // opencode slash command that summarizes the session's accumulated
+  // history; this preserves the agent's working context (vs. session
+  // rotation, which discards it) while making sure the next real prompt
+  // fits inside the model's window.
+  //
+  // Best-effort: any failure here (`/compact` unknown to the opencode
+  // version in the image, model unavailable, session already empty)
+  // shouldn't block the main run, so we suppress with `|| true`. The next
+  // run's overflow detector will catch it again if the compact didn't
+  // help. The flag is consumed by the time the main run completes —
+  // execute.ts clears it from the returned sessionParams (and re-sets it
+  // only if the proactive threshold trips again).
+  const needsCompactBeforeNextRun =
+    runtimeSessionId && Boolean((runtimeSessionParams as Record<string, unknown>).needsCompactBeforeNextRun);
+  const compactArgsEscaped = ["run", "--session", runtimeSessionId, "--format", "json"]
+    .map((a) => `'${a.replace(/'/g, "'\\''")}'`)
+    .join(" ");
+  const compactPrefix = needsCompactBeforeNextRun
+    ? `echo "[paperclip] running /compact on session ${runtimeSessionId} before main prompt"; echo '/compact' | opencode ${compactArgsEscaped} >/dev/null 2>&1 || echo "[paperclip] /compact returned non-zero; continuing"; `
+    : "";
+  const baseMainCommand = `set -o pipefail; ${ccrotateRefresh}; ${authBootstrap}; ${configSetup}${compactPrefix}mkdir -p $(dirname ${podLogPath}) && : > ${podLogPath} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${podLogPath}`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket.
