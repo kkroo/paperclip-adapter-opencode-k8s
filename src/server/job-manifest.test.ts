@@ -924,4 +924,47 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       expect(parsed.disabled_providers).toEqual(["opencode"]);
     });
   });
+
+  describe("paperclipTaskMarkdown surfacing", () => {
+    // Server-side heartbeat composes context.paperclipTaskMarkdown for wakes
+    // that carry first-class task context (notably PR-review wakes via the
+    // github webhook handler, which set contextSnapshot.githubPrNumber +
+    // githubRepoFullName but never produce a paperclipWake because there's
+    // no issue tied to the PR). Without this prompt slot, the PR review
+    // agent reaches the pod with NO information about which PR to review.
+    //
+    // See:
+    //   - server/services/heartbeat.ts buildPaperclipTaskMarkdown
+    //   - server/routes/github-webhook.ts (the wake call that sets
+    //     contextSnapshot.githubPrNumber + reviewKind)
+    it("includes context.paperclipTaskMarkdown in the assembled prompt", () => {
+      const taskMd = [
+        "Paperclip task context:",
+        "- PR: \"Blockcast/paperclip#59\"",
+        "- Wake reason: \"github_pr_opened\"",
+        "",
+        "GitHub PR review directive:",
+        "A GitHub webhook woke you to review this pull request.",
+      ].join("\n");
+      const ctx = { ...mockCtx, context: { ...mockCtx.context, paperclipTaskMarkdown: taskMd } };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      expect(result.prompt).toContain("Blockcast/paperclip#59");
+      expect(result.prompt).toContain("github_pr_opened");
+      expect(result.prompt).toContain("GitHub PR review directive");
+      expect(result.promptMetrics.taskMarkdownChars).toBe(taskMd.length);
+    });
+
+    it("does NOT inject anything when paperclipTaskMarkdown is absent (no spurious newlines)", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      expect(result.promptMetrics.taskMarkdownChars).toBe(0);
+    });
+
+    it("trims surrounding whitespace from paperclipTaskMarkdown before inclusion", () => {
+      const taskMd = "\n\n  GitHub PR review directive:\n  ...\n\n";
+      const ctx = { ...mockCtx, context: { ...mockCtx.context, paperclipTaskMarkdown: taskMd } };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      expect(result.promptMetrics.taskMarkdownChars).toBe(taskMd.trim().length);
+      expect(result.prompt).toContain("GitHub PR review directive");
+    });
+  });
 });
