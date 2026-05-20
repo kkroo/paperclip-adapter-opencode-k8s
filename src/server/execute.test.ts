@@ -758,6 +758,39 @@ describe("execute — session unavailable (reattach classification)", () => {
   });
 });
 
+describe("execute — stream EOF transient classification", () => {
+  it("preserves session params and tags opencode JSON EOF as transient", async () => {
+    const eofJsonl = [
+      JSON.stringify({
+        type: "step_finish",
+        part: { reason: "end_turn", tokens: { input: 100, output: 25, cache: { read: 20 } } },
+        sessionID: "ses_stream_eof",
+      }),
+      JSON.stringify({
+        type: "error",
+        error: {
+          name: "UnknownError",
+          data: { message: "JSON Parse error: Unexpected EOF" },
+        },
+        sessionID: "ses_stream_eof",
+      }),
+    ].join("\n");
+    setMockJsonl(eofJsonl);
+    const coreApi = makeCoreApi(1);
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+    const ctx = makeCtx({}, { paperclipWorkspace: { cwd: "/workspace" } });
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("stream_eof_transient");
+    expect(result.errorMessage).toMatch(/stream truncated/i);
+    expect(result.sessionId).toBe("ses_stream_eof");
+    expect(result.sessionParams).toEqual({ sessionId: "ses_stream_eof", cwd: "/workspace" });
+    expect(result.sessionParams && "needsCompactBeforeNextRun" in result.sessionParams).toBe(false);
+    expect(result.clearSession).toBeUndefined();
+  });
+});
+
 describe("execute — timeout", () => {
   it("returns timedOut=true when job reports DeadlineExceeded", async () => {
     const batchApi = makeBatchApi();

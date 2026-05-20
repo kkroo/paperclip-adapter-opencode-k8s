@@ -153,3 +153,22 @@ export function isOpenCodeContextOverflowResult(stdout: string): boolean {
   }
   return false;
 }
+
+// Detect opencode's internal model-stream parser failure when the upstream
+// closes mid-JSON chunk. This is transient stream truncation, not session
+// corruption: the next wake should retry with the same session intact.
+export function isOpenCodeStreamEofResult(stdout: string): boolean {
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const event = parseJson(line);
+    if (!event) continue;
+    if (asString(event.type, "") !== "error") continue;
+    const errorObj = parseObject(event.error);
+    if (asString(errorObj.name, "") !== "UnknownError") continue;
+    const data = parseObject(errorObj.data);
+    const message = asString(data.message, "");
+    if (/JSON\s+Parse\s+error.*Unexpected\s+EOF/i.test(message)) return true;
+  }
+  return false;
+}

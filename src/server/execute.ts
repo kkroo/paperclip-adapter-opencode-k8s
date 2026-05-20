@@ -9,6 +9,7 @@ import {
   isOpenCodeUnknownSessionError,
   isOpenCodeStepLimitResult,
   isOpenCodeContextOverflowResult,
+  isOpenCodeStreamEofResult,
 } from "./parse.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
 import { PassThrough } from "node:stream";
@@ -19,10 +20,17 @@ const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
 const LOG_EXIT_COMPLETION_GRACE_MS = parseInt(process.env.LOG_EXIT_COMPLETION_GRACE_MS ?? "30000", 10);
 
-// Single source of truth lives in @paperclipai/adapter-utils. Re-exported
-// so existing test imports (`from "./execute.js"`) keep working.
-import { mergeEnvironmentConfig } from "@paperclipai/adapter-utils";
-export { mergeEnvironmentConfig };
+export function mergeEnvironmentConfig(
+  adapterConfig: Record<string, unknown>,
+  envConfig: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  const merged = { ...adapterConfig };
+  if (!envConfig) return merged;
+  for (const [key, value] of Object.entries(envConfig)) {
+    if (value !== null && value !== undefined) merged[key] = value;
+  }
+  return merged;
+}
 
 /**
  * Materialize a kubeconfig string (env-supplied content) onto disk so the
@@ -859,6 +867,24 @@ async function streamAndAwaitJob(
       errorCode: "context_overflow",
       sessionId: resolvedSessionId,
       sessionParams: { ...resolvedSessionParams, needsCompactBeforeNextRun: true } as Record<string, unknown>,
+      resultJson: { stdout },
+    };
+  }
+
+  const streamEof = failed && isOpenCodeStreamEofResult(stdout);
+  if (streamEof) {
+    await onLog(
+      "stdout",
+      `[paperclip] OpenCode stream EOF detected (upstream truncation); preserving session for retry.\n`,
+    );
+    return {
+      exitCode: synthesizedExitCode,
+      signal: null,
+      timedOut: false,
+      errorMessage: "Model stream truncated (Unexpected EOF); retry preserved session",
+      errorCode: "stream_eof_transient",
+      sessionId: resolvedSessionId,
+      sessionParams: resolvedSessionParams,
       resultJson: { stdout },
     };
   }

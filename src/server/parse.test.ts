@@ -4,6 +4,7 @@ import {
   isOpenCodeUnknownSessionError,
   isOpenCodeStepLimitResult,
   isOpenCodeContextOverflowResult,
+  isOpenCodeStreamEofResult,
 } from "./parse.js";
 
 describe("parseOpenCodeJsonl", () => {
@@ -296,5 +297,50 @@ describe("isOpenCodeContextOverflowResult", () => {
       part: { state: { status: "ok", output: "{\"code\":\"context_length_exceeded\"}" } },
     });
     expect(isOpenCodeContextOverflowResult(stdout)).toBe(false);
+  });
+});
+
+describe("isOpenCodeStreamEofResult", () => {
+  it("detects opencode UnknownError stream EOF after clean step_finish output", () => {
+    const stdout = [
+      JSON.stringify({
+        type: "step_finish",
+        part: { reason: "end_turn", tokens: { input: 100, output: 25, cache: { read: 90 } } },
+        sessionID: "ses_eof",
+      }),
+      JSON.stringify({
+        type: "error",
+        error: {
+          name: "UnknownError",
+          data: { message: "JSON Parse error: Unexpected EOF" },
+        },
+        sessionID: "ses_eof",
+      }),
+    ].join("\n");
+
+    expect(isOpenCodeStreamEofResult(stdout)).toBe(true);
+  });
+
+  it("returns false for clean step_finish output without an EOF error", () => {
+    const stdout = JSON.stringify({
+      type: "step_finish",
+      part: { reason: "end_turn", tokens: { input: 100, output: 25, cache: { read: 90 } } },
+      sessionID: "ses_clean",
+    });
+
+    expect(isOpenCodeStreamEofResult(stdout)).toBe(false);
+  });
+
+  it("returns false for UnknownError with a non-EOF message", () => {
+    const stdout = JSON.stringify({
+      type: "error",
+      error: {
+        name: "UnknownError",
+        data: { message: "Provider returned HTTP 502" },
+      },
+      sessionID: "ses_other",
+    });
+
+    expect(isOpenCodeStreamEofResult(stdout)).toBe(false);
   });
 });
