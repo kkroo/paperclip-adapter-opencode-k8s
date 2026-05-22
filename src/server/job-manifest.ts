@@ -443,8 +443,8 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const image = asString(config.image, "") || selfPod.image;
   const enableDocker = asBoolean(config.enableDocker, false);
   const dockerImage = asString(config.dockerImage, "docker:28-dind");
-  const dockerCpuLimit = asString(config.dockerCpuLimit, "2");
-  const dockerMemoryLimit = asString(config.dockerMemoryLimit, "2Gi");
+  const dockerCpuLimit = asString(config.dockerCpuLimit, "4");
+  const dockerMemoryLimit = asString(config.dockerMemoryLimit, "8Gi");
   const model = asString(config.model, "").trim();
   const variant = asString(config.variant, "").trim();
   const extraArgs = asStringArray(config.extraArgs);
