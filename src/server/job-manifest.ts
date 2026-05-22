@@ -400,7 +400,13 @@ function buildDindSidecar(opts: {
     name: "dind",
     image: opts.image,
     imagePullPolicy: "IfNotPresent",
-    args: ["dockerd", "--host=unix:///var/run/docker.sock", "--storage-driver=overlay2"],
+    // `--group=1000` makes dockerd create /var/run/docker.sock with group 1000
+    // (mode 0660 root:1000). The main agent container runs as uid 1000 with
+    // podSecurityContext.fsGroup=1000, so without this it can't connect to the
+    // socket (which dockerd otherwise creates root:root mode 0660). Pairs with
+    // the pod-level runAsGroup=1000 / fsGroup=1000 that this adapter already
+    // sets at line ~695. BLO-5492.
+    args: ["dockerd", "--host=unix:///var/run/docker.sock", "--storage-driver=overlay2", "--group=1000"],
     securityContext: { privileged: true, runAsUser: 0, runAsNonRoot: false },
     env: [{ name: "DOCKER_TLS_CERTDIR", value: "" }],
     resources: {
@@ -492,6 +498,13 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
       : "";
   const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: Boolean(runtimeSessionId) });
+  // Server's heartbeat composes `context.paperclipTaskMarkdown` for wakes
+  // that carry first-class task context (PR-review wakes, issue wakes,
+  // wake-comment wakes). renderPaperclipWakePrompt only covers the
+  // issue/comment path via paperclipWake, so without this slot a
+  // github_pr_* wake reaches the pod with NO PR number / repo in the
+  // prompt and the reviewer agent has nothing to act on.
+  const taskMarkdown = asString(context.paperclipTaskMarkdown, "").trim();
   const shouldUseResumeDeltaPrompt = Boolean(runtimeSessionId) && wakePrompt.length > 0;
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
@@ -502,6 +515,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     skillsBundleContent,
     renderedBootstrapPrompt,
     wakePrompt,
+    taskMarkdown,
     sessionHandoffNote,
     renderedPrompt,
   ]);
@@ -511,6 +525,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     skillsBundleChars: skillsBundleContent.length,
     bootstrapPromptChars: renderedBootstrapPrompt.length,
     wakePromptChars: wakePrompt.length,
+    taskMarkdownChars: taskMarkdown.length,
     sessionHandoffChars: sessionHandoffNote.length,
     heartbeatPromptChars: renderedPrompt.length,
   };
