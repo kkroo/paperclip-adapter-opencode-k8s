@@ -19,6 +19,15 @@ const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
 const LOG_EXIT_COMPLETION_GRACE_MS = parseInt(process.env.LOG_EXIT_COMPLETION_GRACE_MS ?? "30000", 10);
 
+type BudgetAgentSnapshot = {
+  id: string;
+  name?: string | null;
+  spentMonthlyCents?: number | null;
+  budgetMonthlyCents?: number | null;
+  pauseReason?: string | null;
+  pausedAt?: string | null;
+};
+
 // Single source of truth lives in @paperclipai/adapter-utils. Re-exported
 // so existing test imports (`from "./execute.js"`) keep working.
 import { mergeEnvironmentConfig } from "@paperclipai/adapter-utils";
@@ -102,6 +111,138 @@ export function parseModelProvider(model: string | null): string | null {
 
 function isTransientVolumeSchedulingMessage(message: string): boolean {
   return /unbound immediate persistentvolumeclaims|waiting for a volume|pvc|persistentvolumeclaim|volume.*bind/i.test(message);
+}
+
+function centsToDollars(cents: number): string {
+  return `$${(cents / 100).toFixed(2)}`;
+}
+
+function readBudgetAgentSnapshot(raw: unknown): BudgetAgentSnapshot | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  const id = asString(obj.id, "").trim();
+  if (!id) return null;
+  return {
+    id,
+    name: asString(obj.name, "") || null,
+    spentMonthlyCents: typeof obj.spentMonthlyCents === "number" ? obj.spentMonthlyCents : null,
+    budgetMonthlyCents: typeof obj.budgetMonthlyCents === "number" ? obj.budgetMonthlyCents : null,
+    pauseReason: asString(obj.pauseReason, "") || null,
+    pausedAt: asString(obj.pausedAt, "") || null,
+  };
+}
+
+async function fetchCurrentAgentSnapshot(ctx: AdapterExecutionContext): Promise<BudgetAgentSnapshot | null> {
+  const apiUrl = process.env.PAPERCLIP_API_URL?.replace(/\/+$/, "");
+  const agentFromContext = readBudgetAgentSnapshot(ctx.agent);
+  if (!apiUrl) return agentFromContext;
+
+  try {
+    const resp = await fetch(`${apiUrl}/api/agents/${encodeURIComponent(ctx.agent.id)}`, {
+      headers: { Authorization: `Bearer ${ctx.authToken ?? ""}` },
+    });
+    if (!resp.ok) return agentFromContext;
+    return readBudgetAgentSnapshot(await resp.json()) ?? agentFromContext;
+  } catch {
+    return agentFromContext;
+  }
+}
+
+async function pauseAgentForBudgetExceeded(
+  ctx: AdapterExecutionContext,
+  agent: BudgetAgentSnapshot,
+  crossedAt: string,
+  pauseReason: string,
+): Promise<void> {
+  const apiUrl = process.env.PAPERCLIP_API_URL?.replace(/\/+$/, "");
+  if (!apiUrl) return;
+
+  const headers = {
+    Authorization: `Bearer ${ctx.authToken ?? ""}`,
+    "Content-Type": "application/json",
+  };
+
+  await fetch(`${apiUrl}/api/agents/${encodeURIComponent(agent.id)}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({ pauseReason, pausedAt: crossedAt }),
+  });
+}
+
+async function postBudgetExceededComment(
+  ctx: AdapterExecutionContext,
+  agent: BudgetAgentSnapshot,
+  crossedAt: string,
+): Promise<void> {
+  const apiUrl = process.env.PAPERCLIP_API_URL?.replace(/\/+$/, "");
+  const issueId = asString(ctx.context.issueId ?? ctx.context.taskId, "").trim();
+  if (!apiUrl || !issueId) return;
+
+  const spent = agent.spentMonthlyCents ?? 0;
+  const budget = agent.budgetMonthlyCents ?? 0;
+  const over = spent - budget;
+  const body = [
+    "## Budget exceeded",
+    "",
+    `Agent ${agent.name ?? agent.id} is paused because it crossed its monthly budget cap.`,
+    "",
+    `- Spend: ${centsToDollars(spent)} spent / ${centsToDollars(budget)} cap`,
+    `- Over cap: ${centsToDollars(over)}`,
+    `- Detected at: ${crossedAt}`,
+    "- Next action: bump the budget or explicitly unpause the agent before resuming work.",
+  ].join("\n");
+
+  await fetch(`${apiUrl}/api/issues/${encodeURIComponent(issueId)}/comments`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${ctx.authToken ?? ""}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ body }),
+  });
+}
+
+async function enforceBudgetCapBeforeRun(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult | null> {
+  const agent = await fetchCurrentAgentSnapshot(ctx);
+  const spent = agent?.spentMonthlyCents;
+  const budget = agent?.budgetMonthlyCents;
+  if (!agent || spent == null || budget == null || spent <= budget || agent.pauseReason || agent.pausedAt) {
+    return null;
+  }
+
+  const crossedAt = new Date().toISOString();
+  const pauseReason = `budget exceeded: ${centsToDollars(spent)} spent / ${centsToDollars(budget)} cap`;
+
+  try {
+    await pauseAgentForBudgetExceeded(ctx, agent, crossedAt, pauseReason);
+  } catch {
+    // The safety gate still fails the run even if persisting the pause fails.
+  }
+
+  try {
+    await postBudgetExceededComment(ctx, agent, crossedAt);
+  } catch {
+    // Non-fatal: failing closed matters more than the escalation receipt.
+  }
+
+  await ctx.onLog(
+    "stderr",
+    `[paperclip] Budget exceeded for agent ${agent.name ?? agent.id}: ${centsToDollars(spent)} spent / ${centsToDollars(budget)} cap. Run blocked before Job creation.\n`,
+  );
+
+  return {
+    exitCode: null,
+    signal: null,
+    timedOut: false,
+    errorMessage: `Budget exceeded: ${centsToDollars(spent)} spent / ${centsToDollars(budget)} cap`,
+    errorCode: "budget_exceeded",
+    errorMeta: {
+      agentId: agent.id,
+      spentMonthlyCents: spent,
+      budgetMonthlyCents: budget,
+      detectedAt: crossedAt,
+    },
+  };
 }
 
 async function waitForPod(
@@ -1083,6 +1224,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const graceSec = asNumber(config.graceSec, 60);
   const retainJobs = asBoolean(config.retainJobs, false);
   const reattachOrphanedJobs = asBoolean(config.reattachOrphanedJobs, false);
+
+  const budgetGateResult = await enforceBudgetCapBeforeRun(ctx);
+  if (budgetGateResult) return budgetGateResult;
 
   // kubeconfig: env config can supply either a path (legacy) or full content
   // (k8s-env-driver). When content is supplied, materialize to a temp file.
