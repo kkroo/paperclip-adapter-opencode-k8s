@@ -1057,3 +1057,103 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
     });
   });
 });
+
+describe("buildJobManifest — resumeLastSession:false unifies fresh-session semantics", () => {
+  // Bug surfaced 2026-05-23 (originally Gotcha #6 in BLO-5492 handoff): the
+  // CLI gate `if (runtimeSessionId && resumeLastSession) push --session`
+  // skipped the flag when resumeLastSession was false, so opencode started
+  // a brand-new session. But three prompt-rendering paths used the weaker
+  // `Boolean(runtimeSessionId)` gate, so the prompt was still composed as
+  // a resume-delta (no bootstrap, wakePrompt rendered as delta, heartbeat
+  // prompt suppressed). Net effect: opencode came up cold but received a
+  // prompt that assumed prior context. Symptom on the fleet was the
+  // appearance of "stale session reuse" even with resumeLastSession:false
+  // explicitly set.
+  function buildResumeOffCtx(overrides: Partial<JobBuildInput["ctx"]["context"]> = {}) {
+    return {
+      ...mockCtx,
+      runtime: {
+        sessionId: "ses_should_not_resume",
+        sessionParams: { sessionId: "ses_should_not_resume" },
+        sessionDisplayId: "ses_should_not_resume",
+        taskKey: null,
+      },
+      config: {
+        resumeLastSession: false,
+        bootstrapPromptTemplate: "BOOTSTRAP-SENTINEL agent {{agent.id}}",
+      },
+      context: {
+        ...mockCtx.context,
+        ...overrides,
+      },
+    };
+  }
+
+  function getMainShellCommand(result: ReturnType<typeof buildJobManifest>) {
+    const containers = result.job.spec?.template?.spec?.containers ?? [];
+    const main = containers.find((c) => c.name === "opencode");
+    const cmd = main?.command ?? [];
+    return cmd[2] ?? "";
+  }
+
+  it("renders bootstrap prompt when resumeLastSession is false even with a tracked sessionId", () => {
+    const ctx = buildResumeOffCtx();
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    expect(result.prompt).toContain("BOOTSTRAP-SENTINEL");
+    expect(result.promptMetrics.bootstrapPromptChars).toBeGreaterThan(0);
+  });
+
+  it("does NOT pass --session to opencode when resumeLastSession is false", () => {
+    const ctx = buildResumeOffCtx();
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const script = getMainShellCommand(result);
+    expect(script).not.toContain("--session");
+  });
+
+  it("renders wakePrompt as a fresh (not resume-delta) prompt when resumeLastSession is false", () => {
+    // The wake-prompt renderer formats DIFFERENTLY depending on whether
+    // the session is being resumed. When starting fresh we want the full
+    // wake context, not a delta against a phantom prior session.
+    const ctx = buildResumeOffCtx({
+      paperclipWake: {
+        reason: "issue_assigned",
+        issue: { id: "iw", identifier: "BLO-9999", title: "test wake" },
+      },
+    });
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    expect(result.promptMetrics.wakePromptChars).toBeGreaterThan(0);
+    // Heartbeat prompt must NOT be suppressed by the resume-delta gate
+    // (which only applies to genuinely-resumed sessions).
+    expect(result.promptMetrics.heartbeatPromptChars).toBeGreaterThan(0);
+  });
+
+  it("preserves resume semantics when resumeLastSession is true (default)", () => {
+    // Regression guard for the unified flag: existing resumed-session
+    // behaviour must not change for agents that don't opt out.
+    const ctx = {
+      ...mockCtx,
+      runtime: {
+        sessionId: "ses_resuming",
+        sessionParams: { sessionId: "ses_resuming" },
+        sessionDisplayId: "ses_resuming",
+        taskKey: null,
+      },
+      config: {
+        bootstrapPromptTemplate: "BOOTSTRAP-SENTINEL",
+      },
+      context: {
+        ...mockCtx.context,
+        paperclipWake: {
+          reason: "issue_assigned",
+          issue: { id: "i2", identifier: "BLO-9998", title: "resume" },
+        },
+      },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const script = getMainShellCommand(result);
+    // Resuming path: --session passed, no bootstrap, heartbeat suppressed
+    expect(script).toContain("--session' 'ses_resuming'");
+    expect(result.promptMetrics.bootstrapPromptChars).toBe(0);
+    expect(result.promptMetrics.heartbeatPromptChars).toBe(0);
+  });
+});
