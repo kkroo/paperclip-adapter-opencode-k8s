@@ -484,6 +484,15 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
   const runtimeSessionParams = parseObject(runtime.sessionParams);
   const runtimeSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
+  // resumeLastSession defaults to true (preserve existing behaviour); set to false to start fresh.
+  // A run "is resuming" only when there's a tracked session ID AND the agent
+  // hasn't been configured to start fresh. Prompt-rendering paths below must
+  // use this unified flag — using `Boolean(runtimeSessionId)` alone causes a
+  // skew where `--session` is not passed to opencode (line ~540) but the
+  // prompt is still rendered as a resume-delta, so opencode starts a brand-
+  // new session with a wake-only prompt and no bootstrap/heartbeat context.
+  const resumeLastSession = asBoolean(config.resumeLastSession, true);
+  const isResuming = Boolean(runtimeSessionId) && resumeLastSession;
   const templateData = {
     agentId: agent.id,
     companyId: agent.companyId,
@@ -494,10 +503,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     context,
   };
   const renderedBootstrapPrompt =
-    !runtimeSessionId && bootstrapPromptTemplate.trim().length > 0
+    !isResuming && bootstrapPromptTemplate.trim().length > 0
       ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
       : "";
-  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: Boolean(runtimeSessionId) });
+  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: isResuming });
   // Server's heartbeat composes `context.paperclipTaskMarkdown` for wakes
   // that carry first-class task context (PR-review wakes, issue wakes,
   // wake-comment wakes). renderPaperclipWakePrompt only covers the
@@ -505,7 +514,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // github_pr_* wake reaches the pod with NO PR number / repo in the
   // prompt and the reviewer agent has nothing to act on.
   const taskMarkdown = asString(context.paperclipTaskMarkdown, "").trim();
-  const shouldUseResumeDeltaPrompt = Boolean(runtimeSessionId) && wakePrompt.length > 0;
+  const shouldUseResumeDeltaPrompt = isResuming && wakePrompt.length > 0;
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
   const instructionsContent = input.instructionsContent?.trim() ?? "";
@@ -532,9 +541,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
 
   // Build opencode CLI args
   const opencodeArgs = ["run", "--format", "json"];
-  // resumeLastSession defaults to true (preserve existing behaviour); set to false to start fresh.
-  const resumeLastSession = asBoolean(config.resumeLastSession, true);
-  if (runtimeSessionId && resumeLastSession) opencodeArgs.push("--session", runtimeSessionId);
+  if (isResuming) opencodeArgs.push("--session", runtimeSessionId);
   if (model) opencodeArgs.push("--model", model);
   if (variant) opencodeArgs.push("--variant", variant);
   if (extraArgs.length > 0) opencodeArgs.push(...extraArgs);
