@@ -10,6 +10,7 @@ import {
   isOpenCodeStepLimitResult,
   isOpenCodeContextOverflowResult,
 } from "./parse.js";
+import { computeOpenAICompatibleCost } from "./pricing.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
 import { PassThrough } from "node:stream";
 import { buildJobManifest, LARGE_PROMPT_THRESHOLD_BYTES, buildPodLogPath } from "./job-manifest.js";
@@ -913,6 +914,18 @@ async function streamAndAwaitJob(
     nextSessionParams.needsCompactBeforeNextRun = true;
   }
 
+  // LiteLLM-routed paths (openai-compat passthrough) don't populate
+  // `part.cost` on step_finish events, so `parsed.costUsd` is 0 even when
+  // real tokens flowed. Fall back to a per-model token-based estimate so
+  // these runs show up in metered-spend rollups instead of hiding at $0.
+  // Returns null for unknown model / zero usage; in that case we keep the
+  // existing "unknown" / $0 shape so an out-of-date pricing table can't
+  // break the run.
+  const fallbackCost =
+    parsed.costUsd === 0
+      ? computeOpenAICompatibleCost(model || null, parsed.usage)
+      : null;
+
   return {
     exitCode: synthesizedExitCode,
     signal: null,
@@ -928,8 +941,8 @@ async function streamAndAwaitJob(
     sessionDisplayId: resolvedSessionId,
     provider,
     model: model || null,
-    billingType: "unknown",
-    costUsd: parsed.costUsd,
+    billingType: fallbackCost !== null ? "metered_api" : "unknown",
+    costUsd: fallbackCost !== null ? fallbackCost : parsed.costUsd,
     resultJson: { stdout },
     summary: parsed.summary,
     clearSession: stepLimitReached,
