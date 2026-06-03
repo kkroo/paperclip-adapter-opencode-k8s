@@ -85,12 +85,13 @@ describe("getConfigSchema", () => {
     }
   });
 
-  it("has agentDbMode as select with dedicated_pvc default", () => {
+  it("has agentDbMode as select with workspace_subpath default and dedicated_pvc as explicit opt-in", () => {
     const schema = getConfigSchema();
     const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "agentDbMode");
     expect(field).toBeDefined();
     expect(field!.type).toBe("select");
-    expect(field!.default).toBe("dedicated_pvc");
+    expect(field!.default).toBe("workspace_subpath");
+    expect(field!.options).toContainEqual(expect.objectContaining({ value: "workspace_subpath" }));
     expect(field!.options).toContainEqual(expect.objectContaining({ value: "dedicated_pvc" }));
     expect(field!.options).toContainEqual(expect.objectContaining({ value: "ephemeral" }));
   });

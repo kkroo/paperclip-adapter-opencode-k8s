@@ -1050,7 +1050,7 @@ export async function ensureAgentDbPvc(
   config: Record<string, unknown>,
   kubeconfigPath?: string,
 ): Promise<string | null> {
-  const agentDbMode = (asString(config.agentDbMode, "dedicated_pvc").trim() || "dedicated_pvc") as AgentDbMode;
+  const agentDbMode = (asString(config.agentDbMode, "workspace_subpath").trim() || "workspace_subpath") as AgentDbMode;
   if (agentDbMode === "ephemeral" || agentDbMode === "workspace_subpath") return null;
 
   // Build a K8s-safe PVC name from the agent ID (UUIDs are already alphanumeric+hyphens)
@@ -1301,7 +1301,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // - workspace_subpath: per-(agent, task) subdir on the workspace data PVC;
   //   single-writer per task (heartbeat scheduler enforces one pod per
   //   (agent, task)) and survives pod restart, so resume actually works.
-  const agentDbMode = (asString(config.agentDbMode, "dedicated_pvc").trim() || "dedicated_pvc") as AgentDbMode;
+  const agentDbMode = (asString(config.agentDbMode, "workspace_subpath").trim() || "workspace_subpath") as AgentDbMode;
   let agentDbClaimName: string | null | undefined;
   let agentDbWorkspaceSubPath: string | undefined;
   if (agentDbMode === "workspace_subpath") {

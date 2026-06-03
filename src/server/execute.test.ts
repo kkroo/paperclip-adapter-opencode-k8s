@@ -1331,11 +1331,11 @@ describe("ensureAgentDbPvc — unit", () => {
     expect(vi.mocked(createPvc)).not.toHaveBeenCalled();
   });
 
-  it("defaults to dedicated_pvc when agentDbMode is not set", async () => {
-    vi.mocked(getPvc).mockResolvedValueOnce({ metadata: { name: EXPECTED_PVC_NAME } } as Awaited<ReturnType<typeof getPvc>>);
-
+  it("defaults to workspace_subpath when agentDbMode is not set (no dedicated PVC provisioned)", async () => {
     const result = await ensureAgentDbPvc(AGENT_ID, NAMESPACE, {});
-    expect(result).toBe(EXPECTED_PVC_NAME);
+    expect(result).toBeNull();
+    expect(vi.mocked(getPvc)).not.toHaveBeenCalled();
+    expect(vi.mocked(createPvc)).not.toHaveBeenCalled();
   });
 
   it("derives PVC name from agent ID, keeping alphanumeric and hyphens", async () => {

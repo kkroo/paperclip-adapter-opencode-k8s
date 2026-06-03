@@ -24,11 +24,12 @@ export function getConfigSchema(): AdapterConfigSchema {
         label: "Agent DB Mode",
         type: "select",
         options: [
-          { label: "Dedicated PVC (per-agent, persistent)", value: "dedicated_pvc" },
+          { label: "Workspace subPath (shared workspace data PVC, survives restart)", value: "workspace_subpath" },
+          { label: "Dedicated PVC (per-agent, persistent RWO)", value: "dedicated_pvc" },
           { label: "Ephemeral (emptyDir, lost on Job exit)", value: "ephemeral" },
         ],
-        default: "dedicated_pvc",
-        hint: "dedicated_pvc creates a long-lived PVC named opencode-db-<agentId> and mounts it at /opencode-db; ephemeral uses a Job-local emptyDir",
+        default: "workspace_subpath",
+        hint: "workspace_subpath (default) stores the agent DB under a per-(agent, task) subdir on the shared workspace data PVC (RWX) and survives pod restarts without a single-node-attach volume; dedicated_pvc is explicit opt-in and creates a long-lived RWO PVC named opencode-db-<agentId> mounted at /opencode-db (requires agentDbStorageClass); ephemeral uses a Job-local emptyDir",
         group: "Core",
       },
       {
