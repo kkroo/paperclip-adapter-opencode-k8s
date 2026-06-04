@@ -216,6 +216,37 @@ describe("buildJobManifest", () => {
     expect(opencodeEnv?.value).toBe("true");
   });
 
+  // The base paperclip image bakes NODE_ENV=production. In an agent workspace
+  // that breaks `npm install`/`npm ci` (devDependencies omitted), so source
+  // builds that need dev tooling fail to bootstrap (e.g. shaka's
+  // closure-make-deps). Agent jobs do dev/build work, so default them to a
+  // non-production NODE_ENV. See BLO-8661.
+  it("defaults NODE_ENV to development so agent npm installs include devDependencies", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    const nodeEnv = env.find((e) => e.name === "NODE_ENV");
+    expect(nodeEnv?.value).toBe("development");
+  });
+
+  it("lets config.env override the default NODE_ENV", () => {
+    const ctx = { ...mockCtx, config: { env: { NODE_ENV: "production" } } };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    const nodeEnv = env.find((e) => e.name === "NODE_ENV");
+    expect(nodeEnv?.value).toBe("production");
+  });
+
+  it("respects NODE_ENV inherited from the Deployment env", () => {
+    const selfPod = { ...mockSelfPod, inheritedEnv: { NODE_ENV: "staging" } };
+    const result = buildJobManifest({ ctx: mockCtx, selfPod });
+
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    const nodeEnv = env.find((e) => e.name === "NODE_ENV");
+    expect(nodeEnv?.value).toBe("staging");
+  });
+
   it("applies default ttlSecondsAfterFinished of 300", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
 

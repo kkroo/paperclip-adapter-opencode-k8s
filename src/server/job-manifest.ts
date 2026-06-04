@@ -298,6 +298,17 @@ function buildEnvVars(
     ...paperclipEnv,
   };
 
+  // Agent jobs do dev/build work (npm install with devDependencies, running
+  // source build/test toolchains). The base paperclip image bakes
+  // NODE_ENV=production, which makes `npm install`/`npm ci` omit
+  // devDependencies and breaks toolchain bootstrap for source builds
+  // (e.g. shaka's closure-make-deps). Default to a non-production NODE_ENV so
+  // dev tooling installs. Set before Layer 4 so the Deployment env (above) or
+  // user config.env can still override it. See BLO-8661.
+  if (!("NODE_ENV" in merged)) {
+    merged.NODE_ENV = "development";
+  }
+
   // Layer 4: User-defined overrides from adapterConfig.env
   for (const [key, value] of Object.entries(envConfig)) {
     if (typeof value === "string") merged[key] = value;
