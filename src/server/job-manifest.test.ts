@@ -884,13 +884,13 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       };
       const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
       const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command;
-      expect(cmd?.[2]).toMatch(/ccrotate next --yes --target codex --accounts a@b\.net,c@d\.net/);
+      expect(cmd?.[2]).toMatch(/timeout 30s ccrotate next --yes --target codex --accounts a@b\.net,c@d\.net/);
     });
 
     it("falls through to global ccrotate when providers is undefined", () => {
       const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
       const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command;
-      expect(cmd?.[2]).toMatch(/ccrotate next --yes --target codex(?! --accounts)/);
+      expect(cmd?.[2]).toMatch(/timeout 30s ccrotate next --yes --target codex(?! --accounts)/);
     });
 
     it("falls through to global ccrotate when only providers.anthropic is set (wrong key for opencode)", () => {
@@ -920,7 +920,7 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
     it("emits the auth bootstrap step between ccrotateRefresh and the opencode invocation", () => {
       const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
       const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
-      const ccrotateIdx = cmd.indexOf("ccrotate next --yes --target codex");
+      const ccrotateIdx = cmd.indexOf("timeout 30s ccrotate next --yes --target codex");
       const bootstrapIdx = cmd.indexOf(".local/share/opencode");
       const opencodeIdx = cmd.indexOf("| opencode ");
       expect(ccrotateIdx).toBeGreaterThan(-1);

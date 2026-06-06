@@ -759,7 +759,8 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // it ccrotate prompts and hangs/exits when all accounts are at extra
   // usage. Failure is non-fatal: if ccrotate isn't on PATH or all
   // accounts are exhausted, we still try opencode with whatever
-  // credentials are on disk.
+  // credentials are on disk. Bound the preflight so a stuck Codex probe inside
+  // ccrotate cannot block the Job before opencode starts.
   const podLogPath = buildPodLogPath(companyId, agentId, runId);
   const opencodeArgsEscaped = opencodeArgs.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(" ");
   // Phase G.5: per-env credential pool. When `providers.openai.accounts`
@@ -775,7 +776,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       )
     : [];
   const accountsArg = openaiAccounts.length > 0 ? ` --accounts ${openaiAccounts.join(",")}` : "";
-  const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target codex${accountsArg} >/dev/null 2>&1) || true`;
+  const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && timeout 30s ccrotate next --yes --target codex${accountsArg} >/dev/null 2>&1) || true`;
   const authBootstrap = hasEnvVarValue(envVars, "OPENAI_API_KEY")
     ? buildOpencodeApiKeyAuthCleanupShell()
     : buildOpencodeAuthBootstrapShell();
