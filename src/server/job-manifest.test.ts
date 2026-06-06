@@ -941,6 +941,27 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       // Best-effort: never fail the pod on bootstrap errors
       expect(cmd).toContain("|| true");
     });
+
+    it("skips OAuth bootstrap and clears stale opencode auth when OPENAI_API_KEY is configured", () => {
+      const ctx = {
+        ...mockCtx,
+        config: {
+          env: {
+            OPENAI_API_KEY: "test-key",
+            OPENAI_BASE_URL: "http://opencode-ccrotate-responses-shim.paperclip.svc.cluster.local:8080/v1",
+          },
+        },
+      };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+
+      expect(cmd).not.toContain('".codex","auth.json"');
+      expect(cmd).not.toContain('auth_mode!=="chatgpt"');
+      expect(cmd).toContain("rm -f ~/.local/share/opencode/auth.json ~/.local/share/opencode/account.json");
+      expect(cmd.indexOf("rm -f ~/.local/share/opencode/auth.json")).toBeLessThan(
+        cmd.indexOf("cat /tmp/prompt/prompt.txt"),
+      );
+    });
   });
 
   describe("buildRuntimeConfigJson + opencodeConfigJson disable opencode.ai/zen", () => {
