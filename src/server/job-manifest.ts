@@ -265,7 +265,27 @@ function buildEnvVars(
   setIfPresent("PAPERCLIP_WORKSPACE_REPO_REF", workspaceContext.repoRef);
   setIfPresent("PAPERCLIP_WORKSPACE_BRANCH", workspaceContext.branchName);
   setIfPresent("PAPERCLIP_WORKSPACE_WORKTREE_PATH", workspaceContext.worktreePath);
-  setIfPresent("AGENT_HOME", workspaceContext.agentHome);
+
+  // AGENT_HOME resolution.
+  //
+  // The agent's instructions (AGENTS.md) point at companion files via
+  // `$AGENT_HOME/HEARTBEAT.md`, `$AGENT_HOME/SOUL.md`, `$AGENT_HOME/TOOLS.md`,
+  // and `$AGENT_HOME/skills/*.md`. For an "external" instructions bundle the
+  // server materializes that whole tree into `instructionsRootPath` (a stable
+  // per-agent dir), NOT into the per-task workspace. If AGENT_HOME stays
+  // pointed at the workspace (which only ever holds repo checkouts), every
+  // `Read $AGENT_HOME/HEARTBEAT.md` the agent performs hits "File not found"
+  // and the run dies before doing useful work — the failure mode that kept
+  // opencode_k8s agents with an external bundle at 100% failure while
+  // claude_k8s agents (whose AGENT_HOME already IS the bundle dir) worked.
+  // Point AGENT_HOME at the bundle root so the companions resolve, mirroring
+  // claude_k8s. Falls back to the server-provided workspace agentHome when no
+  // external bundle is configured (single-file / legacy agents — unchanged).
+  const instructionsBundleMode = asString(config.instructionsBundleMode, "").trim();
+  const instructionsRootPath = asString(config.instructionsRootPath, "").trim();
+  const externalBundleHome =
+    instructionsBundleMode === "external" && instructionsRootPath ? instructionsRootPath : "";
+  setIfPresent("AGENT_HOME", externalBundleHome || workspaceContext.agentHome);
 
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((v): v is string => typeof v === "string" && v.trim().length > 0)
