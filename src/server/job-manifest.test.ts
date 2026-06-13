@@ -633,6 +633,43 @@ describe("buildJobManifest — env wiring branches", () => {
     expect(env.find((e) => e.name === "AGENT_HOME")?.value).toBe("/home/agent");
   });
 
+  it("points AGENT_HOME at instructionsRootPath for an external instructions bundle (companions resolve)", () => {
+    const ctx = {
+      ...mockCtx,
+      config: {
+        instructionsBundleMode: "external",
+        instructionsRootPath: "/paperclip/.paperclip/instances/default/companies/Penstock/agents/devops",
+        instructionsEntryFile: "AGENTS.md",
+      },
+      context: {
+        ...mockCtx.context,
+        // server pointed agentHome at the per-task workspace (the broken default
+        // that made every `Read $AGENT_HOME/HEARTBEAT.md` miss); the external
+        // bundle root must win so the companions resolve.
+        paperclipWorkspace: { agentHome: "/paperclip/instances/default/workspaces/agent-abc" },
+      },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const env = result.job.spec?.template.spec?.containers[0]?.env ?? [];
+    expect(env.find((e) => e.name === "AGENT_HOME")?.value).toBe(
+      "/paperclip/.paperclip/instances/default/companies/Penstock/agents/devops",
+    );
+  });
+
+  it("leaves AGENT_HOME as the workspace agentHome when no external bundle is configured", () => {
+    const ctx = {
+      ...mockCtx,
+      config: { instructionsFilePath: "/paperclip/.paperclip/.../agents/ceo/AGENTS.md" },
+      context: {
+        ...mockCtx.context,
+        paperclipWorkspace: { agentHome: "/home/agent" },
+      },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const env = result.job.spec?.template.spec?.containers[0]?.env ?? [];
+    expect(env.find((e) => e.name === "AGENT_HOME")?.value).toBe("/home/agent");
+  });
+
   it("sets PAPERCLIP_LINKED_ISSUE_IDS from non-empty issueIds array (skipping blanks)", () => {
     const ctx = { ...mockCtx, context: { ...mockCtx.context, issueIds: ["a", "  ", "b", null as unknown as string, "c"] } };
     const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
