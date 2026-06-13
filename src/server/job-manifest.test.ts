@@ -670,6 +670,28 @@ describe("buildJobManifest — env wiring branches", () => {
     expect(env.find((e) => e.name === "AGENT_HOME")?.value).toBe("/home/agent");
   });
 
+  it("symlinks company shared-docs into cwd for an external bundle (BLO-10315), and skips otherwise", () => {
+    const shell = (r: ReturnType<typeof buildJobManifest>) =>
+      (r.job.spec?.template?.spec?.containers?.find((c) => c.name === "opencode")?.command?.[2] ?? "");
+    const ext = buildJobManifest({
+      ctx: {
+        ...mockCtx,
+        config: {
+          instructionsBundleMode: "external",
+          instructionsRootPath: "/paperclip/.paperclip/instances/default/companies/Penstock/agents/devops",
+        },
+      },
+      selfPod: mockSelfPod,
+    });
+    const c = shell(ext);
+    expect(c).toContain("[ -e docs ]");
+    expect(c).toContain('ln -sfn "$__pcd" docs');
+    expect(c).toContain('"$(dirname "$(dirname "${AGENT_HOME:-/nonexistent}")")/docs"');
+    // no external bundle → no symlink bridge
+    const plain = buildJobManifest({ ctx: { ...mockCtx, config: { instructionsFilePath: "/x/AGENTS.md" } }, selfPod: mockSelfPod });
+    expect(shell(plain)).not.toContain("ln -sfn");
+  });
+
   it("sets PAPERCLIP_LINKED_ISSUE_IDS from non-empty issueIds array (skipping blanks)", () => {
     const ctx = { ...mockCtx, context: { ...mockCtx.context, issueIds: ["a", "  ", "b", null as unknown as string, "c"] } };
     const result = buildJobManifest({ ctx, selfPod: mockSelfPod });

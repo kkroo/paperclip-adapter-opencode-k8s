@@ -839,7 +839,23 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const compactPrefix = needsCompactBeforeNextRun
     ? `echo "[paperclip] running /compact on session ${runtimeSessionId} before main prompt"; echo '/compact' | opencode ${compactArgsEscaped} >/dev/null 2>&1 || echo "[paperclip] /compact returned non-zero; continuing"; `
     : "";
-  const baseMainCommand = `set -o pipefail; ${ccrotateRefresh}; ${authBootstrap}; ${configSetup}${compactPrefix}mkdir -p $(dirname ${podLogPath}) && : > ${podLogPath} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${podLogPath}`;
+  // Shared-docs bridge (BLO-10315). For an external instructions bundle, the
+  // agent's AGENTS.md "## Shared Documentation" section tells it to `Read
+  // docs/<x>.md` — resolved relative to the run's working dir. But those
+  // company doc-templates are materialized one level above the per-agent
+  // bundle (`<instructionsRootPath>/../../docs`, i.e. companies/<co>/docs/),
+  // NOT in the per-run workspace, so every such read 404s and the run exits 1.
+  // AGENT_HOME already points at the bundle root (the external-bundle fix), so
+  // derive the company docs dir from it and symlink it into the working dir as
+  // `docs/`. Guarded: skip when a `docs/` already exists (e.g. the project
+  // repo's own), only link when the source dir is present, and never fail the
+  // run on error.
+  const sharedDocsBridge =
+    asString(config.instructionsBundleMode, "").trim() === "external" &&
+    asString(config.instructionsRootPath, "").trim()
+      ? `( [ -e docs ] || { __pcd="$(dirname "$(dirname "\${AGENT_HOME:-/nonexistent}")")/docs"; [ -d "$__pcd" ] && ln -sfn "$__pcd" docs; } ) 2>/dev/null || true; `
+      : "";
+  const baseMainCommand = `set -o pipefail; ${ccrotateRefresh}; ${authBootstrap}; ${configSetup}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${podLogPath}) && : > ${podLogPath} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${podLogPath}`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket.
