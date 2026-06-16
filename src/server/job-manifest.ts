@@ -46,8 +46,8 @@ function loadSharedMcpBaseline(): Record<string, unknown> {
  * same intent with different field names:
  *   claude  {command: "X", args: [...], env: {...}}
  *     -> opencode {type: "local", command: ["X", ...args], environment: {...}}
- *   claude  {type: "http", url: "..."} / {type: "sse", url: "..."}
- *     -> opencode {type: "remote", url: "..."}
+ *   claude  {type: "http", url: "...", headers: {...}} / {type: "sse", url: "..."}
+ *     -> opencode {type: "remote", url: "...", headers: {...}}
  * SSE entries are emitted as remote — opencode's MCP client may surface a
  * per-server transport error if it can't negotiate SSE; the rest of the
  * fleet stays usable.
@@ -72,7 +72,9 @@ function translateMcpEntryToOpencode(spec: unknown): Record<string, unknown> | n
     return out;
   }
   if (typeof s.url === "string") {
-    return { type: "remote", url: s.url };
+    const out: Record<string, unknown> = { type: "remote", url: s.url };
+    if (s.headers && typeof s.headers === "object" && !Array.isArray(s.headers)) out.headers = s.headers;
+    return out;
   }
   return null;
 }

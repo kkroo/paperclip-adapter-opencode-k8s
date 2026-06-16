@@ -848,6 +848,12 @@ describe("buildJobManifest — MCP fleet wiring", () => {
             type: "http",
             url: "http://prometheus-mcp-server.paperclip.svc.cluster.local:8080/mcp",
           },
+          // claude http with auth headers
+          gbrain: {
+            type: "http",
+            url: "http://gbrain-mcp-admin.paperclip.svc.cluster.local:3130/mcp",
+            headers: { Authorization: "Bearer test-token" },
+          },
           // claude sse — translates to remote (best-effort)
           kubernetes: {
             type: "sse",
@@ -901,6 +907,13 @@ describe("buildJobManifest — MCP fleet wiring", () => {
     expect(parsed.mcp.prometheus).toEqual({
       type: "remote",
       url: "http://prometheus-mcp-server.paperclip.svc.cluster.local:8080/mcp",
+    });
+
+    // auth headers are preserved for Bearer-protected remote MCPs
+    expect(parsed.mcp.gbrain).toEqual({
+      type: "remote",
+      url: "http://gbrain-mcp-admin.paperclip.svc.cluster.local:3130/mcp",
+      headers: { Authorization: "Bearer test-token" },
     });
 
     // sse → remote (lossy translation, documented)
