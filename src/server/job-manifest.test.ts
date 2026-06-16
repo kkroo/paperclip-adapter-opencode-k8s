@@ -216,6 +216,37 @@ describe("buildJobManifest", () => {
     expect(opencodeEnv?.value).toBe("true");
   });
 
+  // The base paperclip image bakes NODE_ENV=production. In an agent workspace
+  // that breaks `npm install`/`npm ci` (devDependencies omitted), so source
+  // builds that need dev tooling fail to bootstrap (e.g. shaka's
+  // closure-make-deps). Agent jobs do dev/build work, so default them to a
+  // non-production NODE_ENV. See BLO-8661.
+  it("defaults NODE_ENV to development so agent npm installs include devDependencies", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    const nodeEnv = env.find((e) => e.name === "NODE_ENV");
+    expect(nodeEnv?.value).toBe("development");
+  });
+
+  it("lets config.env override the default NODE_ENV", () => {
+    const ctx = { ...mockCtx, config: { env: { NODE_ENV: "production" } } };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    const nodeEnv = env.find((e) => e.name === "NODE_ENV");
+    expect(nodeEnv?.value).toBe("production");
+  });
+
+  it("respects NODE_ENV inherited from the Deployment env", () => {
+    const selfPod = { ...mockSelfPod, inheritedEnv: { NODE_ENV: "staging" } };
+    const result = buildJobManifest({ ctx: mockCtx, selfPod });
+
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    const nodeEnv = env.find((e) => e.name === "NODE_ENV");
+    expect(nodeEnv?.value).toBe("staging");
+  });
+
   it("applies default ttlSecondsAfterFinished of 300", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
 
@@ -602,6 +633,65 @@ describe("buildJobManifest — env wiring branches", () => {
     expect(env.find((e) => e.name === "AGENT_HOME")?.value).toBe("/home/agent");
   });
 
+  it("points AGENT_HOME at instructionsRootPath for an external instructions bundle (companions resolve)", () => {
+    const ctx = {
+      ...mockCtx,
+      config: {
+        instructionsBundleMode: "external",
+        instructionsRootPath: "/paperclip/.paperclip/instances/default/companies/Penstock/agents/devops",
+        instructionsEntryFile: "AGENTS.md",
+      },
+      context: {
+        ...mockCtx.context,
+        // server pointed agentHome at the per-task workspace (the broken default
+        // that made every `Read $AGENT_HOME/HEARTBEAT.md` miss); the external
+        // bundle root must win so the companions resolve.
+        paperclipWorkspace: { agentHome: "/paperclip/instances/default/workspaces/agent-abc" },
+      },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const env = result.job.spec?.template.spec?.containers[0]?.env ?? [];
+    expect(env.find((e) => e.name === "AGENT_HOME")?.value).toBe(
+      "/paperclip/.paperclip/instances/default/companies/Penstock/agents/devops",
+    );
+  });
+
+  it("leaves AGENT_HOME as the workspace agentHome when no external bundle is configured", () => {
+    const ctx = {
+      ...mockCtx,
+      config: { instructionsFilePath: "/paperclip/.paperclip/.../agents/ceo/AGENTS.md" },
+      context: {
+        ...mockCtx.context,
+        paperclipWorkspace: { agentHome: "/home/agent" },
+      },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const env = result.job.spec?.template.spec?.containers[0]?.env ?? [];
+    expect(env.find((e) => e.name === "AGENT_HOME")?.value).toBe("/home/agent");
+  });
+
+  it("symlinks company shared-docs into cwd for an external bundle (BLO-10315), and skips otherwise", () => {
+    const shell = (r: ReturnType<typeof buildJobManifest>) =>
+      (r.job.spec?.template?.spec?.containers?.find((c) => c.name === "opencode")?.command?.[2] ?? "");
+    const ext = buildJobManifest({
+      ctx: {
+        ...mockCtx,
+        config: {
+          instructionsBundleMode: "external",
+          instructionsRootPath: "/paperclip/.paperclip/instances/default/companies/Penstock/agents/devops",
+        },
+      },
+      selfPod: mockSelfPod,
+    });
+    const c = shell(ext);
+    expect(c).toContain("[ -e docs ]");
+    expect(c).toContain('ln -sfn "$__pcd" docs');
+    expect(c).toContain('"$(dirname "$(dirname "${AGENT_HOME:-/nonexistent}")")/docs"');
+    // no external bundle → no symlink bridge
+    const plain = buildJobManifest({ ctx: { ...mockCtx, config: { instructionsFilePath: "/x/AGENTS.md" } }, selfPod: mockSelfPod });
+    expect(shell(plain)).not.toContain("ln -sfn");
+  });
+
   it("sets PAPERCLIP_LINKED_ISSUE_IDS from non-empty issueIds array (skipping blanks)", () => {
     const ctx = { ...mockCtx, context: { ...mockCtx.context, issueIds: ["a", "  ", "b", null as unknown as string, "c"] } };
     const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
@@ -853,13 +943,13 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       };
       const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
       const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command;
-      expect(cmd?.[2]).toMatch(/ccrotate next --yes --target codex --accounts a@b\.net,c@d\.net/);
+      expect(cmd?.[2]).toMatch(/timeout 30s ccrotate next --yes --target codex --accounts a@b\.net,c@d\.net/);
     });
 
     it("falls through to global ccrotate when providers is undefined", () => {
       const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
       const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command;
-      expect(cmd?.[2]).toMatch(/ccrotate next --yes --target codex(?! --accounts)/);
+      expect(cmd?.[2]).toMatch(/timeout 30s ccrotate next --yes --target codex(?! --accounts)/);
     });
 
     it("falls through to global ccrotate when only providers.anthropic is set (wrong key for opencode)", () => {
@@ -889,7 +979,7 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
     it("emits the auth bootstrap step between ccrotateRefresh and the opencode invocation", () => {
       const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
       const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
-      const ccrotateIdx = cmd.indexOf("ccrotate next --yes --target codex");
+      const ccrotateIdx = cmd.indexOf("timeout 30s ccrotate next --yes --target codex");
       const bootstrapIdx = cmd.indexOf(".local/share/opencode");
       const opencodeIdx = cmd.indexOf("| opencode ");
       expect(ccrotateIdx).toBeGreaterThan(-1);
@@ -910,6 +1000,27 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       // Best-effort: never fail the pod on bootstrap errors
       expect(cmd).toContain("|| true");
     });
+
+    it("skips OAuth bootstrap and clears stale opencode auth when OPENAI_API_KEY is configured", () => {
+      const ctx = {
+        ...mockCtx,
+        config: {
+          env: {
+            OPENAI_API_KEY: "test-key",
+            OPENAI_BASE_URL: "http://opencode-ccrotate-responses-shim.paperclip.svc.cluster.local:8080/v1",
+          },
+        },
+      };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+
+      expect(cmd).not.toContain('".codex","auth.json"');
+      expect(cmd).not.toContain('auth_mode!=="chatgpt"');
+      expect(cmd).toContain("rm -f ~/.local/share/opencode/auth.json ~/.local/share/opencode/account.json");
+      expect(cmd.indexOf("rm -f ~/.local/share/opencode/auth.json")).toBeLessThan(
+        cmd.indexOf("cat /tmp/prompt/prompt.txt"),
+      );
+    });
   });
 
   describe("buildRuntimeConfigJson + opencodeConfigJson disable opencode.ai/zen", () => {
@@ -923,5 +1034,237 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       const parsed = JSON.parse(match![1].replace(/'\\''/g, "'")) as { disabled_providers?: string[] };
       expect(parsed.disabled_providers).toEqual(["opencode"]);
     });
+  });
+
+  describe("paperclipTaskMarkdown surfacing", () => {
+    // Server-side heartbeat composes context.paperclipTaskMarkdown for wakes
+    // that carry first-class task context (notably PR-review wakes via the
+    // github webhook handler, which set contextSnapshot.githubPrNumber +
+    // githubRepoFullName but never produce a paperclipWake because there's
+    // no issue tied to the PR). Without this prompt slot, the PR review
+    // agent reaches the pod with NO information about which PR to review.
+    //
+    // See:
+    //   - server/services/heartbeat.ts buildPaperclipTaskMarkdown
+    //   - server/routes/github-webhook.ts (the wake call that sets
+    //     contextSnapshot.githubPrNumber + reviewKind)
+    it("includes context.paperclipTaskMarkdown in the assembled prompt", () => {
+      const taskMd = [
+        "Paperclip task context:",
+        "- PR: \"Blockcast/paperclip#59\"",
+        "- Wake reason: \"github_pr_opened\"",
+        "",
+        "GitHub PR review directive:",
+        "A GitHub webhook woke you to review this pull request.",
+      ].join("\n");
+      const ctx = { ...mockCtx, context: { ...mockCtx.context, paperclipTaskMarkdown: taskMd } };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      expect(result.prompt).toContain("Blockcast/paperclip#59");
+      expect(result.prompt).toContain("github_pr_opened");
+      expect(result.prompt).toContain("GitHub PR review directive");
+      expect(result.promptMetrics.taskMarkdownChars).toBe(taskMd.length);
+    });
+
+    it("does NOT inject anything when paperclipTaskMarkdown is absent (no spurious newlines)", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      expect(result.promptMetrics.taskMarkdownChars).toBe(0);
+    });
+
+    it("trims surrounding whitespace from paperclipTaskMarkdown before inclusion", () => {
+      const taskMd = "\n\n  GitHub PR review directive:\n  ...\n\n";
+      const ctx = { ...mockCtx, context: { ...mockCtx.context, paperclipTaskMarkdown: taskMd } };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      expect(result.promptMetrics.taskMarkdownChars).toBe(taskMd.trim().length);
+      expect(result.prompt).toContain("GitHub PR review directive");
+    });
+
+    // The whole point of inserting `taskMarkdown` at a *specific* position
+    // is so the agent reads task context (what to work on) after wake
+    // context (why it woke) but before the session handoff narrative
+    // (which may reference the task). A position-blind .toContain check
+    // would silently accept a reorder; this test pins the contract.
+    it("places taskMarkdown after wakePrompt and before sessionHandoffNote", () => {
+      const ctx = {
+        ...mockCtx,
+        context: {
+          ...mockCtx.context,
+          paperclipWake: {
+            reason: "issue_assigned",
+            issue: { id: "x", identifier: "WAKE-SENTINEL", title: "t" },
+          },
+          paperclipTaskMarkdown: "TASK-SENTINEL paperclipTaskMarkdown body",
+          paperclipSessionHandoffMarkdown: "HANDOFF-SENTINEL paperclipSessionHandoffMarkdown body",
+        },
+      };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      const wakeIdx = result.prompt.indexOf("WAKE-SENTINEL");
+      const taskIdx = result.prompt.indexOf("TASK-SENTINEL");
+      const handoffIdx = result.prompt.indexOf("HANDOFF-SENTINEL");
+      expect(wakeIdx).toBeGreaterThan(-1);
+      expect(taskIdx).toBeGreaterThan(wakeIdx);
+      expect(handoffIdx).toBeGreaterThan(taskIdx);
+    });
+
+    // PR-review wakes overwhelmingly arrive WITH a resumed session: the
+    // reviewer agent (Ally) keeps a long-running opencode session across
+    // wakes. The resume-delta gate `Boolean(runtimeSessionId) && wakePrompt.length > 0`
+    // evaluates to `false` for that shape (paperclipWake is null when
+    // there's no issue tied to the PR), so `renderedPrompt` is NOT
+    // suppressed — the agent gets the full bootstrap + the PR directive.
+    // This test pins that behavior so a future refactor (e.g. gating
+    // resume-delta on `taskMarkdown.length > 0`) doesn't silently land.
+    it("does not gate resume-delta on taskMarkdown (PR-review wake shape: resumed session + no paperclipWake)", () => {
+      const ctx = {
+        ...mockCtx,
+        runtime: {
+          sessionId: "ses_pr_review",
+          sessionParams: { sessionId: "ses_pr_review" },
+          sessionDisplayId: "ses_pr_review",
+          taskKey: null,
+        },
+        context: {
+          ...mockCtx.context,
+          paperclipTaskMarkdown: "GitHub PR review directive: review PR #59",
+        },
+      };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      expect(result.prompt).toContain("GitHub PR review directive");
+      expect(result.promptMetrics.taskMarkdownChars).toBeGreaterThan(0);
+      // wakePrompt is empty (no paperclipWake) → resume-delta gate is OFF
+      // → heartbeat prompt template still renders.
+      expect(result.promptMetrics.wakePromptChars).toBe(0);
+      expect(result.promptMetrics.heartbeatPromptChars).toBeGreaterThan(0);
+    });
+
+    // The complementary shape: issue-wake with both paperclipWake AND
+    // paperclipTaskMarkdown set, on a resumed session. Resume-delta DOES
+    // engage (wakePrompt > 0), so `renderedPrompt` IS suppressed — but
+    // taskMarkdown must survive the suppression. Catches the "fix" where
+    // someone gates taskMarkdown on the same condition as renderedPrompt.
+    it("preserves taskMarkdown even when resume-delta suppresses the heartbeat prompt", () => {
+      const ctx = {
+        ...mockCtx,
+        runtime: {
+          sessionId: "ses_issue_wake",
+          sessionParams: { sessionId: "ses_issue_wake" },
+          sessionDisplayId: "ses_issue_wake",
+          taskKey: null,
+        },
+        context: {
+          ...mockCtx.context,
+          paperclipWake: {
+            reason: "issue_assigned",
+            issue: { id: "iw", identifier: "BLO-1234", title: "t" },
+          },
+          paperclipTaskMarkdown: "Paperclip task context:\n- Issue: BLO-1234",
+        },
+      };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      expect(result.prompt).toContain("Paperclip task context");
+      expect(result.promptMetrics.taskMarkdownChars).toBeGreaterThan(0);
+      // Resume-delta gate fires (wakePrompt > 0 + sessionId set) → heartbeat prompt suppressed
+      expect(result.promptMetrics.wakePromptChars).toBeGreaterThan(0);
+      expect(result.promptMetrics.heartbeatPromptChars).toBe(0);
+    });
+  });
+});
+
+describe("buildJobManifest — resumeLastSession:false unifies fresh-session semantics", () => {
+  // Bug surfaced 2026-05-23 (originally Gotcha #6 in BLO-5492 handoff): the
+  // CLI gate `if (runtimeSessionId && resumeLastSession) push --session`
+  // skipped the flag when resumeLastSession was false, so opencode started
+  // a brand-new session. But three prompt-rendering paths used the weaker
+  // `Boolean(runtimeSessionId)` gate, so the prompt was still composed as
+  // a resume-delta (no bootstrap, wakePrompt rendered as delta, heartbeat
+  // prompt suppressed). Net effect: opencode came up cold but received a
+  // prompt that assumed prior context. Symptom on the fleet was the
+  // appearance of "stale session reuse" even with resumeLastSession:false
+  // explicitly set.
+  function buildResumeOffCtx(overrides: Partial<JobBuildInput["ctx"]["context"]> = {}) {
+    return {
+      ...mockCtx,
+      runtime: {
+        sessionId: "ses_should_not_resume",
+        sessionParams: { sessionId: "ses_should_not_resume" },
+        sessionDisplayId: "ses_should_not_resume",
+        taskKey: null,
+      },
+      config: {
+        resumeLastSession: false,
+        bootstrapPromptTemplate: "BOOTSTRAP-SENTINEL agent {{agent.id}}",
+      },
+      context: {
+        ...mockCtx.context,
+        ...overrides,
+      },
+    };
+  }
+
+  function getMainShellCommand(result: ReturnType<typeof buildJobManifest>) {
+    const containers = result.job.spec?.template?.spec?.containers ?? [];
+    const main = containers.find((c) => c.name === "opencode");
+    const cmd = main?.command ?? [];
+    return cmd[2] ?? "";
+  }
+
+  it("renders bootstrap prompt when resumeLastSession is false even with a tracked sessionId", () => {
+    const ctx = buildResumeOffCtx();
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    expect(result.prompt).toContain("BOOTSTRAP-SENTINEL");
+    expect(result.promptMetrics.bootstrapPromptChars).toBeGreaterThan(0);
+  });
+
+  it("does NOT pass --session to opencode when resumeLastSession is false", () => {
+    const ctx = buildResumeOffCtx();
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const script = getMainShellCommand(result);
+    expect(script).not.toContain("--session");
+  });
+
+  it("renders wakePrompt as a fresh (not resume-delta) prompt when resumeLastSession is false", () => {
+    // The wake-prompt renderer formats DIFFERENTLY depending on whether
+    // the session is being resumed. When starting fresh we want the full
+    // wake context, not a delta against a phantom prior session.
+    const ctx = buildResumeOffCtx({
+      paperclipWake: {
+        reason: "issue_assigned",
+        issue: { id: "iw", identifier: "BLO-9999", title: "test wake" },
+      },
+    });
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    expect(result.promptMetrics.wakePromptChars).toBeGreaterThan(0);
+    // Heartbeat prompt must NOT be suppressed by the resume-delta gate
+    // (which only applies to genuinely-resumed sessions).
+    expect(result.promptMetrics.heartbeatPromptChars).toBeGreaterThan(0);
+  });
+
+  it("preserves resume semantics when resumeLastSession is true (default)", () => {
+    // Regression guard for the unified flag: existing resumed-session
+    // behaviour must not change for agents that don't opt out.
+    const ctx = {
+      ...mockCtx,
+      runtime: {
+        sessionId: "ses_resuming",
+        sessionParams: { sessionId: "ses_resuming" },
+        sessionDisplayId: "ses_resuming",
+        taskKey: null,
+      },
+      config: {
+        bootstrapPromptTemplate: "BOOTSTRAP-SENTINEL",
+      },
+      context: {
+        ...mockCtx.context,
+        paperclipWake: {
+          reason: "issue_assigned",
+          issue: { id: "i2", identifier: "BLO-9998", title: "resume" },
+        },
+      },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const script = getMainShellCommand(result);
+    // Resuming path: --session passed, no bootstrap, heartbeat suppressed
+    expect(script).toContain("--session' 'ses_resuming'");
+    expect(result.promptMetrics.bootstrapPromptChars).toBe(0);
+    expect(result.promptMetrics.heartbeatPromptChars).toBe(0);
   });
 });

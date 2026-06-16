@@ -1331,11 +1331,11 @@ describe("ensureAgentDbPvc — unit", () => {
     expect(vi.mocked(createPvc)).not.toHaveBeenCalled();
   });
 
-  it("defaults to dedicated_pvc when agentDbMode is not set", async () => {
-    vi.mocked(getPvc).mockResolvedValueOnce({ metadata: { name: EXPECTED_PVC_NAME } } as Awaited<ReturnType<typeof getPvc>>);
-
+  it("defaults to workspace_subpath when agentDbMode is not set (no dedicated PVC provisioned)", async () => {
     const result = await ensureAgentDbPvc(AGENT_ID, NAMESPACE, {});
-    expect(result).toBe(EXPECTED_PVC_NAME);
+    expect(result).toBeNull();
+    expect(vi.mocked(getPvc)).not.toHaveBeenCalled();
+    expect(vi.mocked(createPvc)).not.toHaveBeenCalled();
   });
 
   it("derives PVC name from agent ID, keeping alphanumeric and hyphens", async () => {
@@ -1447,10 +1447,17 @@ describe("completionWithGrace", () => {
     }
   });
 
-  it("returns timedOut result when completion promise rejects", async () => {
+  it("does NOT report a timeout when the completion promise rejects — a poll error is not a deadline (BLO-10448)", async () => {
     const { completionWithGrace } = await import("./execute.js");
-    const result = await completionWithGrace(Promise.reject(new Error("boom")), 1000);
-    expect(result).toEqual({ succeeded: false, timedOut: true, jobGone: false });
+    // With a grace cap configured: a rejected completion poll must surface as
+    // "outcome unknown" (timedOut:false), not a spurious deadline. The caller
+    // adjudicates via the pod's real exit code.
+    const withGrace = await completionWithGrace(Promise.reject(new Error("boom")), 1000);
+    expect(withGrace).toEqual({ succeeded: false, timedOut: false, jobGone: false });
+    // And in the no-timeout-configured branch (graceMs <= 0) — this is the path
+    // that produced the bogus "Timed out after 0s" for timeoutSec:0 agents.
+    const noGrace = await completionWithGrace(Promise.reject(new Error("boom")), 0);
+    expect(noGrace).toEqual({ succeeded: false, timedOut: false, jobGone: false });
   });
 
   it("does not apply grace cap when graceMs <= 0 (no timeout configured) — BLO-2436", async () => {
@@ -1476,6 +1483,48 @@ describe("completionWithGrace", () => {
       await vi.advanceTimersByTimeAsync(100_000);
       const result = await racePromise;
       expect(result).toEqual({ succeeded: true, timedOut: false, jobGone: false });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("waitForJobCompletion — transient read tolerance (BLO-10448)", () => {
+  it("rides out a transient read error and then observes completion", async () => {
+    const { waitForJobCompletion } = await import("./execute.js");
+    const readNamespacedJob = vi.fn()
+      .mockRejectedValueOnce(new Error("apiserver 500"))
+      .mockResolvedValueOnce({ status: { conditions: [{ type: "Complete", status: "True" }] } });
+    vi.mocked(getBatchApi).mockReturnValue(
+      { readNamespacedJob } as unknown as ReturnType<typeof getBatchApi>,
+    );
+    vi.useFakeTimers();
+    try {
+      const p = waitForJobCompletion(NAMESPACE, JOB_NAME, 0);
+      await vi.advanceTimersByTimeAsync(2000);
+      const result = await p;
+      expect(result).toEqual({ succeeded: true, timedOut: false, jobGone: false });
+      expect(readNamespacedJob).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("gives up by throwing (NOT masquerading as a timeout) after sustained read errors", async () => {
+    const { waitForJobCompletion } = await import("./execute.js");
+    const readNamespacedJob = vi.fn().mockRejectedValue(new Error("apiserver down"));
+    vi.mocked(getBatchApi).mockReturnValue(
+      { readNamespacedJob } as unknown as ReturnType<typeof getBatchApi>,
+    );
+    vi.useFakeTimers();
+    try {
+      const p = waitForJobCompletion(NAMESPACE, JOB_NAME, 0);
+      const expectation = expect(p).rejects.toThrow("apiserver down");
+      await vi.advanceTimersByTimeAsync(2000 * 5);
+      await expectation;
+      // MAX_CONSECUTIVE_READ_ERRORS reads, then it throws — the caller surfaces a
+      // truthful k8s error instead of a bogus "Timed out after 0s".
+      expect(readNamespacedJob).toHaveBeenCalledTimes(5);
     } finally {
       vi.useRealTimers();
     }

@@ -24,11 +24,12 @@ export function getConfigSchema(): AdapterConfigSchema {
         label: "Agent DB Mode",
         type: "select",
         options: [
-          { label: "Dedicated PVC (per-agent, persistent)", value: "dedicated_pvc" },
+          { label: "Workspace subPath (shared workspace data PVC, survives restart)", value: "workspace_subpath" },
+          { label: "Dedicated PVC (per-agent, persistent RWO)", value: "dedicated_pvc" },
           { label: "Ephemeral (emptyDir, lost on Job exit)", value: "ephemeral" },
         ],
-        default: "dedicated_pvc",
-        hint: "dedicated_pvc creates a long-lived PVC named opencode-db-<agentId> and mounts it at /opencode-db; ephemeral uses a Job-local emptyDir",
+        default: "workspace_subpath",
+        hint: "workspace_subpath (default) stores the agent DB under a per-(agent, task) subdir on the shared workspace data PVC (RWX) and survives pod restarts without a single-node-attach volume; dedicated_pvc is explicit opt-in and creates a long-lived RWO PVC named opencode-db-<agentId> mounted at /opencode-db (requires agentDbStorageClass); ephemeral uses a Job-local emptyDir",
         group: "Core",
       },
       {
@@ -184,14 +185,14 @@ export function getConfigSchema(): AdapterConfigSchema {
         key: "dockerCpuLimit",
         label: "DinD CPU Limit",
         type: "text",
-        hint: "CPU limit for the DinD sidecar (default '2'). e.g. '2', '4000m'.",
+        hint: "CPU limit for the DinD sidecar (default '4'). e.g. '4', '4000m'.",
         group: "Docker",
       },
       {
         key: "dockerMemoryLimit",
         label: "DinD Memory Limit",
         type: "text",
-        hint: "Memory limit for the DinD sidecar (default '2Gi'). e.g. '2Gi', '4Gi'.",
+        hint: "Memory limit for the DinD sidecar (default '8Gi'). e.g. '4Gi', '8Gi'.",
         group: "Docker",
       },
 

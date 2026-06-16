@@ -265,7 +265,27 @@ function buildEnvVars(
   setIfPresent("PAPERCLIP_WORKSPACE_REPO_REF", workspaceContext.repoRef);
   setIfPresent("PAPERCLIP_WORKSPACE_BRANCH", workspaceContext.branchName);
   setIfPresent("PAPERCLIP_WORKSPACE_WORKTREE_PATH", workspaceContext.worktreePath);
-  setIfPresent("AGENT_HOME", workspaceContext.agentHome);
+
+  // AGENT_HOME resolution.
+  //
+  // The agent's instructions (AGENTS.md) point at companion files via
+  // `$AGENT_HOME/HEARTBEAT.md`, `$AGENT_HOME/SOUL.md`, `$AGENT_HOME/TOOLS.md`,
+  // and `$AGENT_HOME/skills/*.md`. For an "external" instructions bundle the
+  // server materializes that whole tree into `instructionsRootPath` (a stable
+  // per-agent dir), NOT into the per-task workspace. If AGENT_HOME stays
+  // pointed at the workspace (which only ever holds repo checkouts), every
+  // `Read $AGENT_HOME/HEARTBEAT.md` the agent performs hits "File not found"
+  // and the run dies before doing useful work — the failure mode that kept
+  // opencode_k8s agents with an external bundle at 100% failure while
+  // claude_k8s agents (whose AGENT_HOME already IS the bundle dir) worked.
+  // Point AGENT_HOME at the bundle root so the companions resolve, mirroring
+  // claude_k8s. Falls back to the server-provided workspace agentHome when no
+  // external bundle is configured (single-file / legacy agents — unchanged).
+  const instructionsBundleMode = asString(config.instructionsBundleMode, "").trim();
+  const instructionsRootPath = asString(config.instructionsRootPath, "").trim();
+  const externalBundleHome =
+    instructionsBundleMode === "external" && instructionsRootPath ? instructionsRootPath : "";
+  setIfPresent("AGENT_HOME", externalBundleHome || workspaceContext.agentHome);
 
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((v): v is string => typeof v === "string" && v.trim().length > 0)
@@ -297,6 +317,17 @@ function buildEnvVars(
     ...selfPod.inheritedEnv,
     ...paperclipEnv,
   };
+
+  // Agent jobs do dev/build work (npm install with devDependencies, running
+  // source build/test toolchains). The base paperclip image bakes
+  // NODE_ENV=production, which makes `npm install`/`npm ci` omit
+  // devDependencies and breaks toolchain bootstrap for source builds
+  // (e.g. shaka's closure-make-deps). Default to a non-production NODE_ENV so
+  // dev tooling installs. Set before Layer 4 so the Deployment env (above) or
+  // user config.env can still override it. See BLO-8661.
+  if (!("NODE_ENV" in merged)) {
+    merged.NODE_ENV = "development";
+  }
 
   // Layer 4: User-defined overrides from adapterConfig.env
   for (const [key, value] of Object.entries(envConfig)) {
@@ -371,6 +402,18 @@ function buildOpencodeAuthBootstrapShell(): string {
   return `mkdir -p ~/.local/share/opencode && node -e 'const fs=require("fs"),p=require("path"),H=process.env.HOME||".";try{const c=JSON.parse(fs.readFileSync(p.join(H,".codex","auth.json"),"utf8"));if(c.auth_mode!=="chatgpt"||!c.tokens||!c.tokens.access_token||!c.tokens.refresh_token)process.exit(0);let exp=Date.now()+30*60*1000;try{const part=c.tokens.id_token.split(".")[1];const pad="=".repeat((4-part.length%4)%4);const payload=JSON.parse(Buffer.from((part+pad).replace(/-/g,"+").replace(/_/g,"/"),"base64").toString());if(payload.exp)exp=payload.exp*1000;}catch(e){}const out={openai:{type:"oauth",access:c.tokens.access_token,refresh:c.tokens.refresh_token,expires:exp,accountId:c.tokens.account_id||null}};fs.writeFileSync(p.join(H,".local","share","opencode","auth.json"),JSON.stringify(out));}catch(e){console.error("[opencode-auth-bootstrap] skipped:",e.message);}' || true`;
 }
 
+function buildOpencodeApiKeyAuthCleanupShell(): string {
+  return `rm -f ~/.local/share/opencode/auth.json ~/.local/share/opencode/account.json 2>/dev/null || true`;
+}
+
+function hasEnvVarValue(envVars: k8s.V1EnvVar[], name: string): boolean {
+  return envVars.some((envVar) => {
+    if (envVar.name !== name) return false;
+    if (typeof envVar.value === "string" && envVar.value.length > 0) return true;
+    return Boolean(envVar.valueFrom);
+  });
+}
+
 /**
  * docker:dind sidecar exposing /var/run/docker.sock to the agent container
  * via a shared emptyDir. Deployed as a native Kubernetes 1.29+ sidecar
@@ -400,7 +443,13 @@ function buildDindSidecar(opts: {
     name: "dind",
     image: opts.image,
     imagePullPolicy: "IfNotPresent",
-    args: ["dockerd", "--host=unix:///var/run/docker.sock", "--storage-driver=overlay2"],
+    // `--group=1000` makes dockerd create /var/run/docker.sock with group 1000
+    // (mode 0660 root:1000). The main agent container runs as uid 1000 with
+    // podSecurityContext.fsGroup=1000, so without this it can't connect to the
+    // socket (which dockerd otherwise creates root:root mode 0660). Pairs with
+    // the pod-level runAsGroup=1000 / fsGroup=1000 that this adapter already
+    // sets at line ~695. BLO-5492.
+    args: ["dockerd", "--host=unix:///var/run/docker.sock", "--storage-driver=overlay2", "--group=1000"],
     securityContext: { privileged: true, runAsUser: 0, runAsNonRoot: false },
     env: [{ name: "DOCKER_TLS_CERTDIR", value: "" }],
     resources: {
@@ -443,8 +492,8 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const image = asString(config.image, "") || selfPod.image;
   const enableDocker = asBoolean(config.enableDocker, false);
   const dockerImage = asString(config.dockerImage, "docker:28-dind");
-  const dockerCpuLimit = asString(config.dockerCpuLimit, "2");
-  const dockerMemoryLimit = asString(config.dockerMemoryLimit, "2Gi");
+  const dockerCpuLimit = asString(config.dockerCpuLimit, "4");
+  const dockerMemoryLimit = asString(config.dockerMemoryLimit, "8Gi");
   const model = asString(config.model, "").trim();
   const variant = asString(config.variant, "").trim();
   const extraArgs = asStringArray(config.extraArgs);
@@ -478,6 +527,15 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
   const runtimeSessionParams = parseObject(runtime.sessionParams);
   const runtimeSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
+  // resumeLastSession defaults to true (preserve existing behaviour); set to false to start fresh.
+  // A run "is resuming" only when there's a tracked session ID AND the agent
+  // hasn't been configured to start fresh. Prompt-rendering paths below must
+  // use this unified flag — using `Boolean(runtimeSessionId)` alone causes a
+  // skew where `--session` is not passed to opencode (line ~540) but the
+  // prompt is still rendered as a resume-delta, so opencode starts a brand-
+  // new session with a wake-only prompt and no bootstrap/heartbeat context.
+  const resumeLastSession = asBoolean(config.resumeLastSession, true);
+  const isResuming = Boolean(runtimeSessionId) && resumeLastSession;
   const templateData = {
     agentId: agent.id,
     companyId: agent.companyId,
@@ -488,11 +546,18 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     context,
   };
   const renderedBootstrapPrompt =
-    !runtimeSessionId && bootstrapPromptTemplate.trim().length > 0
+    !isResuming && bootstrapPromptTemplate.trim().length > 0
       ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
       : "";
-  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: Boolean(runtimeSessionId) });
-  const shouldUseResumeDeltaPrompt = Boolean(runtimeSessionId) && wakePrompt.length > 0;
+  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: isResuming });
+  // Server's heartbeat composes `context.paperclipTaskMarkdown` for wakes
+  // that carry first-class task context (PR-review wakes, issue wakes,
+  // wake-comment wakes). renderPaperclipWakePrompt only covers the
+  // issue/comment path via paperclipWake, so without this slot a
+  // github_pr_* wake reaches the pod with NO PR number / repo in the
+  // prompt and the reviewer agent has nothing to act on.
+  const taskMarkdown = asString(context.paperclipTaskMarkdown, "").trim();
+  const shouldUseResumeDeltaPrompt = isResuming && wakePrompt.length > 0;
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
   const instructionsContent = input.instructionsContent?.trim() ?? "";
@@ -502,6 +567,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     skillsBundleContent,
     renderedBootstrapPrompt,
     wakePrompt,
+    taskMarkdown,
     sessionHandoffNote,
     renderedPrompt,
   ]);
@@ -511,15 +577,14 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     skillsBundleChars: skillsBundleContent.length,
     bootstrapPromptChars: renderedBootstrapPrompt.length,
     wakePromptChars: wakePrompt.length,
+    taskMarkdownChars: taskMarkdown.length,
     sessionHandoffChars: sessionHandoffNote.length,
     heartbeatPromptChars: renderedPrompt.length,
   };
 
   // Build opencode CLI args
   const opencodeArgs = ["run", "--format", "json"];
-  // resumeLastSession defaults to true (preserve existing behaviour); set to false to start fresh.
-  const resumeLastSession = asBoolean(config.resumeLastSession, true);
-  if (runtimeSessionId && resumeLastSession) opencodeArgs.push("--session", runtimeSessionId);
+  if (isResuming) opencodeArgs.push("--session", runtimeSessionId);
   if (model) opencodeArgs.push("--model", model);
   if (variant) opencodeArgs.push("--variant", variant);
   if (extraArgs.length > 0) opencodeArgs.push(...extraArgs);
@@ -714,7 +779,8 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // it ccrotate prompts and hangs/exits when all accounts are at extra
   // usage. Failure is non-fatal: if ccrotate isn't on PATH or all
   // accounts are exhausted, we still try opencode with whatever
-  // credentials are on disk.
+  // credentials are on disk. Bound the preflight so a stuck Codex probe inside
+  // ccrotate cannot block the Job before opencode starts.
   const podLogPath = buildPodLogPath(companyId, agentId, runId);
   const opencodeArgsEscaped = opencodeArgs.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(" ");
   // Phase G.5: per-env credential pool. When `providers.openai.accounts`
@@ -730,8 +796,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       )
     : [];
   const accountsArg = openaiAccounts.length > 0 ? ` --accounts ${openaiAccounts.join(",")}` : "";
-  const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target codex${accountsArg} >/dev/null 2>&1) || true`;
-  const authBootstrap = buildOpencodeAuthBootstrapShell();
+  const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && timeout 30s ccrotate next --yes --target codex${accountsArg} >/dev/null 2>&1) || true`;
+  const authBootstrap = hasEnvVarValue(envVars, "OPENAI_API_KEY")
+    ? buildOpencodeApiKeyAuthCleanupShell()
+    : buildOpencodeAuthBootstrapShell();
   const configSetup = runtimeConfigJson
     ? `mkdir -p ~/.config/opencode && echo '${runtimeConfigJson.replace(/'/g, "'\\''")}' > ~/.config/opencode/opencode.json && `
     : "";
@@ -771,7 +839,23 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const compactPrefix = needsCompactBeforeNextRun
     ? `echo "[paperclip] running /compact on session ${runtimeSessionId} before main prompt"; echo '/compact' | opencode ${compactArgsEscaped} >/dev/null 2>&1 || echo "[paperclip] /compact returned non-zero; continuing"; `
     : "";
-  const baseMainCommand = `set -o pipefail; ${ccrotateRefresh}; ${authBootstrap}; ${configSetup}${compactPrefix}mkdir -p $(dirname ${podLogPath}) && : > ${podLogPath} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${podLogPath}`;
+  // Shared-docs bridge (BLO-10315). For an external instructions bundle, the
+  // agent's AGENTS.md "## Shared Documentation" section tells it to `Read
+  // docs/<x>.md` — resolved relative to the run's working dir. But those
+  // company doc-templates are materialized one level above the per-agent
+  // bundle (`<instructionsRootPath>/../../docs`, i.e. companies/<co>/docs/),
+  // NOT in the per-run workspace, so every such read 404s and the run exits 1.
+  // AGENT_HOME already points at the bundle root (the external-bundle fix), so
+  // derive the company docs dir from it and symlink it into the working dir as
+  // `docs/`. Guarded: skip when a `docs/` already exists (e.g. the project
+  // repo's own), only link when the source dir is present, and never fail the
+  // run on error.
+  const sharedDocsBridge =
+    asString(config.instructionsBundleMode, "").trim() === "external" &&
+    asString(config.instructionsRootPath, "").trim()
+      ? `( [ -e docs ] || { __pcd="$(dirname "$(dirname "\${AGENT_HOME:-/nonexistent}")")/docs"; [ -d "$__pcd" ] && ln -sfn "$__pcd" docs; } ) 2>/dev/null || true; `
+      : "";
+  const baseMainCommand = `set -o pipefail; ${ccrotateRefresh}; ${authBootstrap}; ${configSetup}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${podLogPath}) && : > ${podLogPath} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${podLogPath}`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket.

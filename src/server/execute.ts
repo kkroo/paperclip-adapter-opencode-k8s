@@ -12,12 +12,17 @@ import {
   isOpenCodeStreamEofResult,
   isOpenCodeTypeDerefError,
 } from "./parse.js";
+import { computeOpenAICompatibleCost } from "./pricing.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
 import { PassThrough } from "node:stream";
 import { buildJobManifest, LARGE_PROMPT_THRESHOLD_BYTES, buildPodLogPath } from "./job-manifest.js";
 import type * as k8s from "@kubernetes/client-node";
 
 const POLL_INTERVAL_MS = 2000;
+// How many consecutive transient (non-404) job-status read failures to tolerate
+// before giving up the completion wait. At POLL_INTERVAL_MS each, this rides out
+// brief apiserver blips without aborting a healthy run (BLO-10448).
+const MAX_CONSECUTIVE_READ_ERRORS = 5;
 const KEEPALIVE_INTERVAL_MS = 15_000;
 const LOG_EXIT_COMPLETION_GRACE_MS = parseInt(process.env.LOG_EXIT_COMPLETION_GRACE_MS ?? "30000", 10);
 
@@ -238,7 +243,7 @@ async function waitForPod(
 
 export type JobCompletionResult = { succeeded: boolean; timedOut: boolean; jobGone: boolean };
 
-async function waitForJobCompletion(
+export async function waitForJobCompletion(
   namespace: string,
   jobName: string,
   timeoutMs: number,
@@ -246,6 +251,7 @@ async function waitForJobCompletion(
 ): Promise<JobCompletionResult> {
   const batchApi = getBatchApi(kubeconfigPath);
   const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : 0;
+  let consecutiveReadErrors = 0;
 
   while (true) {
     if (deadline > 0 && Date.now() >= deadline) {
@@ -254,9 +260,19 @@ async function waitForJobCompletion(
     let job: Awaited<ReturnType<typeof batchApi.readNamespacedJob>>;
     try {
       job = await batchApi.readNamespacedJob({ name: jobName, namespace });
+      consecutiveReadErrors = 0;
     } catch (err) {
       if (isK8s404(err)) return { succeeded: false, timedOut: false, jobGone: true };
-      throw err;
+      // Tolerate transient k8s API read errors (500s, connection resets under
+      // apiserver load). A single failed status poll must NOT abort the wait:
+      // the rejection used to bubble up to completionWithGrace, which mislabeled
+      // it as a deadline — surfacing as the bogus "Timed out after 0s" and
+      // discarding an otherwise-successful run (BLO-10448). Only give up after
+      // sustained failures, then let the caller adjudicate via the pod exit code.
+      consecutiveReadErrors++;
+      if (consecutiveReadErrors >= MAX_CONSECUTIVE_READ_ERRORS) throw err;
+      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+      continue;
     }
     const conditions = job.status?.conditions ?? [];
 
@@ -281,11 +297,19 @@ export async function completionWithGrace(
   // arms a setTimeout(_, 0) that fires on the next tick with timedOut=true and
   // wins the race against any in-flight job — turning "no timeout configured"
   // into a 0-second deadline (BLO-2436).
+  // A *rejected* completionPromise means we couldn't determine the job's
+  // outcome (e.g. sustained k8s read errors from waitForJobCompletion), NOT
+  // that the job exceeded a deadline. Returning timedOut:true here mislabels a
+  // finished/running job as a timeout — with timeoutSec=0 it surfaces as the
+  // bogus "Timed out after 0s" and discards an otherwise-successful run
+  // (BLO-10448). Return timedOut:false so the caller adjudicates via the pod's
+  // real exit code (getPodTerminatedInfo). Only the grace timer below is a true
+  // timeout.
   if (graceMs <= 0) {
     try {
       return await completionPromise;
     } catch {
-      return { succeeded: false, timedOut: true, jobGone: false };
+      return { succeeded: false, timedOut: false, jobGone: false };
     }
   }
   const graceExpired = new Promise<JobCompletionResult>(
@@ -294,7 +318,7 @@ export async function completionWithGrace(
   try {
     return await Promise.race([completionPromise, graceExpired]);
   } catch {
-    return { succeeded: false, timedOut: true, jobGone: false };
+    return { succeeded: false, timedOut: false, jobGone: false };
   }
 }
 
@@ -990,6 +1014,18 @@ async function streamAndAwaitJob(
     nextSessionParams.needsCompactBeforeNextRun = true;
   }
 
+  // LiteLLM-routed paths (openai-compat passthrough) don't populate
+  // `part.cost` on step_finish events, so `parsed.costUsd` is 0 even when
+  // real tokens flowed. Fall back to a per-model token-based estimate so
+  // these runs show up in metered-spend rollups instead of hiding at $0.
+  // Returns null for unknown model / zero usage; in that case we keep the
+  // existing "unknown" / $0 shape so an out-of-date pricing table can't
+  // break the run.
+  const fallbackCost =
+    parsed.costUsd === 0
+      ? computeOpenAICompatibleCost(model || null, parsed.usage)
+      : null;
+
   return {
     exitCode: synthesizedExitCode,
     signal: null,
@@ -1005,8 +1041,8 @@ async function streamAndAwaitJob(
     sessionDisplayId: resolvedSessionId,
     provider,
     model: model || null,
-    billingType: "unknown",
-    costUsd: parsed.costUsd,
+    billingType: fallbackCost !== null ? "metered_api" : "unknown",
+    costUsd: fallbackCost !== null ? fallbackCost : parsed.costUsd,
     resultJson: { stdout },
     summary: parsed.summary,
     clearSession: stepLimitReached,
@@ -1088,7 +1124,7 @@ export async function ensureAgentDbPvc(
   config: Record<string, unknown>,
   kubeconfigPath?: string,
 ): Promise<string | null> {
-  const agentDbMode = (asString(config.agentDbMode, "dedicated_pvc").trim() || "dedicated_pvc") as AgentDbMode;
+  const agentDbMode = (asString(config.agentDbMode, "workspace_subpath").trim() || "workspace_subpath") as AgentDbMode;
   if (agentDbMode === "ephemeral" || agentDbMode === "workspace_subpath") return null;
 
   // Build a K8s-safe PVC name from the agent ID (UUIDs are already alphanumeric+hyphens)
@@ -1339,7 +1375,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // - workspace_subpath: per-(agent, task) subdir on the workspace data PVC;
   //   single-writer per task (heartbeat scheduler enforces one pod per
   //   (agent, task)) and survives pod restart, so resume actually works.
-  const agentDbMode = (asString(config.agentDbMode, "dedicated_pvc").trim() || "dedicated_pvc") as AgentDbMode;
+  const agentDbMode = (asString(config.agentDbMode, "workspace_subpath").trim() || "workspace_subpath") as AgentDbMode;
   let agentDbClaimName: string | null | undefined;
   let agentDbWorkspaceSubPath: string | undefined;
   if (agentDbMode === "workspace_subpath") {
