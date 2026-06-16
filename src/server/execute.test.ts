@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { execute, ensureAgentDbPvc, tailPodLogFile, mergeEnvironmentConfig } from "./execute.js";
+import { execute, ensureAgentDbPvc, tailPodLogFile, mergeEnvironmentConfig, captureContainerLogTail } from "./execute.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
 import { PassThrough } from "node:stream";
 import { buildJobManifest, buildPodLogPath } from "./job-manifest.js";
@@ -1997,5 +1997,56 @@ describe("execute — environment.config (Phase E.2)", () => {
     // No executionTarget at all
     const result = await execute(ctx);
     expect(result.exitCode).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// captureContainerLogTail (BLO-10448 B): recover the failure cause when a pod
+// exits non-zero but the live follow-stream captured nothing, so the opaque
+// "Pod exited: Error (exit 1)" becomes self-explaining.
+// ---------------------------------------------------------------------------
+describe("captureContainerLogTail", () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  /** Log API mock that writes `payload` to the sink then ends, like Log.log. */
+  function logApiWithPayload(payload: string) {
+    return {
+      log: vi.fn(async (_ns: string, _pod: string, _c: string, stream: import("node:stream").Writable) => {
+        if (payload) stream.write(payload);
+        stream.end();
+        return { abort: vi.fn() } as unknown as AbortController;
+      }),
+    };
+  }
+
+  it("returns the container log tail (combined stdout+stderr) on a non-follow read", async () => {
+    vi.mocked(getLogApi).mockReturnValue(
+      logApiWithPayload("Traceback: boom\nfatal: config missing\n") as unknown as ReturnType<typeof getLogApi>,
+    );
+    const out = await captureContainerLogTail("ns", "pod-x", "opencode", { kubeconfigPath: "/kc" });
+    expect(out).toContain("fatal: config missing");
+    // non-follow read requested with a bounded tail
+    const logFn = vi.mocked(getLogApi).mock.results[0].value.log;
+    expect(logFn).toHaveBeenCalledWith("ns", "pod-x", "opencode", expect.anything(),
+      expect.objectContaining({ follow: false, tailLines: 80, previous: false }));
+  });
+
+  it("passes previous:true through for the restarted-container retry", async () => {
+    vi.mocked(getLogApi).mockReturnValue(
+      logApiWithPayload("prev-instance crash\n") as unknown as ReturnType<typeof getLogApi>,
+    );
+    const out = await captureContainerLogTail("ns", "pod-x", "opencode", { previous: true });
+    expect(out).toBe("prev-instance crash");
+    const logFn = vi.mocked(getLogApi).mock.results[0].value.log;
+    expect(logFn).toHaveBeenCalledWith("ns", "pod-x", "opencode", expect.anything(),
+      expect.objectContaining({ previous: true }));
+  });
+
+  it("is best-effort: returns '' when the log API throws (never masks the failure)", async () => {
+    vi.mocked(getLogApi).mockReturnValue({
+      log: vi.fn(async () => { throw new Error("logs unavailable"); }),
+    } as unknown as ReturnType<typeof getLogApi>);
+    await expect(captureContainerLogTail("ns", "pod-x", "opencode")).resolves.toBe("");
   });
 });

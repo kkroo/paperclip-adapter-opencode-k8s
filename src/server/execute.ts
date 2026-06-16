@@ -326,19 +326,20 @@ async function getPodTerminatedInfo(
   namespace: string,
   jobName: string,
   kubeconfigPath?: string,
-): Promise<{ exitCode: number | null; reason: string | null }> {
+): Promise<{ exitCode: number | null; reason: string | null; podName: string | null }> {
   const coreApi = getCoreApi(kubeconfigPath);
   const podList = await coreApi.listNamespacedPod({
     namespace,
     labelSelector: `job-name=${jobName}`,
   });
   const pod = podList.items[0];
-  if (!pod) return { exitCode: null, reason: null };
+  if (!pod) return { exitCode: null, reason: null, podName: null };
   const containerStatus = pod.status?.containerStatuses?.find((s) => s.name === "opencode");
   const terminated = containerStatus?.state?.terminated;
   return {
     exitCode: terminated?.exitCode ?? null,
     reason: terminated?.reason ?? terminated?.message ?? null,
+    podName: pod.metadata?.name ?? null,
   };
 }
 
@@ -629,6 +630,48 @@ async function cleanupJob(
 }
 
 /**
+ * One-shot, non-follow read of the last `tailLines` of a container's logs via
+ * the k8s API (the combined stdout+stderr the kubelet captured). Used to
+ * recover the failure cause when a pod exits non-zero but the live follow
+ * stream captured nothing useful — a fast crash whose final stderr was dropped
+ * by the post-stop drain, or output that only exists on the *previous*
+ * (restarted) container instance. Best-effort: returns "" on any error so it
+ * can never mask the original failure.
+ */
+export async function captureContainerLogTail(
+  namespace: string,
+  podName: string,
+  containerName: string,
+  opts: { kubeconfigPath?: string; tailLines?: number; previous?: boolean } = {},
+): Promise<string> {
+  const { kubeconfigPath, tailLines = 80, previous = false } = opts;
+  try {
+    const logApi = getLogApi(kubeconfigPath);
+    const chunks: string[] = [];
+    const sink = new PassThrough();
+    sink.setEncoding("utf-8");
+    sink.on("data", (c: string) => chunks.push(c));
+    const drained = new Promise<void>((resolve) => {
+      sink.on("end", () => resolve());
+      sink.on("error", () => resolve());
+    });
+    // follow:false → the API returns the buffered tail then closes the stream.
+    await logApi.log(namespace, podName, containerName, sink, {
+      follow: false,
+      tailLines,
+      previous,
+      pretty: false,
+    });
+    // logApi.log resolves once the request is established; the bytes arrive on
+    // the sink afterwards. Wait for end, capped so a stuck stream can't hang.
+    await Promise.race([drained, new Promise<void>((r) => setTimeout(r, 5000))]);
+    return chunks.join("").trim();
+  } catch {
+    return "";
+  }
+}
+
+/**
  * Tail the pod log file and await completion for an already-created Job.
  */
 async function streamAndAwaitJob(
@@ -650,6 +693,9 @@ async function streamAndAwaitJob(
   let exitCode: number | null = null;
   let jobTimedOut = false;
   let podTerminatedReason: string | null = null;
+  // Captured alongside podTerminatedReason so the function-tail error builder
+  // can fetch the failed pod's logs (the live `podName` is block-scoped above).
+  let terminatedPodName: string | null = null;
   let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
   const cancelSignal = { cancelled: false };
 
@@ -786,6 +832,7 @@ async function streamAndAwaitJob(
     const terminatedInfo = await getPodTerminatedInfo(namespace, jobName, kubeconfigPath);
     exitCode = terminatedInfo.exitCode;
     podTerminatedReason = terminatedInfo.reason;
+    terminatedPodName = terminatedInfo.podName;
   } finally {
     if (keepaliveTimer) {
       clearInterval(keepaliveTimer);
@@ -1006,9 +1053,41 @@ async function streamAndAwaitJob(
   const podFailureDescription = podTerminatedReason
     ? `Pod exited: ${podTerminatedReason}${synthesizedExitCode != null ? ` (exit ${synthesizedExitCode})` : ""}`
     : null;
+
+  // When the pod exited non-zero but neither a parsed error nor any captured
+  // log line explains why, the operator otherwise gets an opaque "Pod exited:
+  // Error (exit 1)". Recover the cause with a one-shot non-follow log read
+  // (combined stdout+stderr; retries the previous container instance if the
+  // current one is empty) and fold the tail into the error so the failure
+  // self-explains without a kubectl trip. Best-effort — never masks the
+  // original failure.
+  let recoveredLogTail = "";
+  if (failed && terminatedPodName && !parsedError && !firstStderrLine) {
+    recoveredLogTail = await captureContainerLogTail(namespace, terminatedPodName, "opencode", { kubeconfigPath });
+    if (!recoveredLogTail) {
+      recoveredLogTail = await captureContainerLogTail(namespace, terminatedPodName, "opencode", {
+        kubeconfigPath,
+        previous: true,
+      });
+    }
+    if (recoveredLogTail) {
+      await onLog(
+        "stderr",
+        `[paperclip] recovered pod log tail (exit ${synthesizedExitCode ?? -1}):\n${recoveredLogTail}\n`,
+      ).catch(() => undefined);
+    }
+  }
+
   const errorParts = [parsedError, podFailureDescription].filter(Boolean);
-  const fallbackErrorMessage =
+  let fallbackErrorMessage =
     errorParts.join("; ") || firstStderrLine || `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
+  if (recoveredLogTail) {
+    // Cap the inline suffix so the error column stays readable; the full tail
+    // is already in the run log via onLog above.
+    const condensed = recoveredLogTail.replace(/\s+/g, " ").trim();
+    const suffix = condensed.length > 600 ? `…${condensed.slice(-600)}` : condensed;
+    fallbackErrorMessage = `${fallbackErrorMessage} — pod log tail: ${suffix}`;
+  }
 
   // Proactive compaction gate. opencode reports `inputTokens` for the full
   // payload sent to the model (system + history + new prompt). When that's
