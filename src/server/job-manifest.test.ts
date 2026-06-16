@@ -247,6 +247,52 @@ describe("buildJobManifest", () => {
     expect(nodeEnv?.value).toBe("staging");
   });
 
+  it("rebases inherited /runtime-cache cache dirs under the writable agent home (BLO-10651)", () => {
+    // The server pod points its cache env at its own writable /runtime-cache
+    // emptyDir, which agent pods do not mount. Inheriting those values verbatim
+    // makes Bun/npm/go mkdir an unwritable root path -> EACCES at startup.
+    const selfPod = {
+      ...mockSelfPod,
+      inheritedEnv: {
+        BUN_INSTALL_CACHE: "/runtime-cache/bun",
+        XDG_CACHE_HOME: "/runtime-cache/xdg",
+        GOCACHE: "/runtime-cache/go-build",
+        GOMODCACHE: "/runtime-cache/gomod",
+        npm_config_cache: "/runtime-cache/npm",
+        PIP_CACHE_DIR: "/runtime-cache/pip",
+        PLAYWRIGHT_BROWSERS_PATH: "/runtime-cache/ms-playwright",
+        TMPDIR: "/runtime-cache/tmp",
+      },
+    };
+    const result = buildJobManifest({ ctx: mockCtx, selfPod });
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    const val = (name: string) => env.find((e) => e.name === name)?.value;
+
+    expect(val("BUN_INSTALL_CACHE")).toBe("/paperclip/.runtime-cache/bun");
+    expect(val("XDG_CACHE_HOME")).toBe("/paperclip/.runtime-cache/xdg");
+    expect(val("GOCACHE")).toBe("/paperclip/.runtime-cache/go-build");
+    expect(val("TMPDIR")).toBe("/paperclip/.runtime-cache/tmp");
+    expect(val("PLAYWRIGHT_BROWSERS_PATH")).toBe("/paperclip/.runtime-cache/ms-playwright");
+    // No cache var may point at the unwritable container-root mount.
+    for (const e of env) {
+      expect(e.value ?? "").not.toMatch(/^\/runtime-cache(\/|$)/);
+    }
+  });
+
+  it("lets an explicit adapterConfig.env cache override win over the rebased default (BLO-10651)", () => {
+    const ctx = {
+      ...mockCtx,
+      config: { env: { BUN_INSTALL_CACHE: "/paperclip/custom-bun-cache" } },
+    };
+    const selfPod = {
+      ...mockSelfPod,
+      inheritedEnv: { BUN_INSTALL_CACHE: "/runtime-cache/bun" },
+    };
+    const result = buildJobManifest({ ctx, selfPod });
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    expect(env.find((e) => e.name === "BUN_INSTALL_CACHE")?.value).toBe("/paperclip/custom-bun-cache");
+  });
+
   it("applies default ttlSecondsAfterFinished of 300", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
 

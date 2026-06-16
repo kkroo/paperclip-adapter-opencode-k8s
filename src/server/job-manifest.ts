@@ -329,6 +329,33 @@ function buildEnvVars(
     merged.NODE_ENV = "development";
   }
 
+  // Pin runtime caches under the writable agent home (BLO-10651).
+  // The server pod mounts a writable `/runtime-cache` emptyDir and points
+  // its cache env (BUN_INSTALL_CACHE=/runtime-cache/bun, XDG_CACHE_HOME,
+  // GOCACHE, ...) at it. Those values get inherited verbatim via
+  // selfPod.inheritedEnv above, but agent Job pods do NOT mount that
+  // emptyDir — they only mount the data PVC at HOME (/paperclip). Bun/npm/
+  // go/pip then try to mkdir `/runtime-cache` at the container root as a
+  // non-root user and crash at startup with EACCES before opencode ever
+  // runs (exitCode 1 -> adapter_failed). Rebase every cache dir under
+  // ${HOME}/.runtime-cache, which the agent always mounts writable. Set
+  // before Layer 4 so an explicit adapterConfig.env override still wins.
+  // HOME is forced to /paperclip below, so anchor the cache there directly.
+  const AGENT_RUNTIME_CACHE_BASE = "/paperclip/.runtime-cache";
+  const AGENT_CACHE_ENV_LEAVES: Record<string, string> = {
+    XDG_CACHE_HOME: "xdg",
+    GOCACHE: "go-build",
+    GOMODCACHE: "gomod",
+    npm_config_cache: "npm",
+    BUN_INSTALL_CACHE: "bun",
+    PIP_CACHE_DIR: "pip",
+    PLAYWRIGHT_BROWSERS_PATH: "ms-playwright",
+    TMPDIR: "tmp",
+  };
+  for (const [key, leaf] of Object.entries(AGENT_CACHE_ENV_LEAVES)) {
+    merged[key] = `${AGENT_RUNTIME_CACHE_BASE}/${leaf}`;
+  }
+
   // Layer 4: User-defined overrides from adapterConfig.env
   for (const [key, value] of Object.entries(envConfig)) {
     if (typeof value === "string") merged[key] = value;
