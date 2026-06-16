@@ -10,6 +10,7 @@ import {
   isOpenCodeStepLimitResult,
   isOpenCodeContextOverflowResult,
   isOpenCodeStreamEofResult,
+  isOpenCodeTypeDerefError,
 } from "./parse.js";
 import { computeOpenAICompatibleCost } from "./pricing.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
@@ -899,7 +900,7 @@ async function streamAndAwaitJob(
   if (streamEof) {
     await onLog(
       "stdout",
-      `[paperclip] OpenCode stream-EOF detected (upstream truncation); preserving session for retry.\n`,
+      `[paperclip] OpenCode stream EOF detected (upstream truncation); preserving session for retry.\n`,
     );
     return {
       exitCode: synthesizedExitCode,
@@ -909,6 +910,54 @@ async function streamAndAwaitJob(
       errorCode: "stream_eof_transient",
       sessionId: resolvedSessionId,
       sessionParams: resolvedSessionParams,
+      resultJson: { stdout },
+    };
+  }
+
+  // Detect the gpt-5.5 Responses-API type-deref crash (BLO-10651).
+  // The opencode binary crashes with "undefined is not an object (evaluating
+  // 'M.type')" when the model sends a stream item with no `type` field. The
+  // session on disk is intact — the crash is pre-write — so retry is safe.
+  //
+  // Circuit-breaker: track consecutive type-deref failures in session params.
+  // After ADAPTER_CRASHLOOP_LIMIT consecutive crashes we stop retrying and
+  // return `adapter_crashloop_circuit_open` so the runtime stops waking us.
+  const ADAPTER_CRASHLOOP_LIMIT = 5;
+  const prevConsecutiveFailures = asNumber(
+    parseObject(ctx.runtime.sessionParams).consecutiveAdapterTypeDerefFailures,
+    0,
+  );
+  const typeDeref = failed && isOpenCodeTypeDerefError(stdout, parsedError);
+  if (typeDeref) {
+    const consecutiveFailures = prevConsecutiveFailures + 1;
+    if (consecutiveFailures >= ADAPTER_CRASHLOOP_LIMIT) {
+      await onLog(
+        "stderr",
+        `[paperclip] Adapter type-deref crashloop: ${consecutiveFailures} consecutive failures (limit ${ADAPTER_CRASHLOOP_LIMIT}). Circuit open — halting retries.\n`,
+      );
+      return {
+        exitCode: synthesizedExitCode,
+        signal: null,
+        timedOut: false,
+        errorMessage: `OpenCode type-deref crash repeated ${consecutiveFailures}× (gpt-5.5 stream item missing 'type'); circuit open`,
+        errorCode: "adapter_crashloop_circuit_open",
+        sessionId: resolvedSessionId,
+        sessionParams: { ...resolvedSessionParams, consecutiveAdapterTypeDerefFailures: consecutiveFailures },
+        resultJson: { stdout },
+      };
+    }
+    await onLog(
+      "stdout",
+      `[paperclip] OpenCode type-deref crash detected (attempt ${consecutiveFailures}/${ADAPTER_CRASHLOOP_LIMIT}); preserving session for retry.\n`,
+    );
+    return {
+      exitCode: synthesizedExitCode,
+      signal: null,
+      timedOut: false,
+      errorMessage: `OpenCode stream item missing 'type' (gpt-5.5 transient); retry ${consecutiveFailures}/${ADAPTER_CRASHLOOP_LIMIT}`,
+      errorCode: "stream_eof_transient",
+      sessionId: resolvedSessionId,
+      sessionParams: { ...resolvedSessionParams, consecutiveAdapterTypeDerefFailures: consecutiveFailures },
       resultJson: { stdout },
     };
   }
@@ -959,6 +1008,8 @@ async function streamAndAwaitJob(
   // tripped this run.
   const nextSessionParams: Record<string, unknown> = { ...resolvedSessionParams };
   delete nextSessionParams.needsCompactBeforeNextRun;
+  // A successful run clears the type-deref failure counter.
+  delete nextSessionParams.consecutiveAdapterTypeDerefFailures;
   if (approachingWindow) {
     nextSessionParams.needsCompactBeforeNextRun = true;
   }
