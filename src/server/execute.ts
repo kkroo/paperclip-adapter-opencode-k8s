@@ -948,14 +948,18 @@ async function streamAndAwaitJob(
     }
     await onLog(
       "stdout",
-      `[paperclip] OpenCode type-deref crash detected (attempt ${consecutiveFailures}/${ADAPTER_CRASHLOOP_LIMIT}); preserving session for retry.\n`,
+      `[paperclip] OpenCode response-item type crash detected (attempt ${consecutiveFailures}/${ADAPTER_CRASHLOOP_LIMIT}); preserving session for transient retry.\n`,
     );
+    // Reconciled classification (from 67e9687b): dedicated transient code +
+    // upstream family + a 60s backoff before the next retry.
     return {
       exitCode: synthesizedExitCode,
       signal: null,
       timedOut: false,
-      errorMessage: `OpenCode stream item missing 'type' (gpt-5.5 transient); retry ${consecutiveFailures}/${ADAPTER_CRASHLOOP_LIMIT}`,
-      errorCode: "stream_eof_transient",
+      errorMessage: `OpenCode crashed parsing a model response item without a type (gpt-5.5 transient); retry ${consecutiveFailures}/${ADAPTER_CRASHLOOP_LIMIT}`,
+      errorCode: "opencode_response_type_crash",
+      errorFamily: "transient_upstream",
+      retryNotBefore: new Date(Date.now() + 60_000).toISOString(),
       sessionId: resolvedSessionId,
       sessionParams: { ...resolvedSessionParams, consecutiveAdapterTypeDerefFailures: consecutiveFailures },
       resultJson: { stdout },
