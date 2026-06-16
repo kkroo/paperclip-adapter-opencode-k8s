@@ -22,7 +22,18 @@ function errorText(value: unknown): string {
 export function parseOpenCodeJsonl(stdout: string) {
   let sessionId: string | null = null;
   const messages: string[] = [];
+  // Run-level errors: model/session `error` events. These are real failures.
   const errors: string[] = [];
+  // In-session tool-call errors (e.g. a `read` on a missing file). The agent
+  // sees these as tool results and routinely recovers from them — they must
+  // NOT be conflated with a run failure (PEN-906). Tracked separately for
+  // diagnostics only.
+  const toolErrors: string[] = [];
+  // Reason of the last `step_finish` event. "stop" means opencode reached a
+  // clean final answer; anything else (tool-calls, max_turns, ...) is mid-run
+  // or a limit. Used to recognize a successful completion even when the CLI
+  // process exits non-zero due to non-fatal tool errors.
+  let lastStepReason: string | null = null;
   const usage = {
     inputTokens: 0,
     cachedInputTokens: 0,
@@ -53,6 +64,8 @@ export function parseOpenCodeJsonl(stdout: string) {
       const part = parseObject(event.part);
       const text = asString(part.message, "").trim();
       if (text) messages.push(text);
+      const reason = asString(part.reason, "").trim();
+      if (reason) lastStepReason = reason;
       const tokens = parseObject(part.tokens);
       const cache = parseObject(tokens.cache);
       usage.inputTokens += asNumber(tokens.input, 0);
@@ -67,7 +80,7 @@ export function parseOpenCodeJsonl(stdout: string) {
       const state = parseObject(part.state);
       if (asString(state.status, "") === "error") {
         const text = asString(state.error, "").trim();
-        if (text) errors.push(text);
+        if (text) toolErrors.push(text);
       }
       continue;
     }
@@ -85,6 +98,11 @@ export function parseOpenCodeJsonl(stdout: string) {
     usage,
     costUsd,
     errorMessage: errors.length > 0 ? errors.join("\n") : null,
+    toolErrorMessage: toolErrors.length > 0 ? toolErrors.join("\n") : null,
+    // True when opencode reached a clean final answer (last step_finish
+    // reason === "stop"). A clean completion is a successful run even if the
+    // CLI process exits non-zero because of non-fatal in-session tool errors.
+    completedCleanly: lastStepReason === "stop",
   };
 }
 

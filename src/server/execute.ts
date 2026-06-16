@@ -849,8 +849,29 @@ async function streamAndAwaitJob(
 
   const parsedError = typeof parsed.errorMessage === "string" ? parsed.errorMessage.trim() : "";
   const rawExitCode = exitCode;
-  const synthesizedExitCode = parsedError && (rawExitCode ?? 0) === 0 ? 1 : rawExitCode;
+  // PEN-906: opencode's CLI can exit non-zero when in-session tool calls
+  // errored (e.g. a `read` on a missing file) even though the agent reached a
+  // clean final answer. A run that finished with a `stop` step and produced
+  // output is a SUCCESS — discarding it as `adapter_failed` throws away
+  // completed work and re-bills a redundant retry. Tool errors are surfaced
+  // via resultJson.toolErrorMessage for diagnostics, not as a run failure.
+  // (parsedError no longer includes tool-call errors — parse.ts routes those
+  // to toolErrorMessage — so this guard only matters when the process itself
+  // exits non-zero on an otherwise-clean session.)
+  const hasLlmOutputForExit = parsed.usage.outputTokens > 0 || !!parsed.summary;
+  const cleanCompletion = parsed.completedCleanly === true && hasLlmOutputForExit;
+  const synthesizedExitCode = cleanCompletion
+    ? 0
+    : parsedError && (rawExitCode ?? 0) === 0
+      ? 1
+      : rawExitCode;
   const failed = (synthesizedExitCode ?? 0) !== 0;
+  if (cleanCompletion && (rawExitCode ?? 0) !== 0) {
+    await onLog(
+      "stdout",
+      `[paperclip] OpenCode completed cleanly (reason=stop) despite a non-zero exit (${rawExitCode}); treating as success.\n`,
+    );
+  }
 
   if (failed && isOpenCodeUnknownSessionError(stdout, parsedError)) {
     await onLog("stdout", `[paperclip] OpenCode session is unavailable; clearing for next run.\n`);
@@ -1047,7 +1068,11 @@ async function streamAndAwaitJob(
     model: model || null,
     billingType: fallbackCost !== null ? "metered_api" : "unknown",
     costUsd: fallbackCost !== null ? fallbackCost : parsed.costUsd,
-    resultJson: { stdout },
+    resultJson: {
+      stdout,
+      // Non-fatal in-session tool errors, kept for diagnostics (PEN-906).
+      ...(parsed.toolErrorMessage ? { toolErrorMessage: parsed.toolErrorMessage } : {}),
+    },
     summary: parsed.summary,
     clearSession: stepLimitReached,
   } as AdapterExecutionResult;

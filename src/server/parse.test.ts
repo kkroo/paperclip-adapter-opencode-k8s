@@ -61,17 +61,46 @@ describe("parseOpenCodeJsonl", () => {
     expect(result.errorMessage).toBe("Something went wrong");
   });
 
-  it("captures tool_use errors with error state", () => {
+  it("routes tool_use errors to toolErrorMessage, not errorMessage (PEN-906)", () => {
+    // A failed tool call (e.g. read of a missing file) is a normal result the
+    // agent recovers from — it must not be reported as a run-level failure.
     const stdout = [
       JSON.stringify({
         type: "tool_use",
-        part: { state: { status: "error", error: "Tool failed" } },
+        part: { state: { status: "error", error: "File not found: /docs/architecture-template.md" } },
       }),
     ].join("\n");
 
     const result = parseOpenCodeJsonl(stdout);
 
-    expect(result.errorMessage).toBe("Tool failed");
+    expect(result.errorMessage).toBeNull();
+    expect(result.toolErrorMessage).toBe("File not found: /docs/architecture-template.md");
+  });
+
+  it("marks completedCleanly when the last step_finish reason is stop (PEN-906)", () => {
+    const stdout = [
+      JSON.stringify({ type: "tool_use", part: { state: { status: "error", error: "File not found: /docs/x-template.md" } } }),
+      JSON.stringify({ type: "step_finish", part: { reason: "tool-calls", tokens: { input: 10, output: 5 } } }),
+      JSON.stringify({ type: "text", part: { text: "Done." } }),
+      JSON.stringify({ type: "step_finish", part: { reason: "stop", tokens: { input: 1, output: 2 } } }),
+    ].join("\n");
+
+    const result = parseOpenCodeJsonl(stdout);
+
+    expect(result.completedCleanly).toBe(true);
+    expect(result.errorMessage).toBeNull();
+    expect(result.toolErrorMessage).toContain("x-template.md");
+    expect(result.summary).toBe("Done.");
+  });
+
+  it("does not mark completedCleanly when the run ended mid-step or on a limit (PEN-906)", () => {
+    const stdout = [
+      JSON.stringify({ type: "step_finish", part: { reason: "max_turns", tokens: { input: 1, output: 1 } } }),
+    ].join("\n");
+
+    const result = parseOpenCodeJsonl(stdout);
+
+    expect(result.completedCleanly).toBe(false);
   });
 
   it("extracts sessionId from any event", () => {
