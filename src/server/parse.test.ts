@@ -5,6 +5,7 @@ import {
   isOpenCodeStepLimitResult,
   isOpenCodeContextOverflowResult,
   isOpenCodeStreamEofResult,
+  isOpenCodeTypeDerefError,
 } from "./parse.js";
 
 describe("parseOpenCodeJsonl", () => {
@@ -342,5 +343,45 @@ describe("isOpenCodeStreamEofResult", () => {
     });
 
     expect(isOpenCodeStreamEofResult(stdout)).toBe(false);
+  });
+});
+
+describe("isOpenCodeTypeDerefError", () => {
+  it("detects JavaScriptCore 'undefined is not an object (evaluating M.type)' from parsedError", () => {
+    const parsedError = "undefined is not an object (evaluating 'M.type')";
+    expect(isOpenCodeTypeDerefError("", parsedError)).toBe(true);
+  });
+
+  it("detects the pattern in stdout NDJSON error event", () => {
+    const stdout = JSON.stringify({
+      type: "error",
+      error: { message: "undefined is not an object (evaluating 'M.type')" },
+      sessionID: "ses_x",
+    });
+    expect(isOpenCodeTypeDerefError(stdout, "")).toBe(true);
+  });
+
+  it("matches any minified variable name, not just M", () => {
+    const parsedError = "undefined is not an object (evaluating 'Q.type')";
+    expect(isOpenCodeTypeDerefError("", parsedError)).toBe(true);
+  });
+
+  it("detects V8-style 'Cannot read properties of undefined (reading type)'", () => {
+    const parsedError = "Cannot read properties of undefined (reading 'type')";
+    expect(isOpenCodeTypeDerefError("", parsedError)).toBe(true);
+  });
+
+  it("returns false for unrelated undefined-property errors", () => {
+    const parsedError = "undefined is not an object (evaluating 'M.name')";
+    expect(isOpenCodeTypeDerefError("", parsedError)).toBe(false);
+  });
+
+  it("returns false for empty inputs", () => {
+    expect(isOpenCodeTypeDerefError("", "")).toBe(false);
+  });
+
+  it("returns false for V8 undefined read on a non-type property", () => {
+    const parsedError = "Cannot read properties of undefined (reading 'id')";
+    expect(isOpenCodeTypeDerefError("", parsedError)).toBe(false);
   });
 });

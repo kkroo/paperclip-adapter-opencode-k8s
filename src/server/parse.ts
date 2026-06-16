@@ -154,6 +154,25 @@ export function isOpenCodeContextOverflowResult(stdout: string): boolean {
   return false;
 }
 
+// Detect opencode's internal event-stream parser crash when a Responses-API
+// stream item arrives with a missing/undefined `type` field. In the minified
+// bundle this surfaces as a JavaScriptCore runtime error:
+//   "undefined is not an object (evaluating 'M.type')"
+// The V8 equivalent is:
+//   "Cannot read properties of undefined (reading 'type')"
+// Both are caused by a specific item shape from gpt-5.5 that the adapter's
+// event mapper doesn't guard. The opencode session on disk is untouched —
+// the crash happens before any write — so the next wake can retry the same
+// session intact (observed: failed at 07:11/07:14/07:15, clean run at 07:18).
+export function isOpenCodeTypeDerefError(stdout: string, errorMessage: string): boolean {
+  const haystack = `${stdout}\n${errorMessage}`;
+  // JavaScriptCore (Bun): "undefined is not an object (evaluating 'X.type')"
+  if (/undefined is not an object \(evaluating '[^']*\.type'\)/i.test(haystack)) return true;
+  // V8: "Cannot read properties of undefined (reading 'type')"
+  if (/cannot read propert(?:y|ies) of undefined[^)]*\breading ['"]type['"]/i.test(haystack)) return true;
+  return false;
+}
+
 // Detect opencode's internal model-stream parser failure when the upstream
 // closes mid-JSON chunk. This is transient stream truncation, not session
 // corruption: the next wake should retry with the same session intact.
