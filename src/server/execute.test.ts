@@ -791,6 +791,30 @@ describe("execute — stream EOF transient classification", () => {
   });
 });
 
+describe("execute — OpenCode response type crash classification", () => {
+  it("preserves session params and tags missing response-item type crashes as transient", async () => {
+    const crashLog = [
+      JSON.stringify({ type: "step_start", sessionID: "ses_type_crash" }),
+      "undefined is not an object (evaluating 'M.type')",
+      "    at parseResponseItem (opencode.js:123:45)",
+    ].join("\n");
+    setMockJsonl(crashLog);
+    const coreApi = makeCoreApi(1, "Error");
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+    const ctx = makeCtx({}, { paperclipWorkspace: { cwd: "/workspace" } });
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("opencode_response_type_crash");
+    expect(result.errorFamily).toBe("transient_upstream");
+    expect(result.retryNotBefore).toEqual(expect.any(String));
+    expect(result.errorMessage).toMatch(/without a type/i);
+    expect(result.sessionId).toBe("ses_type_crash");
+    expect(result.sessionParams).toEqual({ sessionId: "ses_type_crash", cwd: "/workspace" });
+    expect(result.clearSession).toBeUndefined();
+  });
+});
+
 describe("execute — timeout", () => {
   it("returns timedOut=true when job reports DeadlineExceeded", async () => {
     const batchApi = makeBatchApi();

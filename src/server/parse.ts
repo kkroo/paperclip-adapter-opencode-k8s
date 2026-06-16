@@ -172,3 +172,20 @@ export function isOpenCodeStreamEofResult(stdout: string): boolean {
   }
   return false;
 }
+
+// Detect OpenCode's internal response-item parser crash seen after an
+// unpinned opencode-ai upgrade. The CLI can print this as a raw Bun/JS stack
+// line instead of JSONL, so this intentionally scans all output lines rather
+// than only `type:"error"` events.
+export function isOpenCodeResponseTypeCrash(stdout: string): boolean {
+  const haystack = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n");
+
+  return (
+    /undefined\s+is\s+not\s+an\s+object\s+\(evaluating\s+['"][^'"]+\.type['"]\)/i.test(haystack) ||
+    /cannot\s+read\s+(?:properties|property)\s+of\s+undefined\s+\(reading\s+['"]type['"]\)/i.test(haystack)
+  );
+}

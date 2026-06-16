@@ -5,6 +5,7 @@ import {
   isOpenCodeStepLimitResult,
   isOpenCodeContextOverflowResult,
   isOpenCodeStreamEofResult,
+  isOpenCodeResponseTypeCrash,
 } from "./parse.js";
 
 describe("parseOpenCodeJsonl", () => {
@@ -342,5 +343,32 @@ describe("isOpenCodeStreamEofResult", () => {
     });
 
     expect(isOpenCodeStreamEofResult(stdout)).toBe(false);
+  });
+});
+
+describe("isOpenCodeResponseTypeCrash", () => {
+  it("detects Bun-style missing response item type crashes", () => {
+    const stdout = [
+      JSON.stringify({ type: "step_start", sessionID: "ses_type_crash" }),
+      "undefined is not an object (evaluating 'M.type')",
+      "    at parseResponseItem (opencode.js:123:45)",
+    ].join("\n");
+
+    expect(isOpenCodeResponseTypeCrash(stdout)).toBe(true);
+  });
+
+  it("detects V8-style missing type crashes", () => {
+    const stdout = "TypeError: Cannot read properties of undefined (reading 'type')";
+
+    expect(isOpenCodeResponseTypeCrash(stdout)).toBe(true);
+  });
+
+  it("does not match ordinary tool output mentioning type", () => {
+    const stdout = JSON.stringify({
+      type: "tool_use",
+      part: { state: { status: "completed", output: "field type is optional here" } },
+    });
+
+    expect(isOpenCodeResponseTypeCrash(stdout)).toBe(false);
   });
 });

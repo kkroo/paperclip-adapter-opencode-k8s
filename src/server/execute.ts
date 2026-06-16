@@ -10,6 +10,7 @@ import {
   isOpenCodeStepLimitResult,
   isOpenCodeContextOverflowResult,
   isOpenCodeStreamEofResult,
+  isOpenCodeResponseTypeCrash,
 } from "./parse.js";
 import { computeOpenAICompatibleCost } from "./pricing.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
@@ -907,6 +908,26 @@ async function streamAndAwaitJob(
       timedOut: false,
       errorMessage: "Model stream truncated (Unexpected EOF); retry preserved session",
       errorCode: "stream_eof_transient",
+      sessionId: resolvedSessionId,
+      sessionParams: resolvedSessionParams,
+      resultJson: { stdout },
+    };
+  }
+
+  const responseTypeCrash = failed && isOpenCodeResponseTypeCrash(stdout);
+  if (responseTypeCrash) {
+    await onLog(
+      "stdout",
+      `[paperclip] OpenCode response item type crash detected; preserving session for transient retry.\n`,
+    );
+    return {
+      exitCode: synthesizedExitCode,
+      signal: null,
+      timedOut: false,
+      errorMessage: "OpenCode crashed while parsing a model response item without a type; retry preserved session",
+      errorCode: "opencode_response_type_crash",
+      errorFamily: "transient_upstream",
+      retryNotBefore: new Date(Date.now() + 60_000).toISOString(),
       sessionId: resolvedSessionId,
       sessionParams: resolvedSessionParams,
       resultJson: { stdout },
