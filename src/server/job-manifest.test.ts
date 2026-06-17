@@ -733,9 +733,11 @@ describe("buildJobManifest — env wiring branches", () => {
     expect(c).toContain("[ -e docs ]");
     expect(c).toContain('ln -sfn "$__pcd" docs');
     expect(c).toContain('"$(dirname "$(dirname "${AGENT_HOME:-/nonexistent}")")/docs"');
-    // no external bundle → no symlink bridge
+    // no external bundle → no shared-docs symlink bridge (the unrelated
+    // Chrome BrowserMetrics redirect also uses `ln -sfn`, so match the docs
+    // bridge specifically rather than any symlink).
     const plain = buildJobManifest({ ctx: { ...mockCtx, config: { instructionsFilePath: "/x/AGENTS.md" } }, selfPod: mockSelfPod });
-    expect(shell(plain)).not.toContain("ln -sfn");
+    expect(shell(plain)).not.toContain('ln -sfn "$__pcd" docs');
   });
 
   it("sets PAPERCLIP_LINKED_ISSUE_IDS from non-empty issueIds array (skipping blanks)", () => {
@@ -1044,6 +1046,18 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       expect(ccrotateIdx).toBeGreaterThan(-1);
       expect(bootstrapIdx).toBeGreaterThan(ccrotateIdx);
       expect(opencodeIdx).toBeGreaterThan(bootstrapIdx);
+    });
+
+    it("redirects Chrome BrowserMetrics to ephemeral /tmp before the agent runs (BLO-10699)", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const redirectIdx = cmd.indexOf("ln -sfn /tmp/chrome-browser-metrics");
+      const opencodeIdx = cmd.indexOf("| opencode ");
+      // Only BrowserMetrics is redirected, idempotently, off the shared PVC.
+      expect(cmd).toContain('[ -L "$HOME/.config/google-chrome/BrowserMetrics" ]');
+      expect(redirectIdx).toBeGreaterThan(-1);
+      // Redirect runs before the agent invocation.
+      expect(opencodeIdx).toBeGreaterThan(redirectIdx);
     });
 
     it("translates the codex auth.json shape (auth_mode=chatgpt + tokens) into the openai-OAuth shape opencode expects", () => {

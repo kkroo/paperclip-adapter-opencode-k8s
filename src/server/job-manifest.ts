@@ -885,10 +885,26 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       ? `( [ -e docs ] || { __pcd="$(dirname "$(dirname "\${AGENT_HOME:-/nonexistent}")")/docs"; [ -d "$__pcd" ] && ln -sfn "$__pcd" docs; } ) 2>/dev/null || true; `
       : "";
   const baseMainCommand = `set -o pipefail; ${ccrotateRefresh}; ${authBootstrap}; ${configSetup}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${podLogPath}) && : > ${podLogPath} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${podLogPath}`;
+  // Redirect Chrome's BrowserMetrics spool off the shared CephFS HOME to the
+  // main container's per-pod /tmp (ephemeral, dies with the pod). The
+  // agent-browser designer tool launches system Chrome with the default
+  // $HOME/.config/google-chrome profile; on headless Chrome's unclean shutdown
+  // its ~4MiB BrowserMetrics-*.pma buffers are never reaped and accumulated to
+  // 42GiB on the shared PVC, walling the agent fleet at workspace setup with
+  // EDQUOT (BLO-10699). Unlike claude-k8s, opencode pods have no /runtime-cache
+  // emptyDir (caches are anchored on the PVC), so /tmp is the per-pod ephemeral
+  // target. Only BrowserMetrics is redirected — the rest of the profile
+  // (claude.ai/design auth + cookies) stays persistent. Best-effort and
+  // idempotent: never fails the run, skipped when already a symlink.
+  const CHROME_METRICS_REDIRECT =
+    `mkdir -p "$HOME/.config/google-chrome" /tmp/chrome-browser-metrics 2>/dev/null; ` +
+    `{ [ -L "$HOME/.config/google-chrome/BrowserMetrics" ] || { rm -rf "$HOME/.config/google-chrome/BrowserMetrics"; ln -sfn /tmp/chrome-browser-metrics "$HOME/.config/google-chrome/BrowserMetrics"; }; } 2>/dev/null || true`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket.
-  const mainCommand = enableDocker ? `${DIND_WAIT_PREAMBLE}; ${baseMainCommand}` : baseMainCommand;
+  const mainCommand = enableDocker
+    ? `${CHROME_METRICS_REDIRECT}; ${DIND_WAIT_PREAMBLE}; ${baseMainCommand}`
+    : `${CHROME_METRICS_REDIRECT}; ${baseMainCommand}`;
 
   // Wire the DinD sidecar's shared volumes + DOCKER_HOST env into the main
   // container. Done after volumes/volumeMounts/envVars are otherwise built
