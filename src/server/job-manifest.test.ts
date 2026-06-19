@@ -247,10 +247,9 @@ describe("buildJobManifest", () => {
     expect(nodeEnv?.value).toBe("staging");
   });
 
-  it("rebases inherited /runtime-cache cache dirs under the writable agent home (BLO-10651)", () => {
-    // The server pod points its cache env at its own writable /runtime-cache
-    // emptyDir, which agent pods do not mount. Inheriting those values verbatim
-    // makes Bun/npm/go mkdir an unwritable root path -> EACCES at startup.
+  it("keeps agent cache dirs under the job-local runtime-cache emptyDir (PEN-389)", () => {
+    // The server pod also points its cache env at /runtime-cache. Agent Jobs now
+    // mount their own emptyDir there instead of rebasing caches onto the PVC.
     const selfPod = {
       ...mockSelfPod,
       inheritedEnv: {
@@ -268,18 +267,14 @@ describe("buildJobManifest", () => {
     const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
     const val = (name: string) => env.find((e) => e.name === name)?.value;
 
-    expect(val("BUN_INSTALL_CACHE")).toBe("/paperclip/.runtime-cache/bun");
-    expect(val("XDG_CACHE_HOME")).toBe("/paperclip/.runtime-cache/xdg");
-    expect(val("GOCACHE")).toBe("/paperclip/.runtime-cache/go-build");
-    expect(val("TMPDIR")).toBe("/paperclip/.runtime-cache/tmp");
-    expect(val("PLAYWRIGHT_BROWSERS_PATH")).toBe("/paperclip/.runtime-cache/ms-playwright");
-    // No cache var may point at the unwritable container-root mount.
-    for (const e of env) {
-      expect(e.value ?? "").not.toMatch(/^\/runtime-cache(\/|$)/);
-    }
+    expect(val("BUN_INSTALL_CACHE")).toBe("/runtime-cache/bun");
+    expect(val("XDG_CACHE_HOME")).toBe("/runtime-cache/xdg");
+    expect(val("GOCACHE")).toBe("/runtime-cache/go-build");
+    expect(val("TMPDIR")).toBe("/runtime-cache/tmp");
+    expect(val("PLAYWRIGHT_BROWSERS_PATH")).toBe("/runtime-cache/ms-playwright");
   });
 
-  it("lets an explicit adapterConfig.env cache override win over the rebased default (BLO-10651)", () => {
+  it("lets an explicit adapterConfig.env cache override win over the runtime-cache default", () => {
     const ctx = {
       ...mockCtx,
       config: { env: { BUN_INSTALL_CACHE: "/paperclip/custom-bun-cache" } },
@@ -800,6 +795,14 @@ describe("buildJobManifest — volume wiring branches", () => {
     expect(mounts.find((m) => m.name === "data")?.mountPath).toBe("/paperclip");
   });
 
+  it("mounts the runtime-cache emptyDir at /runtime-cache for agent caches", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+    const volumes = result.job.spec?.template.spec?.volumes ?? [];
+    expect(volumes.find((v) => v.name === "runtime-cache")?.emptyDir?.sizeLimit).toBe("20Gi");
+    const mounts = result.job.spec?.template.spec?.containers[0]?.volumeMounts ?? [];
+    expect(mounts.find((m) => m.name === "runtime-cache")?.mountPath).toBe("/runtime-cache");
+  });
+
   it("mounts inherited secret volumes from selfPod.secretVolumes", () => {
     const selfPod = {
       ...mockSelfPod,
@@ -1048,10 +1051,10 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       expect(opencodeIdx).toBeGreaterThan(bootstrapIdx);
     });
 
-    it("redirects Chrome BrowserMetrics to ephemeral /tmp before the agent runs (BLO-10699)", () => {
+    it("redirects Chrome BrowserMetrics to the runtime-cache emptyDir before the agent runs (BLO-10699)", () => {
       const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
       const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
-      const redirectIdx = cmd.indexOf("ln -sfn /tmp/chrome-browser-metrics");
+      const redirectIdx = cmd.indexOf("ln -sfn /runtime-cache/chrome-browser-metrics");
       const opencodeIdx = cmd.indexOf("| opencode ");
       // Only BrowserMetrics is redirected, idempotently, off the shared PVC.
       expect(cmd).toContain('[ -L "$HOME/.config/google-chrome/BrowserMetrics" ]');
