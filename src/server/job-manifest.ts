@@ -98,6 +98,20 @@ function buildOpencodeMcpSection(merged: Record<string, unknown>): Record<string
 // MAX_ARG_STRLEN with headroom for command line + other env values.
 export const LARGE_PROMPT_THRESHOLD_BYTES = 100 * 1024;
 
+const RUNTIME_CACHE_VOLUME_NAME = "runtime-cache";
+const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
+const RUNTIME_CACHE_SIZE_LIMIT = "20Gi";
+const AGENT_CACHE_ENV_LEAVES: Record<string, string> = {
+  XDG_CACHE_HOME: "xdg",
+  GOCACHE: "go-build",
+  GOMODCACHE: "gomod",
+  npm_config_cache: "npm",
+  BUN_INSTALL_CACHE: "bun",
+  PIP_CACHE_DIR: "pip",
+  PLAYWRIGHT_BROWSERS_PATH: "ms-playwright",
+  TMPDIR: "tmp",
+};
+
 function assertSafePathComponent(field: string, value: string): void {
   // Allow alphanumeric, hyphens, and colons (UUIDs like "550e8400-e29b-41d4-a716-446655440000")
   if (!/^[a-zA-Z0-9-:]+$/.test(value)) {
@@ -331,31 +345,12 @@ function buildEnvVars(
     merged.NODE_ENV = "development";
   }
 
-  // Pin runtime caches under the writable agent home (BLO-10651).
-  // The server pod mounts a writable `/runtime-cache` emptyDir and points
-  // its cache env (BUN_INSTALL_CACHE=/runtime-cache/bun, XDG_CACHE_HOME,
-  // GOCACHE, ...) at it. Those values get inherited verbatim via
-  // selfPod.inheritedEnv above, but agent Job pods do NOT mount that
-  // emptyDir — they only mount the data PVC at HOME (/paperclip). Bun/npm/
-  // go/pip then try to mkdir `/runtime-cache` at the container root as a
-  // non-root user and crash at startup with EACCES before opencode ever
-  // runs (exitCode 1 -> adapter_failed). Rebase every cache dir under
-  // ${HOME}/.runtime-cache, which the agent always mounts writable. Set
-  // before Layer 4 so an explicit adapterConfig.env override still wins.
-  // HOME is forced to /paperclip below, so anchor the cache there directly.
-  const AGENT_RUNTIME_CACHE_BASE = "/paperclip/.runtime-cache";
-  const AGENT_CACHE_ENV_LEAVES: Record<string, string> = {
-    XDG_CACHE_HOME: "xdg",
-    GOCACHE: "go-build",
-    GOMODCACHE: "gomod",
-    npm_config_cache: "npm",
-    BUN_INSTALL_CACHE: "bun",
-    PIP_CACHE_DIR: "pip",
-    PLAYWRIGHT_BROWSERS_PATH: "ms-playwright",
-    TMPDIR: "tmp",
-  };
+  // Agent Jobs mount their own runtime-cache emptyDir. Keep regenerable build,
+  // package, browser, and temp caches off the shared /paperclip PVC while
+  // leaving durable identity/session/config state on HOME. Set before Layer 4
+  // so an explicit adapterConfig.env override still wins.
   for (const [key, leaf] of Object.entries(AGENT_CACHE_ENV_LEAVES)) {
-    merged[key] = `${AGENT_RUNTIME_CACHE_BASE}/${leaf}`;
+    merged[key] = `${RUNTIME_CACHE_MOUNT_PATH}/${leaf}`;
   }
 
   // Layer 4: User-defined overrides from adapterConfig.env
@@ -710,8 +705,14 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   }
 
   // Volumes
-  const volumes: k8s.V1Volume[] = [{ name: "prompt", emptyDir: {} }];
-  const volumeMounts: k8s.V1VolumeMount[] = [{ name: "prompt", mountPath: "/tmp/prompt" }];
+  const volumes: k8s.V1Volume[] = [
+    { name: "prompt", emptyDir: {} },
+    { name: RUNTIME_CACHE_VOLUME_NAME, emptyDir: { sizeLimit: RUNTIME_CACHE_SIZE_LIMIT } },
+  ];
+  const volumeMounts: k8s.V1VolumeMount[] = [
+    { name: "prompt", mountPath: "/tmp/prompt" },
+    { name: RUNTIME_CACHE_VOLUME_NAME, mountPath: RUNTIME_CACHE_MOUNT_PATH },
+  ];
 
   if (input.promptSecretName) {
     volumes.push({ name: "prompt-secret", secret: { secretName: input.promptSecretName } });
@@ -886,19 +887,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       : "";
   const baseMainCommand = `set -o pipefail; ${ccrotateRefresh}; ${authBootstrap}; ${configSetup}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${podLogPath}) && : > ${podLogPath} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${podLogPath}`;
   // Redirect Chrome's BrowserMetrics spool off the shared CephFS HOME to the
-  // main container's per-pod /tmp (ephemeral, dies with the pod). The
+  // main container's per-pod runtime-cache emptyDir. The
   // agent-browser designer tool launches system Chrome with the default
   // $HOME/.config/google-chrome profile; on headless Chrome's unclean shutdown
   // its ~4MiB BrowserMetrics-*.pma buffers are never reaped and accumulated to
   // 42GiB on the shared PVC, walling the agent fleet at workspace setup with
-  // EDQUOT (BLO-10699). Unlike claude-k8s, opencode pods have no /runtime-cache
-  // emptyDir (caches are anchored on the PVC), so /tmp is the per-pod ephemeral
-  // target. Only BrowserMetrics is redirected — the rest of the profile
-  // (claude.ai/design auth + cookies) stays persistent. Best-effort and
-  // idempotent: never fails the run, skipped when already a symlink.
+  // EDQUOT (BLO-10699). Only BrowserMetrics is redirected — the rest of the
+  // profile (claude.ai/design auth + cookies) stays persistent. Best-effort
+  // and idempotent: never fails the run, skipped when already a symlink.
   const CHROME_METRICS_REDIRECT =
-    `mkdir -p "$HOME/.config/google-chrome" /tmp/chrome-browser-metrics 2>/dev/null; ` +
-    `{ [ -L "$HOME/.config/google-chrome/BrowserMetrics" ] || { rm -rf "$HOME/.config/google-chrome/BrowserMetrics"; ln -sfn /tmp/chrome-browser-metrics "$HOME/.config/google-chrome/BrowserMetrics"; }; } 2>/dev/null || true`;
+    `mkdir -p "$HOME/.config/google-chrome" ${RUNTIME_CACHE_MOUNT_PATH}/chrome-browser-metrics 2>/dev/null; ` +
+    `{ [ -L "$HOME/.config/google-chrome/BrowserMetrics" ] || { rm -rf "$HOME/.config/google-chrome/BrowserMetrics"; ln -sfn ${RUNTIME_CACHE_MOUNT_PATH}/chrome-browser-metrics "$HOME/.config/google-chrome/BrowserMetrics"; }; } 2>/dev/null || true`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket.
