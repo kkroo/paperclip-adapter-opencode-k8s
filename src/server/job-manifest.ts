@@ -345,17 +345,18 @@ function buildEnvVars(
     merged.NODE_ENV = "development";
   }
 
-  // Agent Jobs mount their own runtime-cache emptyDir. Keep regenerable build,
-  // package, browser, and temp caches off the shared /paperclip PVC while
-  // leaving durable identity/session/config state on HOME. Set before Layer 4
-  // so an explicit adapterConfig.env override still wins.
-  for (const [key, leaf] of Object.entries(AGENT_CACHE_ENV_LEAVES)) {
-    merged[key] = `${RUNTIME_CACHE_MOUNT_PATH}/${leaf}`;
-  }
-
   // Layer 4: User-defined overrides from adapterConfig.env
   for (const [key, value] of Object.entries(envConfig)) {
     if (typeof value === "string") merged[key] = value;
+  }
+
+  // Agent Jobs mount their own runtime-cache emptyDir. Keep regenerable build,
+  // package, browser, and temp caches off the shared /paperclip PVC while
+  // leaving durable identity/session/config state on HOME. These cache keys are
+  // reserved so stale adapterConfig.env overrides cannot move caches back onto
+  // the shared PVC.
+  for (const [key, leaf] of Object.entries(AGENT_CACHE_ENV_LEAVES)) {
+    merged[key] = `${RUNTIME_CACHE_MOUNT_PATH}/${leaf}`;
   }
 
   // OpenCode-specific: prevent project config pollution, always set after user overrides

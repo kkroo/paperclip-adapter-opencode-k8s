@@ -274,10 +274,17 @@ describe("buildJobManifest", () => {
     expect(val("PLAYWRIGHT_BROWSERS_PATH")).toBe("/runtime-cache/ms-playwright");
   });
 
-  it("lets an explicit adapterConfig.env cache override win over the runtime-cache default", () => {
+  it("keeps reserved cache envs on runtime-cache even when adapterConfig.env has stale PVC overrides", () => {
     const ctx = {
       ...mockCtx,
-      config: { env: { BUN_INSTALL_CACHE: "/paperclip/custom-bun-cache" } },
+      config: {
+        env: {
+          BUN_INSTALL_CACHE: "/paperclip/.runtime-cache/bun",
+          XDG_CACHE_HOME: "/paperclip/.runtime-cache/xdg",
+          GOCACHE: "/paperclip/.runtime-cache/go-build",
+          TMPDIR: "/paperclip/.runtime-cache/tmp",
+        },
+      },
     };
     const selfPod = {
       ...mockSelfPod,
@@ -285,7 +292,12 @@ describe("buildJobManifest", () => {
     };
     const result = buildJobManifest({ ctx, selfPod });
     const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
-    expect(env.find((e) => e.name === "BUN_INSTALL_CACHE")?.value).toBe("/paperclip/custom-bun-cache");
+    const val = (name: string) => env.find((e) => e.name === name)?.value;
+
+    expect(val("BUN_INSTALL_CACHE")).toBe("/runtime-cache/bun");
+    expect(val("XDG_CACHE_HOME")).toBe("/runtime-cache/xdg");
+    expect(val("GOCACHE")).toBe("/runtime-cache/go-build");
+    expect(val("TMPDIR")).toBe("/runtime-cache/tmp");
   });
 
   it("applies default ttlSecondsAfterFinished of 300", () => {
