@@ -121,19 +121,22 @@ function isTransientVolumeSchedulingMessage(message: string): boolean {
 async function waitForPod(
   namespace: string,
   jobName: string,
-  timeoutMs: number,
+  scheduleTimeoutMs: number,
+  startTimeoutMs: number,
   onLog: AdapterExecutionContext["onLog"],
   kubeconfigPath?: string,
 ): Promise<string> {
   const coreApi = getCoreApi(kubeconfigPath);
-  const deadline = Date.now() + timeoutMs;
+  const scheduleDeadline = Date.now() + scheduleTimeoutMs;
   const labelSelector = `job-name=${jobName}`;
 
   await onLog("stdout", `[paperclip] Waiting for pod to be scheduled (job: ${jobName})...\n`);
 
   let lastStatus = "";
+  let lastStatusDetails = "no pod observed yet";
   let lastUnschedulableMessage = "";
-  while (Date.now() < deadline) {
+  let startDeadline = 0;
+  while (true) {
     const podList = await coreApi.listNamespacedPod({
       namespace,
       labelSelector,
@@ -141,6 +144,9 @@ async function waitForPod(
     const pod = podList.items[0];
 
     if (!pod) {
+      if (Date.now() >= scheduleDeadline) {
+        throw new Error(`Timed out waiting for pod to be scheduled (${Math.round(scheduleTimeoutMs / 1000)}s)`);
+      }
       if (lastStatus !== "no-pod") {
         await onLog("stdout", `[paperclip] Waiting for Job controller to create pod...\n`);
         lastStatus = "no-pod";
@@ -151,6 +157,9 @@ async function waitForPod(
 
     const podName = pod.metadata?.name ?? "unknown";
     const phase = pod.status?.phase ?? "Unknown";
+    const conditions = pod.status?.conditions ?? [];
+    const scheduledCondition = conditions.find((c) => c.type === "PodScheduled");
+    const isScheduled = Boolean(pod.spec?.nodeName) || scheduledCondition?.status === "True";
     const initStatuses = pod.status?.initContainerStatuses ?? [];
     const containerStatuses = pod.status?.containerStatuses ?? [];
 
@@ -168,6 +177,12 @@ async function waitForPod(
       }
       await onLog("stdout", `[paperclip] Pod ${podName}: ${details.join(", ")}\n`);
       lastStatus = statusKey;
+      lastStatusDetails = details.join(", ");
+    }
+
+    if (isScheduled && startDeadline === 0) {
+      startDeadline = Date.now() + startTimeoutMs;
+      await onLog("stdout", `[paperclip] Pod ${podName} scheduled; waiting for containers to start...\n`);
     }
 
     if (phase === "Running" || phase === "Succeeded" || phase === "Failed") {
@@ -196,7 +211,6 @@ async function waitForPod(
       }
     }
 
-    const conditions = pod.status?.conditions ?? [];
     const unschedulable = conditions.find(
       (c) => c.type === "PodScheduled" && c.status === "False" && c.reason === "Unschedulable",
     );
@@ -211,6 +225,13 @@ async function waitForPod(
         continue;
       }
       throw new Error(`Pod unschedulable: ${msg}`);
+    }
+
+    if (!isScheduled && Date.now() >= scheduleDeadline) {
+      throw new Error(`Timed out waiting for pod to be scheduled (${Math.round(scheduleTimeoutMs / 1000)}s)`);
+    }
+    if (isScheduled && startDeadline > 0 && Date.now() >= startDeadline) {
+      throw new Error(`Timed out waiting for pod containers to start (${Math.round(startTimeoutMs / 1000)}s): ${lastStatusDetails}`);
     }
 
     for (const cs of containerStatuses) {
@@ -237,8 +258,6 @@ async function waitForPod(
 
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
   }
-
-  throw new Error(`Timed out waiting for pod to be scheduled (${Math.round(timeoutMs / 1000)}s)`);
 }
 
 export type JobCompletionResult = { succeeded: boolean; timedOut: boolean; jobGone: boolean };
@@ -701,9 +720,10 @@ async function streamAndAwaitJob(
 
   try {
     const scheduleTimeoutMs = 120_000;
+    const startTimeoutMs = 600_000;
     let podName: string;
     try {
-      podName = await waitForPod(namespace, jobName, scheduleTimeoutMs, onLog, kubeconfigPath);
+      podName = await waitForPod(namespace, jobName, scheduleTimeoutMs, startTimeoutMs, onLog, kubeconfigPath);
       await onLog("stdout", `[paperclip] Pod running: ${podName}\n`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

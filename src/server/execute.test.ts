@@ -668,6 +668,67 @@ describe("execute — pod scheduling failure", () => {
       expect.stringContaining("Waiting for PVC/volume binding before scheduling"),
     );
   });
+
+  it("does not apply the scheduler timeout after the pod is already assigned", async () => {
+    const nowSpy = vi.spyOn(Date, "now")
+      .mockReturnValueOnce(0)
+      .mockReturnValue(121_000);
+    try {
+      const coreApi = makeCoreApi();
+      coreApi.listNamespacedPod = vi.fn()
+        .mockResolvedValueOnce({
+          items: [
+            {
+              metadata: { name: POD_NAME },
+              spec: { nodeName: "k8s-paperclip-3" },
+              status: {
+                phase: "Pending",
+                conditions: [{ type: "PodScheduled", status: "True" }],
+                initContainerStatuses: [
+                  { name: "write-prompt", state: { running: {} } },
+                ],
+                containerStatuses: [
+                  { name: "opencode", state: { waiting: { reason: "PodInitializing" } } },
+                ],
+              },
+            },
+          ],
+        })
+        .mockResolvedValueOnce({
+          items: [
+            {
+              metadata: { name: POD_NAME },
+              spec: { nodeName: "k8s-paperclip-3" },
+              status: { phase: "Running" },
+            },
+          ],
+        })
+        .mockResolvedValueOnce({
+          items: [
+            {
+              status: {
+                containerStatuses: [
+                  { name: "opencode", state: { terminated: { exitCode: 0 } } },
+                ],
+              },
+            },
+          ],
+        });
+      vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+      const ctx = makeCtx();
+      const result = await execute(ctx);
+
+      expect(result.errorCode).toBeUndefined();
+      expect(result.exitCode).toBe(0);
+      expect(ctx.onLog).toHaveBeenCalledWith(
+        "stdout",
+        expect.stringContaining("scheduled; waiting for containers to start"),
+      );
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
 });
 
 describe("execute — happy path", () => {
