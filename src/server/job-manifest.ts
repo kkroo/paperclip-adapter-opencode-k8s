@@ -886,7 +886,24 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     asString(config.instructionsRootPath, "").trim()
       ? `( [ -e docs ] || { __pcd="$(dirname "$(dirname "\${AGENT_HOME:-/nonexistent}")")/docs"; [ -d "$__pcd" ] && ln -sfn "$__pcd" docs; } ) 2>/dev/null || true; `
       : "";
-  const baseMainCommand = `set -o pipefail; ${ccrotateRefresh}; ${authBootstrap}; ${configSetup}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${podLogPath}) && : > ${podLogPath} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${podLogPath}`;
+  // opencode-db schema-compat guard (root-caused 2026-06-21, BLO follow-up).
+  // The persistent opencode.db is keyed per (company, agent, taskKey) and reused
+  // across runs (workspace_subpath mode). When the vendored opencode binary is
+  // upgraded, an opencode.db created by the OLD version can carry a schema the
+  // NEW insert path violates — observed live: `NOT NULL constraint failed:
+  // session_message.seq` at SessionPrompt.createUserMessage — which bricks
+  // EVERY run with a generic "Unexpected server error / UnknownError" thrown
+  // before any model call (so the model endpoint looks healthy while the agent
+  // crashloops). A DB built fresh by the current binary is self-consistent, so
+  // reset opencode.db (+ -wal/-shm) when the opencode version that built it
+  // differs from the current binary, stamping the version next to the DB.
+  // Best-effort and idempotent: only fires on a version change, never wipes a
+  // DB matching the current binary, and never fails the run. Gated on hasAgentDb
+  // (only meaningful when /opencode-db is mounted).
+  const dbResetGuard = hasAgentDb
+    ? `__ocdb=/opencode-db/opencode.db; __ocdir="$(dirname "$__ocdb")"; __ocver="$(opencode --version 2>/dev/null | head -n1)"; if [ -n "$__ocver" ]; then __ocprev="$(cat "$__ocdir/.opencode-version" 2>/dev/null || true)"; if [ -f "$__ocdb" ] && [ "$__ocver" != "$__ocprev" ]; then echo "[paperclip] opencode upgraded ('$__ocprev' -> '$__ocver'); resetting $__ocdb to avoid stale-schema crash" >&2; rm -f "$__ocdb" "$__ocdb-shm" "$__ocdb-wal" 2>/dev/null || true; fi; mkdir -p "$__ocdir" 2>/dev/null || true; printf '%s' "$__ocver" > "$__ocdir/.opencode-version" 2>/dev/null || true; fi; `
+    : "";
+  const baseMainCommand = `set -o pipefail; ${ccrotateRefresh}; ${authBootstrap}; ${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${podLogPath}) && : > ${podLogPath} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${podLogPath}`;
   // Redirect Chrome's BrowserMetrics spool off the shared CephFS HOME to the
   // main container's per-pod runtime-cache emptyDir. The
   // agent-browser designer tool launches system Chrome with the default

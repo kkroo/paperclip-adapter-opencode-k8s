@@ -606,6 +606,38 @@ describe("init container is unchanged by agentDbClaimName", () => {
   });
 });
 
+describe("opencode-db schema-compat reset guard", () => {
+  function mainScript(result: ReturnType<typeof buildJobManifest>) {
+    const main = (result.job.spec?.template?.spec?.containers ?? []).find((c) => c.name === "opencode");
+    return main?.command?.[2] ?? "";
+  }
+
+  it("injects the version-stamped reset guard when an agent DB is mounted", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, agentDbClaimName: "opencode-db-agent-abc" });
+    const script = mainScript(result);
+    expect(script).toContain("opencode --version");
+    expect(script).toContain(".opencode-version");
+    expect(script).toContain('rm -f "$__ocdb" "$__ocdb-shm" "$__ocdb-wal"');
+    // Guard must run BEFORE the prompt is piped into opencode, so a stale-schema
+    // DB is reset before any session insert is attempted.
+    expect(script.indexOf(".opencode-version")).toBeLessThan(script.indexOf("cat /tmp/prompt/prompt.txt"));
+    expect(script.indexOf(".opencode-version")).toBeGreaterThan(-1);
+  });
+
+  it("only resets on a version change (guarded by .opencode-version comparison, not unconditional)", () => {
+    const script = mainScript(
+      buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, agentDbClaimName: "opencode-db-agent-abc" }),
+    );
+    // The rm is inside a `[ "$__ocver" != "$__ocprev" ]` branch — never a bare wipe.
+    expect(script).toContain('"$__ocver" != "$__ocprev"');
+  });
+
+  it("does NOT inject the guard when no agent DB is mounted", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+    expect(mainScript(result)).not.toContain(".opencode-version");
+  });
+});
+
 describe("sanitizeLabelValue", () => {
   it("passes through clean values unchanged", () => {
     expect(sanitizeLabelValue("abc-123")).toBe("abc-123");
