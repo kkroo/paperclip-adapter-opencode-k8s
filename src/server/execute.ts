@@ -1503,15 +1503,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // - workspace_subpath: per-(agent, task) subdir on the workspace data PVC;
   //   single-writer per task (heartbeat scheduler enforces one pod per
   //   (agent, task)) and survives pod restart, so resume actually works.
+  //   No-task heartbeats are intentionally ephemeral: they do not need resume
+  //   state and otherwise share one long-lived `_no_task_` SQLite DB forever.
   const agentDbMode = (asString(config.agentDbMode, "workspace_subpath").trim() || "workspace_subpath") as AgentDbMode;
   let agentDbClaimName: string | null | undefined;
   let agentDbWorkspaceSubPath: string | undefined;
   if (agentDbMode === "workspace_subpath") {
-    agentDbWorkspaceSubPath = buildAgentDbWorkspaceSubPath(
-      ctx.agent.companyId,
-      agentId,
-      ctx.runtime.taskKey,
-    );
+    if (sanitizeTaskKeyForPath(ctx.runtime.taskKey) === "_no_task_") {
+      agentDbClaimName = null;
+    } else {
+      agentDbWorkspaceSubPath = buildAgentDbWorkspaceSubPath(
+        ctx.agent.companyId,
+        agentId,
+        ctx.runtime.taskKey,
+      );
+    }
   } else {
     try {
       agentDbClaimName = await ensureAgentDbPvc(agentId, guardNamespace, config, kubeconfigPath);

@@ -632,9 +632,22 @@ describe("opencode-db schema-compat reset guard", () => {
     expect(script).toContain('"$__ocver" != "$__ocprev"');
   });
 
+  it("resets unchanged DBs when main DB plus WAL/SHM exceeds 500 MiB", () => {
+    const script = mainScript(
+      buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, agentDbClaimName: "opencode-db-agent-abc" }),
+    );
+    expect(script).toContain("524288000");
+    expect(script).toContain('for __ocf in "$__ocdb" "$__ocdb-wal" "$__ocdb-shm"');
+    expect(script).toContain('wc -c < "$__ocf"');
+    expect(script).toContain('"$__ocbytes" -gt 524288000');
+    expect(script).toContain("to cap growth");
+    expect(script.indexOf('"$__ocver" != "$__ocprev"')).toBeLessThan(script.indexOf('"$__ocbytes" -gt 524288000'));
+  });
+
   it("does NOT inject the guard when no agent DB is mounted", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
     expect(mainScript(result)).not.toContain(".opencode-version");
+    expect(mainScript(result)).not.toContain("524288000");
   });
 });
 
