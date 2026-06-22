@@ -153,4 +153,10 @@ describe("buildAgentDbWorkspaceSubPath", () => {
     expect(buildAgentDbWorkspaceSubPath("co123", "agent-abc", null))
       .toBe(".opencode-db/co123/agent-abc/_no_task_");
   });
+
+  it("keeps only the path builder responsible for _no_task_ naming", async () => {
+    const { buildAgentDbWorkspaceSubPath, sanitizeTaskKeyForPath } = await import("./execute.js");
+    expect(sanitizeTaskKeyForPath(null)).toBe("_no_task_");
+    expect(buildAgentDbWorkspaceSubPath("co123", "agent-abc", null).endsWith("/_no_task_")).toBe(true);
+  });
 });

@@ -1593,6 +1593,29 @@ describe("waitForJobCompletion — transient read tolerance (BLO-10448)", () => 
 });
 
 describe("execute — config edge paths", () => {
+  it("uses an ephemeral opencode DB for default workspace_subpath no-task runs", async () => {
+    const ctx = makeCtx({ agentDbMode: "workspace_subpath" });
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBeUndefined();
+    const buildArgs = vi.mocked(buildJobManifest).mock.calls[0][0];
+    expect(buildArgs.agentDbClaimName).toBeNull();
+    expect(buildArgs.agentDbWorkspaceSubPath).toBeUndefined();
+    expect(vi.mocked(getPvc)).not.toHaveBeenCalled();
+  });
+
+  it("keeps issue-scoped workspace_subpath opencode DB persistence", async () => {
+    const ctx = makeCtx({ agentDbMode: "workspace_subpath" });
+    (ctx.runtime as { taskKey: string | null }).taskKey = "BLO-11715";
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBeUndefined();
+    const buildArgs = vi.mocked(buildJobManifest).mock.calls[0][0];
+    expect(buildArgs.agentDbWorkspaceSubPath).toBe(".opencode-db/co-1/agent-id-test/blo-11715");
+    expect(buildArgs.agentDbClaimName).toBeUndefined();
+    expect(vi.mocked(getPvc)).not.toHaveBeenCalled();
+  });
+
   it("logs a warning but continues when instructionsFilePath cannot be read", async () => {
     const ctx = makeCtx({ instructionsFilePath: "/does/not/exist/AGENTS.md" });
     const result = await execute(ctx);

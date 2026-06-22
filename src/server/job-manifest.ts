@@ -897,11 +897,11 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // crashloops). A DB built fresh by the current binary is self-consistent, so
   // reset opencode.db (+ -wal/-shm) when the opencode version that built it
   // differs from the current binary, stamping the version next to the DB.
-  // Best-effort and idempotent: only fires on a version change, never wipes a
-  // DB matching the current binary, and never fails the run. Gated on hasAgentDb
-  // (only meaningful when /opencode-db is mounted).
+  // If the version is unchanged, cap DB growth by resetting when the DB + WAL
+  // + SHM files exceed 500 MiB. Best-effort and idempotent: never fails the
+  // run. Gated on hasAgentDb (only meaningful when /opencode-db is mounted).
   const dbResetGuard = hasAgentDb
-    ? `__ocdb=/opencode-db/opencode.db; __ocdir="$(dirname "$__ocdb")"; __ocver="$(opencode --version 2>/dev/null | head -n1)"; if [ -n "$__ocver" ]; then __ocprev="$(cat "$__ocdir/.opencode-version" 2>/dev/null || true)"; if [ -f "$__ocdb" ] && [ "$__ocver" != "$__ocprev" ]; then echo "[paperclip] opencode upgraded ('$__ocprev' -> '$__ocver'); resetting $__ocdb to avoid stale-schema crash" >&2; rm -f "$__ocdb" "$__ocdb-shm" "$__ocdb-wal" 2>/dev/null || true; fi; mkdir -p "$__ocdir" 2>/dev/null || true; printf '%s' "$__ocver" > "$__ocdir/.opencode-version" 2>/dev/null || true; fi; `
+    ? `__ocdb=/opencode-db/opencode.db; __ocdir="$(dirname "$__ocdb")"; __ocver="$(opencode --version 2>/dev/null | head -n1)"; __ocprev="$(cat "$__ocdir/.opencode-version" 2>/dev/null || true)"; if [ -n "$__ocver" ] && [ -f "$__ocdb" ] && [ "$__ocver" != "$__ocprev" ]; then echo "[paperclip] opencode upgraded ('$__ocprev' -> '$__ocver'); resetting $__ocdb to avoid stale-schema crash" >&2; rm -f "$__ocdb" "$__ocdb-shm" "$__ocdb-wal" 2>/dev/null || true; else __ocbytes=0; for __ocf in "$__ocdb" "$__ocdb-wal" "$__ocdb-shm"; do if [ -f "$__ocf" ]; then __ocsz="$(wc -c < "$__ocf" 2>/dev/null || echo 0)"; __ocsz="\${__ocsz##* }"; __ocbytes=$((__ocbytes + \${__ocsz:-0})); fi; done; if [ -f "$__ocdb" ] && [ "$__ocbytes" -gt 524288000 ]; then echo "[paperclip] opencode DB $__ocbytes bytes exceeds 524288000; resetting $__ocdb to cap growth" >&2; rm -f "$__ocdb" "$__ocdb-shm" "$__ocdb-wal" 2>/dev/null || true; fi; fi; if [ -n "$__ocver" ]; then mkdir -p "$__ocdir" 2>/dev/null || true; printf '%s' "$__ocver" > "$__ocdir/.opencode-version" 2>/dev/null || true; fi; `
     : "";
   const baseMainCommand = `set -o pipefail; ${ccrotateRefresh}; ${authBootstrap}; ${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${podLogPath}) && : > ${podLogPath} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${podLogPath}`;
   // Redirect Chrome's BrowserMetrics spool off the shared CephFS HOME to the
