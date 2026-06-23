@@ -266,6 +266,72 @@ beforeEach(() => {
   );
 });
 
+describe("execute — budget enforcement", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.PAPERCLIP_API_URL;
+  });
+
+  it("fails fast and pauses the agent before creating a Job when the current agent is over budget", async () => {
+    process.env.PAPERCLIP_API_URL = "http://test-api";
+
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === "http://test-api/api/agents/agent-id-test" && (!init?.method || init.method === "GET")) {
+        return {
+          ok: true,
+          json: async () => ({
+            id: "agent-id-test",
+            name: "Test Agent",
+            spentMonthlyCents: 22_385,
+            budgetMonthlyCents: 20_000,
+            pauseReason: null,
+            pausedAt: null,
+          }),
+        } as Response;
+      }
+      if (url === "http://test-api/api/agents/agent-id-test" && init?.method === "PATCH") {
+        return { ok: true, json: async () => ({}) } as Response;
+      }
+      if (url === "http://test-api/api/issues/issue-test-456/comments" && init?.method === "POST") {
+        return { ok: true, json: async () => ({}) } as Response;
+      }
+      throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const batchApi = makeBatchApi();
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const ctx = makeCtx({}, { issueId: "issue-test-456" }, "run-jwt-token");
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("budget_exceeded");
+    expect(result.exitCode).toBeNull();
+    expect(result.errorMessage).toContain("Budget exceeded");
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://test-api/api/agents/agent-id-test",
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer run-jwt-token" }) }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://test-api/api/agents/agent-id-test",
+      expect.objectContaining({
+        method: "PATCH",
+        headers: expect.objectContaining({ Authorization: "Bearer run-jwt-token" }),
+        body: expect.stringContaining("budget exceeded"),
+      }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://test-api/api/issues/issue-test-456/comments",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ Authorization: "Bearer run-jwt-token" }),
+        body: expect.stringContaining("$223.85 spent / $200.00 cap"),
+      }),
+    );
+  });
+});
+
 describe("execute — concurrency guard", () => {
   it("blocks when a running job already exists for the agent", async () => {
     const batchApi = makeBatchApi([
