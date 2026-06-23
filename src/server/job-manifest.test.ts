@@ -1167,6 +1167,43 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       const parsed = JSON.parse(match![1].replace(/'\\''/g, "'")) as { disabled_providers?: string[] };
       expect(parsed.disabled_providers).toEqual(["opencode"]);
     });
+
+    // Reasoning models (gpt-5.5) can pause for long stretches between SSE
+    // chunks while thinking. OpenCode's default inter-chunk idle guard
+    // (provider.options.chunkTimeout) aborts the stream on these gaps,
+    // surfacing "API Error: Stream idle timeout - partial response" and
+    // persisting a TRUNCATED assistant turn (an issue body cut mid-sentence).
+    // Both config paths must set a generous chunkTimeout so a healthy-but-slow
+    // reasoning stream is never aborted.
+    it("sets provider.openai.options.chunkTimeout on the default (no-MCP) opencode.json", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > ~\/\.config\/opencode\/opencode\.json/);
+      expect(match).toBeTruthy();
+      const parsed = JSON.parse(match![1].replace(/'\\''/g, "'")) as {
+        provider?: { openai?: { options?: { chunkTimeout?: number } } };
+      };
+      expect(parsed.provider?.openai?.options?.chunkTimeout).toBe(240_000);
+    });
+
+    it("sets provider.openai.options.chunkTimeout on the MCP-path opencode.json (OPENCODE_CONFIG_JSON)", () => {
+      const ctx: JobBuildInput["ctx"] = {
+        ...mockCtx,
+        config: {
+          mcpServers: {
+            paperclip: { command: "node", args: ["/app/packages/mcp-server/dist/stdio.js"] },
+          },
+        },
+      };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      const init = result.job.spec!.template.spec!.initContainers![0]!;
+      const cfgEnv = (init.env ?? []).find((e) => e.name === "OPENCODE_CONFIG_JSON");
+      expect(cfgEnv).toBeDefined();
+      const parsed = JSON.parse(cfgEnv!.value!) as {
+        provider?: { openai?: { options?: { chunkTimeout?: number } } };
+      };
+      expect(parsed.provider?.openai?.options?.chunkTimeout).toBe(240_000);
+    });
   });
 
   describe("paperclipTaskMarkdown surfacing", () => {
