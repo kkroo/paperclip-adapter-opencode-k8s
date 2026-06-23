@@ -397,10 +397,30 @@ function buildEnvVars(
  * immediately if no other provider is configured) instead of silently
  * falling through to zen.
  */
+// Reasoning models (notably gpt-5.5) routinely pause for long stretches between
+// streamed SSE chunks while thinking. OpenCode's default inter-chunk idle guard
+// (`provider.options.chunkTimeout`) aborts the request when no chunk arrives
+// within its window, surfacing `API Error: Stream idle timeout - partial
+// response` and persisting the TRUNCATED assistant turn — e.g. an issue
+// description cut mid-sentence, which then mirrors verbatim to Linear and reads
+// as a "sync clipped my body" bug. 240_000 ms (240s) sits just under the
+// /responses shim's 255s Bun socket idle (onprem-k8s opencode-ccrotate-responses-shim)
+// and matches the MCP idleTimeout=240 convention, so opencode tolerates the same
+// reasoning gap the upstream socket does instead of aborting first. Applied to
+// BOTH config paths because opencode does not merge config sources — whichever
+// of ~/.config/opencode/opencode.json (no-MCP) or OPENCODE_CONFIG (MCP) wins
+// must carry it.
+const OPENAI_PROVIDER_CHUNK_TIMEOUT_MS = 240_000;
+
+function reasoningProviderConfig(): Record<string, unknown> {
+  return { openai: { options: { chunkTimeout: OPENAI_PROVIDER_CHUNK_TIMEOUT_MS } } };
+}
+
 function buildRuntimeConfigJson(config: Record<string, unknown>): string | null {
   const skipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
   const runtime: Record<string, unknown> = {
     disabled_providers: ["opencode"],
+    provider: reasoningProviderConfig(),
   };
   if (skipPermissions) {
     runtime.permission = { external_directory: "allow" };
@@ -665,6 +685,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
           // the auth.json that buildOpencodeAuthBootstrapShell writes
           // from ~/.codex/auth.json.
           disabled_providers: ["opencode"],
+          // Generous inter-chunk idle window for slow reasoning streams; see
+          // reasoningProviderConfig / OPENAI_PROVIDER_CHUNK_TIMEOUT_MS.
+          provider: reasoningProviderConfig(),
           mcp: opencodeMcpSection,
         })
       : null;
