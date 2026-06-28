@@ -1,5 +1,18 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { buildJobManifest, sanitizeLabelValue, type JobBuildInput } from "./job-manifest.js";
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    readFileSync: vi.fn((file: Parameters<typeof actual.readFileSync>[0], ...args: unknown[]) => {
+      if (file === "/paperclip/.mcp.json") {
+        throw new Error("test baseline absent");
+      }
+      return actual.readFileSync(file, ...(args as [Parameters<typeof actual.readFileSync>[1]]));
+    }),
+  };
+});
 
 const mockSelfPod: JobBuildInput["selfPod"] = {
   namespace: "paperclip",
@@ -206,6 +219,56 @@ describe("buildJobManifest", () => {
     const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
     const homeEnv = env.find((e) => e.name === "HOME");
     expect(homeEnv?.value).toBe("/paperclip");
+  });
+
+  it("uses server-supplied isolated roots for HOME, caches, workdir, labels, and pod logs", () => {
+    const ctx = {
+      ...mockCtx,
+      context: {
+        ...mockCtx.context,
+        taskId: "task-123",
+        k8sRunIsolation: {
+          isolationMode: "isolated",
+          isolationKey: "co123:agent-abc:task-123",
+          workspaceRoot: "/paperclip/isolated/task-123/workspace",
+          homeRoot: "/paperclip/isolated/task-123/home",
+          cacheRoot: "/paperclip/isolated/task-123/cache",
+          sessionScope: "co123:agent-abc:task-123",
+        },
+      },
+    };
+
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const labels = result.job.metadata?.labels ?? {};
+    const container = result.job.spec?.template?.spec?.containers?.[0];
+    const env = container?.env ?? [];
+    const envValue = (name: string) => env.find((e) => e.name === name)?.value;
+
+    expect(labels["paperclip.io/isolation-mode"]).toBe("isolated");
+    expect(labels["paperclip.io/isolation-key-hash"]).toMatch(/^[0-9a-f]{16}$/);
+    expect(container?.workingDir).toBe("/paperclip/isolated/task-123/workspace");
+    expect(envValue("HOME")).toBe("/paperclip/isolated/task-123/home");
+    expect(envValue("XDG_CACHE_HOME")).toBe("/paperclip/isolated/task-123/cache/xdg");
+    expect(envValue("PAPERCLIP_K8S_ISOLATION_KEY")).toBe("co123:agent-abc:task-123");
+    expect(result.podLogPath).toBe("/paperclip/isolated/task-123/cache/run-logs/run123456.pod.ndjson");
+  });
+
+  it("falls back to shared mode when isolation metadata is incomplete", () => {
+    const ctx = {
+      ...mockCtx,
+      context: {
+        ...mockCtx.context,
+        k8sRunIsolation: { isolationMode: "isolated" },
+      },
+    };
+
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const labels = result.job.metadata?.labels ?? {};
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+
+    expect(labels["paperclip.io/isolation-mode"]).toBe("shared");
+    expect(labels["paperclip.io/isolation-key-hash"]).toBeUndefined();
+    expect(env.find((e) => e.name === "HOME")?.value).toBe("/paperclip");
   });
 
   it("sets OPENCODE_DISABLE_PROJECT_CONFIG=true", () => {

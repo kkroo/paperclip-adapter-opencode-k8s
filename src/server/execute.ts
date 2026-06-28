@@ -15,7 +15,7 @@ import {
 import { computeOpenAICompatibleCost } from "./pricing.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
 import { PassThrough } from "node:stream";
-import { buildJobManifest, LARGE_PROMPT_THRESHOLD_BYTES, buildPodLogPath } from "./job-manifest.js";
+import { buildJobManifest, LARGE_PROMPT_THRESHOLD_BYTES, buildPodLogPath, readRunIsolationDescriptor } from "./job-manifest.js";
 import type * as k8s from "@kubernetes/client-node";
 
 const POLL_INTERVAL_MS = 2000;
@@ -1503,21 +1503,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const agentId = ctx.agent.id;
   const taskId = asString(ctx.context.taskId ?? ctx.context.issueId, "").trim();
+  const runIsolation = readRunIsolationDescriptor(ctx, config);
   const selfPod = await getSelfPodInfo(kubeconfigPath);
   const guardNamespace = asString(config.namespace, "") || selfPod.namespace;
   ensureSigtermHandler();
 
-  // Serialize guard-check + job-create per agent to prevent TOCTOU races.
-  const prevLock = agentCreationMutex.get(agentId) ?? Promise.resolve();
+  // Serialize guard-check + job-create per shared-state slot to prevent TOCTOU
+  // races. Shared/malformed isolation keeps the legacy per-agent mutex; isolated
+  // mode only narrows it once the server supplied a validated isolation key.
+  const guardKey = runIsolation.mode === "isolated" && runIsolation.keyHash
+    ? `${agentId}:${runIsolation.keyHash}`
+    : agentId;
+  const prevLock = agentCreationMutex.get(guardKey) ?? Promise.resolve();
   let releaseLock!: () => void;
-  agentCreationMutex.set(
-    agentId,
-    prevLock.then(() => new Promise<void>((resolve) => { releaseLock = resolve; })),
-  );
+  const currentLock = prevLock.then(() => new Promise<void>((resolve) => { releaseLock = resolve; }));
+  agentCreationMutex.set(guardKey, currentLock);
   await prevLock;
 
   try {
-    // Guard: single concurrency per agent (shared PVC/session) — fail-closed.
+    // Guard: shared mode still serializes per agent. Isolated mode may run with
+    // other jobs for the same agent only when both sides carry different
+    // isolation-key hashes; missing labels fail closed as shared.
     let waitedForConcurrent = false;
     while (true) {
       try {
@@ -1534,10 +1540,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             ? running.filter((j) => j.metadata?.labels?.["paperclip.io/task-id"] === taskId)
             : [];
           const otherJobs = running.filter((j) => !sameTaskJobs.includes(j));
+          const blockingJobs = otherJobs.filter((j) => {
+            if (runIsolation.mode !== "isolated" || !runIsolation.keyHash) return true;
+            const labels = j.metadata?.labels ?? {};
+            return labels["paperclip.io/isolation-mode"] !== "isolated" ||
+              labels["paperclip.io/isolation-key-hash"] === runIsolation.keyHash ||
+              !labels["paperclip.io/isolation-key-hash"];
+          });
 
-          if (otherJobs.length > 0) {
+          if (blockingJobs.length > 0) {
             if (waitedForConcurrent) {
-              const names = otherJobs.map((j) => j.metadata?.name).join(", ");
+              const names = blockingJobs.map((j) => j.metadata?.name).join(", ");
               await onLog("stderr", `[paperclip] Concurrent run blocked: existing Job(s) still running for this agent: ${names}\n`);
               return {
                 exitCode: null,
@@ -1547,13 +1560,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 errorCode: "k8s_concurrent_run_blocked",
               };
             }
-            const names = otherJobs.map((j) => j.metadata?.name).join(", ");
+            const names = blockingJobs.map((j) => j.metadata?.name).join(", ");
             await onLog("stdout", `[paperclip] Waiting for concurrent Job(s) to finish before starting: ${names}\n`);
             const concurrentWaitMs = timeoutSec > 0
               ? (timeoutSec + graceSec + 120) * 1000
               : 60 * 60_000;
             await Promise.all(
-              otherJobs.map((j) =>
+              blockingJobs.map((j) =>
                 waitForJobCompletion(guardNamespace, j.metadata?.name ?? "", concurrentWaitMs, kubeconfigPath).catch(() => {}),
               ),
             );
@@ -1690,6 +1703,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // /paperclip respectively.
     ...(workspaceVolumeClaim !== undefined ? { workspaceVolumeClaim } : {}),
     ...(workspaceMountPath !== undefined ? { workspaceMountPath } : {}),
+    isolation: runIsolation,
   };
   const firstBuild = buildJobManifest(buildArgs);
   const { jobName, namespace, prompt, opencodeArgs, promptMetrics, podLogPath } = firstBuild;
@@ -1819,5 +1833,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     return streamAndAwaitJob(ctx, jobName, namespace, timeoutSec, graceSec, kubeconfigPath, retainJobs, podLogPath, promptSecretName);
   } finally {
     releaseLock();
+    if (agentCreationMutex.get(guardKey) === currentLock) {
+      agentCreationMutex.delete(guardKey);
+    }
   }
 }
