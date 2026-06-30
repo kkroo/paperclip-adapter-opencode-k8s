@@ -3,6 +3,7 @@ import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { execute, ensureAgentDbPvc, tailPodLogFile, mergeEnvironmentConfig, captureContainerLogTail } from "./execute.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
 import { PassThrough } from "node:stream";
+import { createHash } from "node:crypto";
 import { buildJobManifest, buildPodLogPath } from "./job-manifest.js";
 
 // Mock node:fs/promises so tailPodLogFile (used by execute()) reads a
@@ -59,13 +60,45 @@ vi.mock("./k8s-client.js", () => ({
   createPvc: vi.fn().mockResolvedValue({}),
 }));
 
-vi.mock("./job-manifest.js", () => ({
-  buildJobManifest: vi.fn(),
-  buildPodLogPath: vi.fn((companyId: string, agentId: string, runId: string) =>
-    `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/${runId}.pod.ndjson`
-  ),
-  LARGE_PROMPT_THRESHOLD_BYTES: 256 * 1024,
-}));
+vi.mock("./job-manifest.js", async () => {
+  const { createHash } = await import("node:crypto");
+  return {
+    buildJobManifest: vi.fn(),
+    buildPodLogPath: vi.fn((companyId: string, agentId: string, runId: string) =>
+      `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/${runId}.pod.ndjson`
+    ),
+    readRunIsolationDescriptor: vi.fn((ctx: AdapterExecutionContext, config: Record<string, unknown> = {}) => {
+      const context = (ctx.context ?? {}) as Record<string, unknown>;
+      const raw = [
+        context.k8sRunIsolation,
+        context.runIsolation,
+        context.isolation,
+        config.k8sRunIsolation,
+        config.runIsolation,
+        config.isolation,
+      ].find((candidate): candidate is Record<string, unknown> => Boolean(candidate && typeof candidate === "object" && !Array.isArray(candidate)));
+      const mode = typeof raw?.isolationMode === "string" ? raw.isolationMode : raw?.mode;
+      const key = typeof raw?.isolationKey === "string" && raw.isolationKey.trim()
+        ? raw.isolationKey.trim()
+        : typeof raw?.key === "string" && raw.key.trim()
+          ? raw.key.trim()
+          : null;
+      if (mode !== "isolated" || !key) {
+        return { mode: "shared", key: null, keyHash: null, workspaceRoot: null, homeRoot: null, cacheRoot: null, sessionScope: null };
+      }
+      return {
+        mode: "isolated",
+        key,
+        keyHash: createHash("sha256").update(key).digest("hex").slice(0, 16),
+        workspaceRoot: typeof raw?.workspaceRoot === "string" ? raw.workspaceRoot : null,
+        homeRoot: typeof raw?.homeRoot === "string" ? raw.homeRoot : null,
+        cacheRoot: typeof raw?.cacheRoot === "string" ? raw.cacheRoot : null,
+        sessionScope: typeof raw?.sessionScope === "string" ? raw.sessionScope : null,
+      };
+    }),
+    LARGE_PROMPT_THRESHOLD_BYTES: 256 * 1024,
+  };
+});
 
 // Prevent skill loading from reading real SKILL.md files during tests — the
 // real filesystem read delays timer registration and breaks fake-timer tests.
@@ -228,6 +261,10 @@ function makeCoreApi(
     deleteNamespacedSecret: vi.fn().mockResolvedValue({}),
     patchNamespacedSecret: vi.fn().mockResolvedValue({}),
   };
+}
+
+function isoHash(key: string): string {
+  return createHash("sha256").update(key).digest("hex").slice(0, 16);
 }
 
 beforeEach(() => {
@@ -412,6 +449,89 @@ describe("execute — concurrency guard", () => {
     const ctx = makeCtx({ reattachOrphanedJobs: true });
     // ctx.context.taskId is null in makeCtx, so the running job is always an "other" job
     const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+  });
+
+  it("allows concurrent isolated jobs when isolation keys differ", async () => {
+    const batchApi = makeBatchApi([
+      {
+        metadata: {
+          name: "other-isolated-job",
+          labels: {
+            "paperclip.io/task-id": "other-task-id",
+            "paperclip.io/isolation-mode": "isolated",
+            "paperclip.io/isolation-key-hash": isoHash("agent:other-task"),
+          },
+        },
+        status: { conditions: [] },
+      },
+    ]);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const ctx = makeCtx({}, {
+      taskId: "this-task-id",
+      k8sRunIsolation: {
+        isolationMode: "isolated",
+        isolationKey: "agent:this-task",
+        workspaceRoot: "/paperclip/isolated/this-task/workspace",
+        homeRoot: "/paperclip/isolated/this-task/home",
+        cacheRoot: "/paperclip/isolated/this-task/cache",
+        sessionScope: "agent:this-task",
+      },
+    });
+
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBeUndefined();
+    expect(batchApi.createNamespacedJob).toHaveBeenCalled();
+  });
+
+  it("blocks concurrent isolated jobs when isolation keys match", async () => {
+    const key = "agent:same-task";
+    const batchApi = makeBatchApi([
+      {
+        metadata: {
+          name: "same-isolation-job",
+          labels: {
+            "paperclip.io/task-id": "other-task-id",
+            "paperclip.io/isolation-mode": "isolated",
+            "paperclip.io/isolation-key-hash": isoHash(key),
+          },
+        },
+        status: { conditions: [] },
+      },
+    ]);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const ctx = makeCtx({}, {
+      taskId: "this-task-id",
+      k8sRunIsolation: { isolationMode: "isolated", isolationKey: key },
+    });
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+  });
+
+  it("blocks in shared mode even when the existing job is isolated", async () => {
+    const batchApi = makeBatchApi([
+      {
+        metadata: {
+          name: "isolated-job",
+          labels: {
+            "paperclip.io/task-id": "other-task-id",
+            "paperclip.io/isolation-mode": "isolated",
+            "paperclip.io/isolation-key-hash": isoHash("agent:other-task"),
+          },
+        },
+        status: { conditions: [] },
+      },
+    ]);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const result = await execute(makeCtx());
 
     expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
     expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
@@ -1965,6 +2085,15 @@ describe("execute — SIGTERM handler body (FAR-86 coverage)", () => {
       buildPodLogPath: vi.fn((companyId: string, agentId: string, runId: string) =>
         `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/${runId}.pod.ndjson`
       ),
+      readRunIsolationDescriptor: vi.fn(() => ({
+        mode: "shared",
+        key: null,
+        keyHash: null,
+        workspaceRoot: null,
+        homeRoot: null,
+        cacheRoot: null,
+        sessionScope: null,
+      })),
       LARGE_PROMPT_THRESHOLD_BYTES: 256 * 1024,
     }));
 

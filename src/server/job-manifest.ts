@@ -1,5 +1,6 @@
 import { createHash } from "crypto";
 import { readFileSync } from "node:fs";
+import path from "node:path";
 import type * as k8s from "@kubernetes/client-node";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import {
@@ -112,6 +113,72 @@ const AGENT_CACHE_ENV_LEAVES: Record<string, string> = {
   TMPDIR: "tmp",
 };
 
+export type RunIsolationMode = "shared" | "isolated";
+
+export interface RunIsolationDescriptor {
+  mode: RunIsolationMode;
+  key: string | null;
+  keyHash: string | null;
+  workspaceRoot: string | null;
+  homeRoot: string | null;
+  cacheRoot: string | null;
+  sessionScope: string | null;
+}
+
+const SHARED_RUN_ISOLATION: RunIsolationDescriptor = {
+  mode: "shared",
+  key: null,
+  keyHash: null,
+  workspaceRoot: null,
+  homeRoot: null,
+  cacheRoot: null,
+  sessionScope: null,
+};
+
+function readObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function readDescriptorString(obj: Record<string, unknown>, key: string): string | null {
+  const value = obj[key];
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function isolationKeyHash(key: string): string {
+  return createHash("sha256").update(key).digest("hex").slice(0, 16);
+}
+
+export function readRunIsolationDescriptor(
+  ctx: AdapterExecutionContext,
+  config: Record<string, unknown> = parseObject(ctx.config),
+): RunIsolationDescriptor {
+  const context = (ctx.context ?? {}) as Record<string, unknown>;
+  const candidates = [
+    context.k8sRunIsolation,
+    context.runIsolation,
+    context.isolation,
+    config.k8sRunIsolation,
+    config.runIsolation,
+    config.isolation,
+  ];
+  const raw = candidates.map(readObject).find((candidate): candidate is Record<string, unknown> => Boolean(candidate));
+  if (!raw) return SHARED_RUN_ISOLATION;
+
+  const mode = readDescriptorString(raw, "isolationMode") ?? readDescriptorString(raw, "mode");
+  const key = readDescriptorString(raw, "isolationKey") ?? readDescriptorString(raw, "key");
+  if (mode !== "isolated" || !key) return SHARED_RUN_ISOLATION;
+
+  return {
+    mode: "isolated",
+    key,
+    keyHash: isolationKeyHash(key),
+    workspaceRoot: readDescriptorString(raw, "workspaceRoot"),
+    homeRoot: readDescriptorString(raw, "homeRoot"),
+    cacheRoot: readDescriptorString(raw, "cacheRoot"),
+    sessionScope: readDescriptorString(raw, "sessionScope"),
+  };
+}
+
 function assertSafePathComponent(field: string, value: string): void {
   // Allow alphanumeric, hyphens, and colons (UUIDs like "550e8400-e29b-41d4-a716-446655440000")
   if (!/^[a-zA-Z0-9-:]+$/.test(value)) {
@@ -121,6 +188,15 @@ function assertSafePathComponent(field: string, value: string): void {
 
 export function buildPodLogPath(companyId: string, agentId: string, runId: string): string {
   return `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/${runId}.pod.ndjson`;
+}
+
+function buildIsolatedPodLogPath(isolation: RunIsolationDescriptor, runId: string): string | null {
+  if (isolation.mode !== "isolated" || !isolation.cacheRoot) return null;
+  return path.posix.join(isolation.cacheRoot, "run-logs", `${runId}.pod.ndjson`);
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 export interface JobBuildInput {
@@ -170,6 +246,7 @@ export interface JobBuildInput {
    * target's environment config. Defaults to `/paperclip` when unset.
    */
   workspaceMountPath?: string;
+  isolation?: RunIsolationDescriptor;
 }
 
 export interface JobBuildResult {
@@ -247,6 +324,7 @@ function buildEnvVars(
   ctx: AdapterExecutionContext,
   selfPod: SelfPodInfo,
   config: Record<string, unknown>,
+  isolation: RunIsolationDescriptor,
 ): k8s.V1EnvVar[] {
   const { runId, agent, context } = ctx;
   const envConfig = parseObject(config.env);
@@ -355,13 +433,22 @@ function buildEnvVars(
   // leaving durable identity/session/config state on HOME. These cache keys are
   // reserved so stale adapterConfig.env overrides cannot move caches back onto
   // the shared PVC.
+  const cacheMountPath = isolation.cacheRoot ?? RUNTIME_CACHE_MOUNT_PATH;
   for (const [key, leaf] of Object.entries(AGENT_CACHE_ENV_LEAVES)) {
-    merged[key] = `${RUNTIME_CACHE_MOUNT_PATH}/${leaf}`;
+    merged[key] = `${cacheMountPath}/${leaf}`;
   }
 
   // OpenCode-specific: prevent project config pollution, always set after user overrides
   merged.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
-  merged.HOME = "/paperclip";
+  merged.HOME = isolation.homeRoot ?? "/paperclip";
+  if (isolation.mode === "isolated") {
+    merged.PAPERCLIP_K8S_ISOLATION_MODE = isolation.mode;
+    if (isolation.key) merged.PAPERCLIP_K8S_ISOLATION_KEY = isolation.key;
+    if (isolation.workspaceRoot) merged.PAPERCLIP_K8S_WORKSPACE_ROOT = isolation.workspaceRoot;
+    if (isolation.homeRoot) merged.PAPERCLIP_K8S_HOME_ROOT = isolation.homeRoot;
+    if (isolation.cacheRoot) merged.PAPERCLIP_K8S_CACHE_ROOT = isolation.cacheRoot;
+    if (isolation.sessionScope) merged.PAPERCLIP_K8S_SESSION_SCOPE = isolation.sessionScope;
+  }
 
   // Convert literal-value vars to V1EnvVar array
   const envVars: k8s.V1EnvVar[] = Object.entries(merged).map(([name, value]) => ({
@@ -525,6 +612,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const { runId, agent, runtime, config: rawConfig, context, onLog } = ctx;
   const warnLabel = (msg: string) => void onLog("stderr", msg).catch(() => {});
   const config = parseObject(rawConfig);
+  const isolation = input.isolation ?? readRunIsolationDescriptor(ctx, config);
 
   // Validate path components for log file safety
   const companyId = agent.companyId;
@@ -556,7 +644,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
   const configuredCwd = asString(config.cwd, "");
-  const workingDir = workspaceCwd || configuredCwd || "/paperclip";
+  const workingDir = isolation.workspaceRoot || workspaceCwd || configuredCwd || "/paperclip";
 
   // Job naming: slug + 6-char hash for collision resistance; strip trailing hyphens
   const agentSlug = sanitizeForK8sName(agent.id);
@@ -635,7 +723,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   if (extraArgs.length > 0) opencodeArgs.push(...extraArgs);
 
   // Build env vars
-  const envVars = buildEnvVars(ctx, selfPod, config);
+  const envVars = buildEnvVars(ctx, selfPod, config, isolation);
 
   // OPENCODE_DB: set when a DB volume is present (dedicated PVC, ephemeral
   // emptyDir, or workspace subPath)
@@ -720,7 +808,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     "paperclip.io/run-id": sanitizeLabelValue(runId, warnLabel),
     "paperclip.io/company-id": sanitizeLabelValue(agent.companyId, warnLabel),
     "paperclip.io/adapter-type": "opencode_k8s",
+    "paperclip.io/isolation-mode": isolation.mode,
   };
+  if (isolation.keyHash) labels["paperclip.io/isolation-key-hash"] = isolation.keyHash;
+  if (isolation.sessionScope) labels["paperclip.io/session-scope"] = sanitizeLabelValue(isolation.sessionScope, warnLabel);
   const taskId = asString(context.taskId ?? context.issueId, "").trim();
   if (taskId) labels["paperclip.io/task-id"] = sanitizeLabelValue(taskId, warnLabel);
   if (runtimeSessionId) labels["paperclip.io/session-id"] = sanitizeLabelValue(runtimeSessionId, warnLabel);
@@ -835,7 +926,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // accounts are exhausted, we still try opencode with whatever
   // credentials are on disk. Bound the preflight so a stuck Codex probe inside
   // ccrotate cannot block the Job before opencode starts.
-  const podLogPath = buildPodLogPath(companyId, agentId, runId);
+  const podLogPath = buildIsolatedPodLogPath(isolation, runId) ?? buildPodLogPath(companyId, agentId, runId);
   const opencodeArgsEscaped = opencodeArgs.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(" ");
   // Phase G.5: per-env credential pool. When `providers.openai.accounts`
   // is a non-empty string array (sourced from the resolved k8s execution
@@ -909,6 +1000,12 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     asString(config.instructionsRootPath, "").trim()
       ? `( [ -e docs ] || { __pcd="$(dirname "$(dirname "\${AGENT_HOME:-/nonexistent}")")/docs"; [ -d "$__pcd" ] && ln -sfn "$__pcd" docs; } ) 2>/dev/null || true; `
       : "";
+  const isolatedRuntimePrep = isolation.mode === "isolated"
+    ? `mkdir -p ${[isolation.homeRoot, isolation.cacheRoot, isolation.workspaceRoot, path.posix.dirname(podLogPath)]
+        .filter((p): p is string => Boolean(p))
+        .map(shellQuote)
+        .join(" ")} 2>/dev/null || true; `
+    : "";
   // opencode-db schema-compat guard (root-caused 2026-06-21, BLO follow-up).
   // The persistent opencode.db is keyed per (company, agent, taskKey) and reused
   // across runs (workspace_subpath mode). When the vendored opencode binary is
@@ -926,7 +1023,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const dbResetGuard = hasAgentDb
     ? `__ocdb=/opencode-db/opencode.db; __ocdir="$(dirname "$__ocdb")"; __ocver="$(opencode --version 2>/dev/null | head -n1)"; __ocprev="$(cat "$__ocdir/.opencode-version" 2>/dev/null || true)"; if [ -n "$__ocver" ] && [ -f "$__ocdb" ] && [ "$__ocver" != "$__ocprev" ]; then echo "[paperclip] opencode upgraded ('$__ocprev' -> '$__ocver'); resetting $__ocdb to avoid stale-schema crash" >&2; rm -f "$__ocdb" "$__ocdb-shm" "$__ocdb-wal" 2>/dev/null || true; else __ocbytes=0; for __ocf in "$__ocdb" "$__ocdb-wal" "$__ocdb-shm"; do if [ -f "$__ocf" ]; then __ocsz="$(wc -c < "$__ocf" 2>/dev/null || echo 0)"; __ocsz="\${__ocsz##* }"; __ocbytes=$((__ocbytes + \${__ocsz:-0})); fi; done; if [ -f "$__ocdb" ] && [ "$__ocbytes" -gt 524288000 ]; then echo "[paperclip] opencode DB $__ocbytes bytes exceeds 524288000; resetting $__ocdb to cap growth" >&2; rm -f "$__ocdb" "$__ocdb-shm" "$__ocdb-wal" 2>/dev/null || true; fi; fi; if [ -n "$__ocver" ]; then mkdir -p "$__ocdir" 2>/dev/null || true; printf '%s' "$__ocver" > "$__ocdir/.opencode-version" 2>/dev/null || true; fi; `
     : "";
-  const baseMainCommand = `set -o pipefail; ${ccrotateRefresh}; ${authBootstrap}; ${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${podLogPath}) && : > ${podLogPath} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${podLogPath}`;
+  const baseMainCommand = `set -o pipefail; ${isolatedRuntimePrep}${ccrotateRefresh}; ${authBootstrap}; ${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${shellQuote(podLogPath)}) && : > ${shellQuote(podLogPath)} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${shellQuote(podLogPath)}`;
   // Redirect Chrome's BrowserMetrics spool off the shared CephFS HOME to the
   // main container's per-pod runtime-cache emptyDir. The
   // agent-browser designer tool launches system Chrome with the default
