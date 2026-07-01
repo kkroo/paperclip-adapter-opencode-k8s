@@ -118,6 +118,13 @@ export function getConfigSchema(): AdapterConfigSchema {
         group: "Kubernetes",
       },
       {
+        key: "compactThreshold",
+        label: "Compact Threshold",
+        type: "number",
+        hint: "Override the model-aware auto-compact input-token threshold. Leave unset to compact at 50% of the model context window.",
+        group: "Kubernetes",
+      },
+      {
         key: "nodeSelector",
         label: "Node Selector",
         type: "textarea",
