@@ -24,7 +24,7 @@ export function createServerAdapter(): ServerAdapterModule {
     supportsInstructionsBundle: true,
     instructionsPathKey: "instructionsFilePath",
     requiresMaterializedRuntimeSkills: false,
-    sessionManagement: getAdapterSessionManagement("opencode_local") ?? {
+    sessionManagement: getAdapterSessionManagement("opencode_k8s") ?? {
       supportsSessionResume: true,
       nativeContextManagement: "unknown",
       defaultSessionCompaction: {

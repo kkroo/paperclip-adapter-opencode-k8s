@@ -85,6 +85,15 @@ describe("getConfigSchema", () => {
     }
   });
 
+  it("exposes compactThreshold as an optional number override", () => {
+    const schema = getConfigSchema();
+    const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "compactThreshold");
+    expect(field).toBeDefined();
+    expect(field!.type).toBe("number");
+    expect(field!.group).toBe("Kubernetes");
+    expect(field!.default).toBeUndefined();
+  });
+
   it("has agentDbMode as select with workspace_subpath default and dedicated_pvc as explicit opt-in", () => {
     const schema = getConfigSchema();
     const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "agentDbMode");

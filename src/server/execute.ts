@@ -25,6 +25,17 @@ const POLL_INTERVAL_MS = 2000;
 const MAX_CONSECUTIVE_READ_ERRORS = 5;
 const KEEPALIVE_INTERVAL_MS = 15_000;
 const LOG_EXIT_COMPLETION_GRACE_MS = parseInt(process.env.LOG_EXIT_COMPLETION_GRACE_MS ?? "30000", 10);
+const DEFAULT_COMPACT_THRESHOLD = 90_000;
+const COMPACT_WINDOW_FRACTION = 0.5;
+
+export const MODEL_CONTEXT_WINDOWS: Array<{ pattern: RegExp; tokens: number }> = [
+  { pattern: /^gpt-5\.5(?:-|$)/, tokens: 1_048_576 },
+  { pattern: /^gemini-2(?:\.|-|$)/, tokens: 1_048_576 },
+  { pattern: /^claude-(?:3|4)(?:\.|-|$)/, tokens: 200_000 },
+  { pattern: /^gpt-4(?:\.|-|$)/, tokens: 128_000 },
+  { pattern: /^gpt-5(?:\.|-|$)/, tokens: 128_000 },
+  { pattern: /^o[134](?:-|$)/, tokens: 128_000 },
+];
 
 type BudgetAgentSnapshot = {
   id: string;
@@ -34,6 +45,35 @@ type BudgetAgentSnapshot = {
   pauseReason?: string | null;
   pausedAt?: string | null;
 };
+
+function normalizeModelName(model: string | null | undefined): string {
+  return (model ?? "").trim().toLowerCase().split("/").pop() ?? "";
+}
+
+export function resolveModelContextWindow(model: string | null | undefined): number | null {
+  const normalized = normalizeModelName(model);
+  if (!normalized) return null;
+  return MODEL_CONTEXT_WINDOWS.find((entry) => entry.pattern.test(normalized))?.tokens ?? null;
+}
+
+export function resolveCompactThreshold(
+  model: string | null | undefined,
+  config: Record<string, unknown>,
+): { threshold: number; contextWindow: number | null; source: "config" | "model" | "default" } {
+  const configured = Math.floor(asNumber(config.compactThreshold, 0));
+  if (configured > 0) {
+    return { threshold: configured, contextWindow: null, source: "config" };
+  }
+  const contextWindow = resolveModelContextWindow(model);
+  if (contextWindow) {
+    return {
+      threshold: Math.floor(contextWindow * COMPACT_WINDOW_FRACTION),
+      contextWindow,
+      source: "model",
+    };
+  }
+  return { threshold: DEFAULT_COMPACT_THRESHOLD, contextWindow: null, source: "default" };
+}
 
 export function mergeEnvironmentConfig(
   adapterConfig: Record<string, unknown>,
@@ -1249,19 +1289,21 @@ async function streamAndAwaitJob(
   }
 
   // Proactive compaction gate. opencode reports `inputTokens` for the full
-  // payload sent to the model (system + history + new prompt). When that's
-  // close to the model's context window, compact the next wake before the
-  // session actually overflows. Threshold is conservative: 90k matches
-  // ~70% of a 128k window (the smallest mainstream window we ship — claude
-  // 3.5 sonnet is 200k, openai/gpt-5.5 is larger still, codex/gpt-4 is
-  // 128k). Better to compact a few wakes too early than burn a wake on a
-  // hard overflow.
-  const INPUT_TOKEN_COMPACT_THRESHOLD = 90_000;
-  const approachingWindow = parsed.usage.inputTokens > INPUT_TOKEN_COMPACT_THRESHOLD;
+  // payload sent to the model (system + history + new prompt). Compact the
+  // next wake at half of the model's known window, with an operator override
+  // and the historical 90k fallback for unknown models.
+  const compactThreshold = resolveCompactThreshold(model || null, config);
+  const approachingWindow = parsed.usage.inputTokens > compactThreshold.threshold;
   if (approachingWindow) {
+    const thresholdReason =
+      compactThreshold.source === "model" && compactThreshold.contextWindow
+        ? ` (50% of ${compactThreshold.contextWindow}-token model window)`
+        : compactThreshold.source === "config"
+          ? " (configured compactThreshold)"
+          : " (default fallback)";
     await onLog(
       "stdout",
-      `[paperclip] Input tokens ${parsed.usage.inputTokens} > threshold ${INPUT_TOKEN_COMPACT_THRESHOLD}; scheduling /compact for next wake.\n`,
+      `[paperclip] Input tokens ${parsed.usage.inputTokens} > threshold ${compactThreshold.threshold}${thresholdReason}; scheduling /compact for next wake.\n`,
     );
   }
 

@@ -1,6 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { execute, ensureAgentDbPvc, tailPodLogFile, mergeEnvironmentConfig, captureContainerLogTail } from "./execute.js";
+import {
+  execute,
+  ensureAgentDbPvc,
+  tailPodLogFile,
+  mergeEnvironmentConfig,
+  captureContainerLogTail,
+  resolveCompactThreshold,
+  resolveModelContextWindow,
+} from "./execute.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
 import { PassThrough } from "node:stream";
 import { buildJobManifest, buildPodLogPath } from "./job-manifest.js";
@@ -66,6 +74,41 @@ vi.mock("./job-manifest.js", () => ({
   ),
   LARGE_PROMPT_THRESHOLD_BYTES: 256 * 1024,
 }));
+
+describe("resolveCompactThreshold", () => {
+  it("uses half of the declared model window for gpt-5.5", () => {
+    expect(resolveModelContextWindow("openai/gpt-5.5")).toBe(1_048_576);
+    expect(resolveCompactThreshold("openai/gpt-5.5", {})).toEqual({
+      threshold: 524_288,
+      contextWindow: 1_048_576,
+      source: "model",
+    });
+  });
+
+  it("uses model-aware 128k thresholds for common compact-window models", () => {
+    expect(resolveCompactThreshold("openai/o4-mini", {})).toEqual({
+      threshold: 64_000,
+      contextWindow: 128_000,
+      source: "model",
+    });
+  });
+
+  it("allows an operator override", () => {
+    expect(resolveCompactThreshold("openai/gpt-5.5", { compactThreshold: 123_456 })).toEqual({
+      threshold: 123_456,
+      contextWindow: null,
+      source: "config",
+    });
+  });
+
+  it("keeps the historical fallback for unknown models", () => {
+    expect(resolveCompactThreshold("custom/model", {})).toEqual({
+      threshold: 90_000,
+      contextWindow: null,
+      source: "default",
+    });
+  });
+});
 
 // Prevent skill loading from reading real SKILL.md files during tests — the
 // real filesystem read delays timer registration and breaks fake-timer tests.
