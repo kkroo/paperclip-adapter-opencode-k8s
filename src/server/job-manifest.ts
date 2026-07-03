@@ -412,15 +412,48 @@ function buildEnvVars(
 // must carry it.
 const OPENAI_PROVIDER_CHUNK_TIMEOUT_MS = 240_000;
 
-function reasoningProviderConfig(): Record<string, unknown> {
-  return { openai: { options: { chunkTimeout: OPENAI_PROVIDER_CHUNK_TIMEOUT_MS } } };
+/**
+ * Per-agent client-session header for the Penstock gateway (org_penstock
+ * #accounts attribution). Every agent Job shares the one org API key, so
+ * without this the whole fleet melts into a single UNTAGGED bucket on the
+ * consumption dashboard. Penstock's client-session extraction gives
+ * `x-penstock-session` top precedence, so each agent's traffic groups under
+ * `agent:<name>` — one live entry per agent while it is actually flowing.
+ *
+ * Value hygiene mirrors the host's claude_local X-Anthropic-Agent-Id stamp:
+ * strip CR/LF (header injection) and bound the length.
+ */
+function penstockSessionHeaders(agent: { id: string; name?: string | null }): Record<string, string> {
+  const name = String(agent.name ?? "").replace(/[\r\n]/g, "").trim();
+  const id = String(agent.id ?? "").replace(/[\r\n]/g, "").trim();
+  const label = (name || id).slice(0, 128);
+  return { "x-penstock-session": `agent:${label}` };
 }
 
-function buildRuntimeConfigJson(config: Record<string, unknown>): string | null {
+/**
+ * Provider options for BOTH opencode config paths (opencode does not merge
+ * config sources, so whichever file wins must carry the full set):
+ *  - openai.chunkTimeout: generous inter-chunk idle window for reasoning models
+ *  - per-provider headers: per-agent Penstock session identity (see
+ *    penstockSessionHeaders) — opencode passes `options` to the AI SDK's
+ *    provider factory, which merges `headers` into every request.
+ */
+function providerConfig(agent: { id: string; name?: string | null }): Record<string, unknown> {
+  const headers = penstockSessionHeaders(agent);
+  return {
+    anthropic: { options: { headers } },
+    openai: { options: { chunkTimeout: OPENAI_PROVIDER_CHUNK_TIMEOUT_MS, headers } },
+  };
+}
+
+function buildRuntimeConfigJson(
+  config: Record<string, unknown>,
+  agent: { id: string; name?: string | null },
+): string | null {
   const skipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
   const runtime: Record<string, unknown> = {
     disabled_providers: ["opencode"],
-    provider: reasoningProviderConfig(),
+    provider: providerConfig(agent),
   };
   if (skipPermissions) {
     runtime.permission = { external_directory: "allow" };
@@ -685,9 +718,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
           // the auth.json that buildOpencodeAuthBootstrapShell writes
           // from ~/.codex/auth.json.
           disabled_providers: ["opencode"],
-          // Generous inter-chunk idle window for slow reasoning streams; see
-          // reasoningProviderConfig / OPENAI_PROVIDER_CHUNK_TIMEOUT_MS.
-          provider: reasoningProviderConfig(),
+          // Chunk timeout + per-agent Penstock session identity; see
+          // providerConfig / OPENAI_PROVIDER_CHUNK_TIMEOUT_MS.
+          provider: providerConfig(agent),
           mcp: opencodeMcpSection,
         })
       : null;
@@ -696,7 +729,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   }
 
   // Runtime config for permissions
-  const runtimeConfigJson = buildRuntimeConfigJson(config);
+  const runtimeConfigJson = buildRuntimeConfigJson(config, agent);
 
   // Resource defaults
   const resourceRequests = parseObject(resources.requests);

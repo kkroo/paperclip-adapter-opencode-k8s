@@ -1204,6 +1204,76 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       };
       expect(parsed.provider?.openai?.options?.chunkTimeout).toBe(240_000);
     });
+    // Per-agent Penstock attribution: every agent Job shares the one org API
+    // key, so without a per-agent client-session header the whole fleet melts
+    // into a single UNTAGGED bucket on the org_penstock consumption dashboard.
+    type ProviderHeaderShape = {
+      provider?: {
+        anthropic?: { options?: { headers?: Record<string, string> } };
+        openai?: { options?: { headers?: Record<string, string>; chunkTimeout?: number } };
+      };
+    };
+
+    it("stamps x-penstock-session: agent:<name> on both providers (default path)", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > ~\/\.config\/opencode\/opencode\.json/);
+      expect(match).toBeTruthy();
+      const parsed = JSON.parse(match![1].replace(/'\\''/g, "'")) as ProviderHeaderShape;
+      expect(parsed.provider?.anthropic?.options?.headers).toEqual({
+        "x-penstock-session": "agent:Test Agent",
+      });
+      expect(parsed.provider?.openai?.options?.headers).toEqual({
+        "x-penstock-session": "agent:Test Agent",
+      });
+      // The identity headers must not displace the reasoning chunkTimeout.
+      expect(parsed.provider?.openai?.options?.chunkTimeout).toBe(240_000);
+    });
+
+    it("stamps x-penstock-session on the MCP-path opencode.json too", () => {
+      const ctx: JobBuildInput["ctx"] = {
+        ...mockCtx,
+        config: {
+          mcpServers: {
+            paperclip: { command: "node", args: ["/app/packages/mcp-server/dist/stdio.js"] },
+          },
+        },
+      };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      const init = result.job.spec!.template.spec!.initContainers![0]!;
+      const cfgEnv = (init.env ?? []).find((e) => e.name === "OPENCODE_CONFIG_JSON");
+      const parsed = JSON.parse(cfgEnv!.value!) as ProviderHeaderShape;
+      expect(parsed.provider?.anthropic?.options?.headers?.["x-penstock-session"]).toBe(
+        "agent:Test Agent",
+      );
+    });
+
+    it("falls back to the agent id and strips header-injection characters from the name", () => {
+      const ctx: JobBuildInput["ctx"] = {
+        ...mockCtx,
+        agent: { ...mockCtx.agent, id: "agent-xyz", name: "evil\r\nX-Injected: 1" },
+      };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > ~\/\.config\/opencode\/opencode\.json/);
+      const parsed = JSON.parse(match![1].replace(/'\\''/g, "'")) as ProviderHeaderShape;
+      // CR/LF stripped — the value stays a single header line.
+      expect(parsed.provider?.anthropic?.options?.headers?.["x-penstock-session"]).toBe(
+        "agent:evilX-Injected: 1",
+      );
+
+      const noName: JobBuildInput["ctx"] = {
+        ...mockCtx,
+        agent: { ...mockCtx.agent, id: "agent-noname", name: "" },
+      };
+      const result2 = buildJobManifest({ ctx: noName, selfPod: mockSelfPod });
+      const cmd2 = result2.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const match2 = cmd2.match(/echo '([^']+(?:'\\''[^']*)*)' > ~\/\.config\/opencode\/opencode\.json/);
+      const parsed2 = JSON.parse(match2![1].replace(/'\\''/g, "'")) as ProviderHeaderShape;
+      expect(parsed2.provider?.anthropic?.options?.headers?.["x-penstock-session"]).toBe(
+        "agent:agent-noname",
+      );
+    });
   });
 
   describe("paperclipTaskMarkdown surfacing", () => {
