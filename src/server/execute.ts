@@ -1655,7 +1655,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const moduleDir = import.meta.dirname;
     const paperclipSkillsHome = "/paperclip/.claude/skills";
     const availableEntries = await readPaperclipRuntimeSkillEntries(config, moduleDir, [paperclipSkillsHome]);
-    const desiredSkillKeys = resolvePaperclipDesiredSkillNames(config, availableEntries);
+    // Required-by-Paperclip skills bundle unconditionally: the desired-skill
+    // preference is a company/operator opt-in list, but a host-marked required
+    // entry must reach the pod regardless (the published adapter-utils type
+    // does not declare the flag yet — read it defensively).
+    const requiredSkillKeys = availableEntries
+      .filter((entry) => Boolean((entry as { required?: boolean }).required))
+      .map((entry) => entry.key);
+    const desiredSkillKeys = Array.from(
+      new Set([...resolvePaperclipDesiredSkillNames(config, availableEntries), ...requiredSkillKeys]),
+    );
     const skillTexts: string[] = [];
     for (const key of desiredSkillKeys) {
       const entry = availableEntries.find((e) => e.key === key);
