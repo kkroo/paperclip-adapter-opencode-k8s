@@ -576,11 +576,11 @@ function buildRuntimeConfigJson(
  * token expires.
  */
 function buildOpencodeAuthBootstrapShell(): string {
-  return `mkdir -p ~/.local/share/opencode && node -e 'const fs=require("fs"),p=require("path"),H=process.env.HOME||".";try{const c=JSON.parse(fs.readFileSync(p.join(H,".codex","auth.json"),"utf8"));if(c.auth_mode!=="chatgpt"||!c.tokens||!c.tokens.access_token||!c.tokens.refresh_token)process.exit(0);let exp=Date.now()+30*60*1000;try{const part=c.tokens.id_token.split(".")[1];const pad="=".repeat((4-part.length%4)%4);const payload=JSON.parse(Buffer.from((part+pad).replace(/-/g,"+").replace(/_/g,"/"),"base64").toString());if(payload.exp)exp=payload.exp*1000;}catch(e){}const out={openai:{type:"oauth",access:c.tokens.access_token,refresh:c.tokens.refresh_token,expires:exp,accountId:c.tokens.account_id||null}};fs.writeFileSync(p.join(H,".local","share","opencode","auth.json"),JSON.stringify(out));}catch(e){console.error("[opencode-auth-bootstrap] skipped:",e.message);}' || true`;
+  return `mkdir -p "\${XDG_DATA_HOME:-$HOME/.local/share}/opencode" && node -e 'const fs=require("fs"),p=require("path"),H=process.env.HOME||".",D=process.env.XDG_DATA_HOME||p.join(H,".local","share");try{const c=JSON.parse(fs.readFileSync(p.join(H,".codex","auth.json"),"utf8"));if(c.auth_mode!=="chatgpt"||!c.tokens||!c.tokens.access_token||!c.tokens.refresh_token)process.exit(0);let exp=Date.now()+30*60*1000;try{const part=c.tokens.id_token.split(".")[1];const pad="=".repeat((4-part.length%4)%4);const payload=JSON.parse(Buffer.from((part+pad).replace(/-/g,"+").replace(/_/g,"/"),"base64").toString());if(payload.exp)exp=payload.exp*1000;}catch(e){}const out={openai:{type:"oauth",access:c.tokens.access_token,refresh:c.tokens.refresh_token,expires:exp,accountId:c.tokens.account_id||null}};fs.writeFileSync(p.join(D,"opencode","auth.json"),JSON.stringify(out));}catch(e){console.error("[opencode-auth-bootstrap] skipped:",e.message);}' || true`;
 }
 
 function buildOpencodeApiKeyAuthCleanupShell(): string {
-  return `rm -f ~/.local/share/opencode/auth.json ~/.local/share/opencode/account.json 2>/dev/null || true`;
+  return `rm -f "\${XDG_DATA_HOME:-$HOME/.local/share}/opencode/auth.json" "\${XDG_DATA_HOME:-$HOME/.local/share}/opencode/account.json" 2>/dev/null || true`;
 }
 
 function hasEnvVarValue(envVars: k8s.V1EnvVar[], name: string): boolean {
@@ -991,7 +991,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     ? buildOpencodeApiKeyAuthCleanupShell()
     : buildOpencodeAuthBootstrapShell();
   const configSetup = runtimeConfigJson
-    ? `mkdir -p ~/.config/opencode && echo '${runtimeConfigJson.replace(/'/g, "'\\''")}' > ~/.config/opencode/opencode.json && `
+    ? `mkdir -p "\${XDG_CONFIG_HOME:-$HOME/.config}/opencode" && echo '${runtimeConfigJson.replace(/'/g, "'\\''")}' > "\${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json" && `
     : "";
   // `set -o pipefail` so an opencode binary crash surfaces as a non-zero
   // shell exit code instead of being masked by tee's exit code. Mirrors
