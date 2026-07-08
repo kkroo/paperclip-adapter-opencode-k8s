@@ -1200,7 +1200,7 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
       const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
       const ccrotateIdx = cmd.indexOf("timeout 30s ccrotate next --yes --target codex");
-      const bootstrapIdx = cmd.indexOf(".local/share/opencode");
+      const bootstrapIdx = cmd.indexOf("XDG_DATA_HOME");
       const opencodeIdx = cmd.indexOf("| opencode ");
       expect(ccrotateIdx).toBeGreaterThan(-1);
       expect(bootstrapIdx).toBeGreaterThan(ccrotateIdx);
@@ -1225,7 +1225,8 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       // Reads codex auth + checks chatgpt mode + writes opencode auth.json
       expect(cmd).toContain('".codex","auth.json"');
       expect(cmd).toContain('auth_mode!=="chatgpt"');
-      expect(cmd).toContain('"share","opencode","auth.json"');
+      expect(cmd).toContain('D=process.env.XDG_DATA_HOME||p.join(H,".local","share")');
+      expect(cmd).toContain('p.join(D,"opencode","auth.json")');
       // Output keys: openai provider, oauth type, expiry from id_token exp claim
       expect(cmd).toContain('openai:{type:"oauth"');
       expect(cmd).toContain("payload.exp");
@@ -1248,8 +1249,8 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
 
       expect(cmd).not.toContain('".codex","auth.json"');
       expect(cmd).not.toContain('auth_mode!=="chatgpt"');
-      expect(cmd).toContain("rm -f ~/.local/share/opencode/auth.json ~/.local/share/opencode/account.json");
-      expect(cmd.indexOf("rm -f ~/.local/share/opencode/auth.json")).toBeLessThan(
+      expect(cmd).toContain('rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/opencode/auth.json" "${XDG_DATA_HOME:-$HOME/.local/share}/opencode/account.json"');
+      expect(cmd.indexOf('rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/opencode/auth.json"')).toBeLessThan(
         cmd.indexOf("cat /tmp/prompt/prompt.txt"),
       );
     });
@@ -1260,8 +1261,8 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
       const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
       // The default-path config is inlined into the main command via
-      // `echo '...' > ~/.config/opencode/opencode.json`. Extract and parse.
-      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > ~\/\.config\/opencode\/opencode\.json/);
+      // `echo '...' > "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json"`. Extract and parse.
+      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > \S*opencode\/opencode\.json/);
       expect(match).toBeTruthy();
       const parsed = JSON.parse(match![1].replace(/'\\''/g, "'")) as { disabled_providers?: string[] };
       expect(parsed.disabled_providers).toEqual(["opencode"]);
@@ -1277,7 +1278,7 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
     it("sets provider.openai.options.chunkTimeout on the default (no-MCP) opencode.json", () => {
       const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
       const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
-      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > ~\/\.config\/opencode\/opencode\.json/);
+      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > \S*opencode\/opencode\.json/);
       expect(match).toBeTruthy();
       const parsed = JSON.parse(match![1].replace(/'\\''/g, "'")) as {
         provider?: { openai?: { options?: { chunkTimeout?: number } } };
@@ -1316,7 +1317,7 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
     it("stamps x-penstock-session: agent:<name> on both providers (default path)", () => {
       const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
       const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
-      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > ~\/\.config\/opencode\/opencode\.json/);
+      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > \S*opencode\/opencode\.json/);
       expect(match).toBeTruthy();
       const parsed = JSON.parse(match![1].replace(/'\\''/g, "'")) as ProviderHeaderShape;
       expect(parsed.provider?.anthropic?.options?.headers).toEqual({
@@ -1354,7 +1355,7 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       };
       const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
       const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
-      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > ~\/\.config\/opencode\/opencode\.json/);
+      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > \S*opencode\/opencode\.json/);
       const parsed = JSON.parse(match![1].replace(/'\\''/g, "'")) as ProviderHeaderShape;
       // CR/LF stripped — the value stays a single header line.
       expect(parsed.provider?.anthropic?.options?.headers?.["x-penstock-session"]).toBe(
@@ -1367,7 +1368,7 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       };
       const result2 = buildJobManifest({ ctx: noName, selfPod: mockSelfPod });
       const cmd2 = result2.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
-      const match2 = cmd2.match(/echo '([^']+(?:'\\''[^']*)*)' > ~\/\.config\/opencode\/opencode\.json/);
+      const match2 = cmd2.match(/echo '([^']+(?:'\\''[^']*)*)' > \S*opencode\/opencode\.json/);
       const parsed2 = JSON.parse(match2![1].replace(/'\\''/g, "'")) as ProviderHeaderShape;
       expect(parsed2.provider?.anthropic?.options?.headers?.["x-penstock-session"]).toBe(
         "agent:agent-noname",
