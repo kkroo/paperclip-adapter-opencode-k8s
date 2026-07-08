@@ -104,6 +104,17 @@ const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
 const RUNTIME_CACHE_SIZE_LIMIT = "20Gi";
 const AGENT_CACHE_ENV_LEAVES: Record<string, string> = {
   XDG_CACHE_HOME: "xdg",
+  // opencode (Bun) is XDG-driven and mkdir's its config/data/state dirs at
+  // boot. With only XDG_CACHE_HOME reserved, the other three were unset and
+  // opencode fell back to an unwritable path (`/runtime-config`), crashing
+  // every run with `EACCES: permission denied, mkdir '/runtime-config'` before
+  // any model call (BLO-14003). Reserve all four onto the writable
+  // runtime-cache emptyDir. These leaves match the values that were applied as
+  // a per-agent adapterConfig.env workaround and verified booting clean, so
+  // shipping this makes those overrides redundant.
+  XDG_CONFIG_HOME: "xdg/config",
+  XDG_DATA_HOME: "xdg/data",
+  XDG_STATE_HOME: "xdg/state",
   GOCACHE: "go-build",
   GOMODCACHE: "gomod",
   npm_config_cache: "npm",
@@ -429,10 +440,11 @@ function buildEnvVars(
   }
 
   // Agent Jobs mount their own runtime-cache emptyDir. Keep regenerable build,
-  // package, browser, and temp caches off the shared /paperclip PVC while
-  // leaving durable identity/session/config state on HOME. These cache keys are
-  // reserved so stale adapterConfig.env overrides cannot move caches back onto
-  // the shared PVC.
+  // package, browser, temp caches AND opencode's XDG config/data/state off the
+  // shared /paperclip PVC — opencode regenerates all of these per run, and its
+  // XDG dirs must land somewhere writable or the process crashes at boot
+  // (BLO-14003). These keys are reserved so stale adapterConfig.env overrides
+  // cannot move them back onto the shared PVC.
   const cacheMountPath = isolation.cacheRoot ?? RUNTIME_CACHE_MOUNT_PATH;
   for (const [key, leaf] of Object.entries(AGENT_CACHE_ENV_LEAVES)) {
     merged[key] = `${cacheMountPath}/${leaf}`;

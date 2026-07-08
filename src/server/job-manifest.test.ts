@@ -337,6 +337,42 @@ describe("buildJobManifest", () => {
     expect(val("PLAYWRIGHT_BROWSERS_PATH")).toBe("/runtime-cache/ms-playwright");
   });
 
+  it("reserves opencode XDG config/data/state onto runtime-cache so it can't crash at boot (BLO-14003)", () => {
+    // opencode mkdir's its XDG config/data/state dirs at startup; if they land
+    // on an unwritable path it dies with EACCES before any model call. Reserve
+    // them onto the writable runtime-cache emptyDir, matching the values that
+    // were applied as a per-agent env workaround and verified booting clean.
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    const val = (name: string) => env.find((e) => e.name === name)?.value;
+
+    expect(val("XDG_CONFIG_HOME")).toBe("/runtime-cache/xdg/config");
+    expect(val("XDG_DATA_HOME")).toBe("/runtime-cache/xdg/data");
+    expect(val("XDG_STATE_HOME")).toBe("/runtime-cache/xdg/state");
+    // still under the same writable mount as the cache leaf
+    expect(val("XDG_CACHE_HOME")).toBe("/runtime-cache/xdg");
+  });
+
+  it("forces opencode XDG dirs onto runtime-cache even when adapterConfig.env sets stale unwritable paths (BLO-14003)", () => {
+    const ctx = {
+      ...mockCtx,
+      config: {
+        env: {
+          XDG_CONFIG_HOME: "/runtime-config",
+          XDG_DATA_HOME: "/runtime-data",
+          XDG_STATE_HOME: "/runtime-state",
+        },
+      },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    const val = (name: string) => env.find((e) => e.name === name)?.value;
+
+    expect(val("XDG_CONFIG_HOME")).toBe("/runtime-cache/xdg/config");
+    expect(val("XDG_DATA_HOME")).toBe("/runtime-cache/xdg/data");
+    expect(val("XDG_STATE_HOME")).toBe("/runtime-cache/xdg/state");
+  });
+
   it("keeps reserved cache envs on runtime-cache even when adapterConfig.env has stale PVC overrides", () => {
     const ctx = {
       ...mockCtx,
