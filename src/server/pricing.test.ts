@@ -13,6 +13,24 @@ describe("computeOpenAICompatibleCost", () => {
     expect(cost).toBeCloseTo(0.65, 4);
   });
 
+  it("prices GPT-5.6 Codex variants by their public tiers", () => {
+    expect(OPENAI_PRICING_USD_PER_MTOK["openai/gpt-5.6-sol"]).toEqual({
+      input: 5.0,
+      cachedInput: 0.5,
+      output: 30.0,
+    });
+    expect(OPENAI_PRICING_USD_PER_MTOK["openai/gpt-5.6-terra"]).toEqual({
+      input: 2.5,
+      cachedInput: 0.25,
+      output: 15.0,
+    });
+    expect(OPENAI_PRICING_USD_PER_MTOK["openai/gpt-5.6-luna"]).toEqual({
+      input: 1.0,
+      cachedInput: 0.1,
+      output: 6.0,
+    });
+  });
+
   it("returns a positive cost for a known model with non-zero usage", () => {
     const cost = computeOpenAICompatibleCost("openai/gpt-5.5", {
       inputTokens: 100_000,
