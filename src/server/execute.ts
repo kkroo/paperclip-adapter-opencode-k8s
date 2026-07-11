@@ -29,6 +29,7 @@ const DEFAULT_COMPACT_THRESHOLD = 90_000;
 const COMPACT_WINDOW_FRACTION = 0.5;
 
 export const MODEL_CONTEXT_WINDOWS: Array<{ pattern: RegExp; tokens: number }> = [
+  { pattern: /^gpt-5\.6(?:-|$)/, tokens: 1_048_576 },
   { pattern: /^gpt-5\.5(?:-|$)/, tokens: 1_048_576 },
   { pattern: /^gemini-2(?:\.|-|$)/, tokens: 1_048_576 },
   { pattern: /^claude-(?:3|4)(?:\.|-|$)/, tokens: 200_000 },

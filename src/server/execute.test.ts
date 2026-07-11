@@ -109,6 +109,15 @@ vi.mock("./job-manifest.js", async () => {
 });
 
 describe("resolveCompactThreshold", () => {
+  it("uses half of the declared model window for gpt-5.6-sol", () => {
+    expect(resolveModelContextWindow("openai/gpt-5.6-sol")).toBe(1_048_576);
+    expect(resolveCompactThreshold("openai/gpt-5.6-sol", {})).toEqual({
+      threshold: 524_288,
+      contextWindow: 1_048_576,
+      source: "model",
+    });
+  });
+
   it("uses half of the declared model window for gpt-5.5", () => {
     expect(resolveModelContextWindow("openai/gpt-5.5")).toBe(1_048_576);
     expect(resolveCompactThreshold("openai/gpt-5.5", {})).toEqual({
