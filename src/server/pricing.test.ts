@@ -2,6 +2,17 @@ import { describe, it, expect } from "vitest";
 import { computeOpenAICompatibleCost, OPENAI_PRICING_USD_PER_MTOK } from "./pricing.js";
 
 describe("computeOpenAICompatibleCost", () => {
+  it("returns a positive cost for gpt-5.6-sol with non-zero usage", () => {
+    const cost = computeOpenAICompatibleCost("openai/gpt-5.6-sol", {
+      inputTokens: 100_000,
+      cachedInputTokens: 0,
+      outputTokens: 5_000,
+    });
+    // 100k input @ $5/M + 5k output @ $30/M = $0.50 + $0.15 = $0.65
+    expect(cost).not.toBeNull();
+    expect(cost).toBeCloseTo(0.65, 4);
+  });
+
   it("returns a positive cost for a known model with non-zero usage", () => {
     const cost = computeOpenAICompatibleCost("openai/gpt-5.5", {
       inputTokens: 100_000,
