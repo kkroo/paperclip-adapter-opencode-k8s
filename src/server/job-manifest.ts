@@ -495,6 +495,17 @@ function buildEnvVars(
  * `disabled_providers: ["opencode"]` makes the failure loud (opencode exits
  * immediately if no other provider is configured) instead of silently
  * falling through to zen.
+ *
+ * 3. `snapshot: false` — opencode's turn-zero workspace snapshot runs
+ *    `git add --all --sparse` against the whole work tree into a shadow
+ *    git store under XDG_DATA_HOME before the first LLM turn starts. Agent
+ *    workspace dirs accumulate months of checkouts/build trees, so on a
+ *    cold runtime-cache (snapshot store keyed per content hash) this can
+ *    peg a core in uninterruptible disk I/O for 20-30+ minutes with zero
+ *    opencode output — indistinguishable from a hang from the harness's
+ *    point of view. The harness already has its own git/PR discipline for
+ *    every task; opencode's in-session revert-via-snapshot UI is unused
+ *    here, so the snapshot is pure overhead. See BLO-14758.
  */
 // Reasoning models (notably gpt-5.5) routinely pause for long stretches between
 // streamed SSE chunks while thinking. OpenCode's default inter-chunk idle guard
@@ -553,6 +564,7 @@ function buildRuntimeConfigJson(
   const runtime: Record<string, unknown> = {
     disabled_providers: ["opencode"],
     provider: providerConfig(agent),
+    snapshot: false,
   };
   if (skipPermissions) {
     runtime.permission = { external_directory: "allow" };
@@ -818,6 +830,11 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
           // the auth.json that buildOpencodeAuthBootstrapShell writes
           // from ~/.codex/auth.json.
           disabled_providers: ["opencode"],
+          // Skip the turn-zero workspace `git add --all --sparse` snapshot;
+          // see buildRuntimeConfigJson's snapshot:false comment (BLO-14758).
+          // Both config paths must carry it — opencode does not merge
+          // config sources.
+          snapshot: false,
           // Chunk timeout + per-agent Penstock session identity; see
           // providerConfig / OPENAI_PROVIDER_CHUNK_TIMEOUT_MS.
           provider: providerConfig(agent),
