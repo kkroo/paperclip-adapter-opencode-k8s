@@ -136,21 +136,15 @@ describe("buildJobManifest", () => {
     expect(container?.image).toBe("my-custom-image:v1.2.3");
   });
 
-  it("sets fsGroupChangePolicy to OnRootMismatch", () => {
-    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
-
-    const securityContext = result.job.spec?.template?.spec?.securityContext;
-    expect(securityContext?.fsGroupChangePolicy).toBe("OnRootMismatch");
-  });
-
-  it("sets runAsNonRoot and runAsUser 1000", () => {
+  it("sets the non-root uid and primary gid without requesting volume ownership changes", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
 
     const securityContext = result.job.spec?.template?.spec?.securityContext;
     expect(securityContext?.runAsNonRoot).toBe(true);
     expect(securityContext?.runAsUser).toBe(1000);
     expect(securityContext?.runAsGroup).toBe(1000);
-    expect(securityContext?.fsGroup).toBe(1000);
+    expect(securityContext?.fsGroup).toBeUndefined();
+    expect(securityContext?.fsGroupChangePolicy).toBeUndefined();
   });
 
   it("maps labels to job metadata", () => {
@@ -949,6 +943,9 @@ describe("buildJobManifest — volume wiring branches", () => {
     expect(volumes.find((v) => v.name === "data")?.persistentVolumeClaim?.claimName).toBe("paperclip-data");
     const mounts = result.job.spec?.template.spec?.containers[0]?.volumeMounts ?? [];
     expect(mounts.find((m) => m.name === "data")?.mountPath).toBe("/paperclip");
+    const securityContext = result.job.spec?.template.spec?.securityContext;
+    expect(securityContext?.fsGroup).toBeUndefined();
+    expect(securityContext?.fsGroupChangePolicy).toBeUndefined();
   });
 
   it("mounts the runtime-cache emptyDir at /runtime-cache for agent caches", () => {
