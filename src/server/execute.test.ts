@@ -210,6 +210,7 @@ function makeCtx(configOverrides: Record<string, unknown> = {}, contextOverrides
       ...contextOverrides,
     },
     onLog: vi.fn().mockResolvedValue(undefined),
+    onExternalRuntimeLaunched: vi.fn().mockResolvedValue(undefined),
   } as unknown as AdapterExecutionContext;
 }
 
@@ -1018,6 +1019,34 @@ describe("execute — happy path", () => {
 
     expect(onMeta).toHaveBeenCalledWith(
       expect.objectContaining({ adapterType: "opencode_k8s" }),
+    );
+  });
+
+  it("acknowledges the created Job identity before continuing", async () => {
+    const onExternalRuntimeLaunched = vi.fn().mockResolvedValue(undefined);
+    const ctx = { ...makeCtx(), onExternalRuntimeLaunched } as unknown as AdapterExecutionContext;
+
+    await execute(ctx);
+
+    expect(onExternalRuntimeLaunched).toHaveBeenCalledWith({
+      jobName: JOB_NAME,
+      jobUid: "test-job-uid",
+    });
+  });
+
+  it("deletes the Job when launch identity cannot be acknowledged", async () => {
+    const batchApi = makeBatchApi();
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+    const ctx = {
+      ...makeCtx(),
+      onExternalRuntimeLaunched: vi.fn().mockRejectedValue(new Error("reservation released")),
+    } as unknown as AdapterExecutionContext;
+
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("k8s_job_identity_unacknowledged");
+    expect(batchApi.deleteNamespacedJob).toHaveBeenCalledWith(
+      expect.objectContaining({ name: JOB_NAME, namespace: NAMESPACE }),
     );
   });
 });
