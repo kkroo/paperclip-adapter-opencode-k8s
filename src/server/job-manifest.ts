@@ -104,17 +104,6 @@ const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
 const RUNTIME_CACHE_SIZE_LIMIT = "20Gi";
 const AGENT_CACHE_ENV_LEAVES: Record<string, string> = {
   XDG_CACHE_HOME: "xdg",
-  // opencode (Bun) is XDG-driven and mkdir's its config/data/state dirs at
-  // boot. With only XDG_CACHE_HOME reserved, the other three were unset and
-  // opencode fell back to an unwritable path (`/runtime-config`), crashing
-  // every run with `EACCES: permission denied, mkdir '/runtime-config'` before
-  // any model call (BLO-14003). Reserve all four onto the writable
-  // runtime-cache emptyDir. These leaves match the values that were applied as
-  // a per-agent adapterConfig.env workaround and verified booting clean, so
-  // shipping this makes those overrides redundant.
-  XDG_CONFIG_HOME: "xdg/config",
-  XDG_DATA_HOME: "xdg/data",
-  XDG_STATE_HOME: "xdg/state",
   GOCACHE: "go-build",
   GOMODCACHE: "gomod",
   npm_config_cache: "npm",
@@ -124,26 +113,49 @@ const AGENT_CACHE_ENV_LEAVES: Record<string, string> = {
   TMPDIR: "tmp",
 };
 
-export type RunIsolationMode = "shared" | "isolated";
+const AGENT_SESSION_ENV_LEAVES: Record<string, string> = {
+  XDG_CONFIG_HOME: "xdg/config",
+  XDG_DATA_HOME: "xdg/data",
+  XDG_STATE_HOME: "xdg/state",
+};
+
+export type RunIsolationMode = "shared" | "run" | "workspace" | "isolated";
+type IsolationStorage = "ephemeral" | "persistent";
 
 export interface RunIsolationDescriptor {
   mode: RunIsolationMode;
+  source: "runtime" | "legacy" | "shared";
   key: string | null;
   keyHash: string | null;
   workspaceRoot: string | null;
   homeRoot: string | null;
+  sessionRoot: string | null;
   cacheRoot: string | null;
   sessionScope: string | null;
+  storage: {
+    workspace: IsolationStorage;
+    home: IsolationStorage;
+    session: IsolationStorage;
+    cache: IsolationStorage;
+  };
 }
 
 const SHARED_RUN_ISOLATION: RunIsolationDescriptor = {
   mode: "shared",
+  source: "shared",
   key: null,
   keyHash: null,
   workspaceRoot: null,
   homeRoot: null,
+  sessionRoot: null,
   cacheRoot: null,
   sessionScope: null,
+  storage: {
+    workspace: "persistent",
+    home: "persistent",
+    session: "ephemeral",
+    cache: "ephemeral",
+  },
 };
 
 function readObject(value: unknown): Record<string, unknown> | null {
@@ -159,10 +171,65 @@ function isolationKeyHash(key: string): string {
   return createHash("sha256").update(key).digest("hex").slice(0, 16);
 }
 
+function readStorageValue(raw: Record<string, unknown>, field: string): IsolationStorage {
+  const value = readDescriptorString(raw, field);
+  if (value !== "ephemeral" && value !== "persistent") {
+    throw new Error(`runtime isolation descriptor has invalid storage.${field}`);
+  }
+  return value;
+}
+
+function readRuntimeIsolationDescriptor(value: unknown): RunIsolationDescriptor | null {
+  if (value === null || value === undefined) return null;
+  const raw = readObject(value);
+  if (!raw) throw new Error("runtime isolation descriptor must be an object");
+  const mode = readDescriptorString(raw, "isolationMode");
+  if (mode === "shared" || !mode) return { ...SHARED_RUN_ISOLATION, source: "runtime" };
+  if (mode !== "run" && mode !== "workspace") {
+    return { ...SHARED_RUN_ISOLATION, source: "runtime" };
+  }
+  const key = readDescriptorString(raw, "isolationKey");
+  const workspaceRoot = readDescriptorString(raw, "workspaceRoot");
+  const homeRoot = readDescriptorString(raw, "homeRoot");
+  const sessionRoot = readDescriptorString(raw, "sessionRoot");
+  const cacheRoot = readDescriptorString(raw, "cacheRoot");
+  const storage = readObject(raw.storage);
+  if (!key || !workspaceRoot || !homeRoot || !sessionRoot || !cacheRoot || !storage) {
+    throw new Error(`runtime ${mode} isolation descriptor is incomplete`);
+  }
+  for (const [field, candidate] of Object.entries({ workspaceRoot, homeRoot, sessionRoot, cacheRoot })) {
+    if (!path.posix.isAbsolute(candidate)) {
+      throw new Error(`runtime isolation descriptor ${field} must be absolute`);
+    }
+  }
+  return {
+    mode,
+    source: "runtime",
+    key,
+    keyHash: isolationKeyHash(key),
+    workspaceRoot,
+    homeRoot,
+    sessionRoot,
+    cacheRoot,
+    sessionScope: readDescriptorString(readObject(raw.sessionScope) ?? {}, "isolationKey") ?? key,
+    storage: {
+      workspace: readStorageValue(storage, "workspace"),
+      home: readStorageValue(storage, "home"),
+      session: readStorageValue(storage, "session"),
+      cache: readStorageValue(storage, "cache"),
+    },
+  };
+}
+
 export function readRunIsolationDescriptor(
   ctx: AdapterExecutionContext,
   config: Record<string, unknown> = parseObject(ctx.config),
 ): RunIsolationDescriptor {
+  const runtimeIsolation = readRuntimeIsolationDescriptor(
+    (ctx.runtime as unknown as { isolation?: unknown }).isolation,
+  );
+  if (runtimeIsolation) return runtimeIsolation;
+
   const context = (ctx.context ?? {}) as Record<string, unknown>;
   const candidates = [
     context.k8sRunIsolation,
@@ -181,13 +248,25 @@ export function readRunIsolationDescriptor(
 
   return {
     mode: "isolated",
+    source: "legacy",
     key,
     keyHash: isolationKeyHash(key),
     workspaceRoot: readDescriptorString(raw, "workspaceRoot"),
     homeRoot: readDescriptorString(raw, "homeRoot"),
+    sessionRoot: readDescriptorString(raw, "sessionRoot") ?? readDescriptorString(raw, "homeRoot"),
     cacheRoot: readDescriptorString(raw, "cacheRoot"),
     sessionScope: readDescriptorString(raw, "sessionScope"),
+    storage: {
+      workspace: "persistent",
+      home: "persistent",
+      session: "persistent",
+      cache: "persistent",
+    },
   };
+}
+
+function isIsolatedRunMode(mode: RunIsolationMode): mode is Exclude<RunIsolationMode, "shared"> {
+  return mode !== "shared";
 }
 
 function assertSafePathComponent(field: string, value: string): void {
@@ -202,7 +281,7 @@ export function buildPodLogPath(companyId: string, agentId: string, runId: strin
 }
 
 function buildIsolatedPodLogPath(isolation: RunIsolationDescriptor, runId: string): string | null {
-  if (isolation.mode !== "isolated" || !isolation.cacheRoot) return null;
+  if (!isIsolatedRunMode(isolation.mode) || !isolation.cacheRoot || isolation.storage.cache === "ephemeral") return null;
   return path.posix.join(isolation.cacheRoot, "run-logs", `${runId}.pod.ndjson`);
 }
 
@@ -439,27 +518,31 @@ function buildEnvVars(
     if (typeof value === "string") merged[key] = value;
   }
 
-  // Agent Jobs mount their own runtime-cache emptyDir. Keep regenerable build,
-  // package, browser, temp caches AND opencode's XDG config/data/state off the
-  // shared /paperclip PVC — opencode regenerates all of these per run, and its
-  // XDG dirs must land somewhere writable or the process crashes at boot
-  // (BLO-14003). These keys are reserved so stale adapterConfig.env overrides
-  // cannot move them back onto the shared PVC.
+  // Build/package/temp state is always disposable writable cache. OpenCode's
+  // config/data/state carry resumable session metadata, so durable workspace
+  // descriptors route those XDG roots to sessionRoot while run/shared modes
+  // retain writable ephemeral paths.
   const cacheMountPath = isolation.cacheRoot ?? RUNTIME_CACHE_MOUNT_PATH;
   for (const [key, leaf] of Object.entries(AGENT_CACHE_ENV_LEAVES)) {
     merged[key] = `${cacheMountPath}/${leaf}`;
+  }
+  const sessionMountPath = isolation.sessionRoot ?? cacheMountPath;
+  for (const [key, leaf] of Object.entries(AGENT_SESSION_ENV_LEAVES)) {
+    merged[key] = `${sessionMountPath}/${leaf}`;
   }
 
   // OpenCode-specific: prevent project config pollution, always set after user overrides
   merged.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
   merged.HOME = isolation.homeRoot ?? "/paperclip";
-  if (isolation.mode === "isolated") {
+  if (isIsolatedRunMode(isolation.mode)) {
     merged.PAPERCLIP_K8S_ISOLATION_MODE = isolation.mode;
     if (isolation.key) merged.PAPERCLIP_K8S_ISOLATION_KEY = isolation.key;
     if (isolation.workspaceRoot) merged.PAPERCLIP_K8S_WORKSPACE_ROOT = isolation.workspaceRoot;
     if (isolation.homeRoot) merged.PAPERCLIP_K8S_HOME_ROOT = isolation.homeRoot;
+    if (isolation.sessionRoot) merged.PAPERCLIP_K8S_SESSION_ROOT = isolation.sessionRoot;
     if (isolation.cacheRoot) merged.PAPERCLIP_K8S_CACHE_ROOT = isolation.cacheRoot;
     if (isolation.sessionScope) merged.PAPERCLIP_K8S_SESSION_SCOPE = isolation.sessionScope;
+    if (isolation.workspaceRoot) merged.PAPERCLIP_WORKSPACE_CWD = isolation.workspaceRoot;
   }
 
   // Convert literal-value vars to V1EnvVar array
@@ -1099,11 +1182,21 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     asString(config.instructionsRootPath, "").trim()
       ? `( [ -e docs ] || { __pcd="$(dirname "$(dirname "\${AGENT_HOME:-/nonexistent}")")/docs"; [ -d "$__pcd" ] && ln -sfn "$__pcd" docs; } ) 2>/dev/null || true; `
       : "";
-  const isolatedRuntimePrep = isolation.mode === "isolated"
-    ? `mkdir -p ${[isolation.homeRoot, isolation.cacheRoot, isolation.workspaceRoot, path.posix.dirname(podLogPath)]
+  const isolatedRuntimePrep = isIsolatedRunMode(isolation.mode)
+    ? `mkdir -p ${[isolation.homeRoot, isolation.sessionRoot, isolation.cacheRoot, isolation.workspaceRoot, path.posix.dirname(podLogPath)]
         .filter((p): p is string => Boolean(p))
         .map(shellQuote)
         .join(" ")} 2>/dev/null || true; `
+    : "";
+  const workspaceSetup = isolation.mode === "run" && workspaceCwd && workspaceCwd !== isolation.workspaceRoot
+    ? [
+        `source_head=$(git -C ${shellQuote(workspaceCwd)} rev-parse HEAD)`,
+        `rm -rf ${shellQuote(isolation.workspaceRoot!)}`,
+        // Share only immutable Git objects; refs, index, locks, and worktree are run-owned.
+        `git clone --shared --no-checkout -- ${shellQuote(workspaceCwd)} ${shellQuote(isolation.workspaceRoot!)}`,
+        `git -C ${shellQuote(isolation.workspaceRoot!)} checkout --detach "$source_head"`,
+        `cd ${shellQuote(isolation.workspaceRoot!)}`,
+      ].join(" && ") + "; "
     : "";
   // opencode-db schema-compat guard (root-caused 2026-06-21, BLO follow-up).
   // The persistent opencode.db is keyed per (company, agent, taskKey) and reused
@@ -1122,7 +1215,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const dbResetGuard = hasAgentDb
     ? `__ocdb=/opencode-db/opencode.db; __ocdir="$(dirname "$__ocdb")"; __ocver="$(opencode --version 2>/dev/null | head -n1)"; __ocprev="$(cat "$__ocdir/.opencode-version" 2>/dev/null || true)"; if [ -n "$__ocver" ] && [ -f "$__ocdb" ] && [ "$__ocver" != "$__ocprev" ]; then echo "[paperclip] opencode upgraded ('$__ocprev' -> '$__ocver'); resetting $__ocdb to avoid stale-schema crash" >&2; rm -f "$__ocdb" "$__ocdb-shm" "$__ocdb-wal" 2>/dev/null || true; else __ocbytes=0; for __ocf in "$__ocdb" "$__ocdb-wal" "$__ocdb-shm"; do if [ -f "$__ocf" ]; then __ocsz="$(wc -c < "$__ocf" 2>/dev/null || echo 0)"; __ocsz="\${__ocsz##* }"; __ocbytes=$((__ocbytes + \${__ocsz:-0})); fi; done; if [ -f "$__ocdb" ] && [ "$__ocbytes" -gt 524288000 ]; then echo "[paperclip] opencode DB $__ocbytes bytes exceeds 524288000; resetting $__ocdb to cap growth" >&2; rm -f "$__ocdb" "$__ocdb-shm" "$__ocdb-wal" 2>/dev/null || true; fi; fi; if [ -n "$__ocver" ]; then mkdir -p "$__ocdir" 2>/dev/null || true; printf '%s' "$__ocver" > "$__ocdir/.opencode-version" 2>/dev/null || true; fi; `
     : "";
-  const baseMainCommand = `set -o pipefail; ${isolatedRuntimePrep}${ccrotateRefresh}; ${authBootstrap}; ${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${shellQuote(podLogPath)}) && : > ${shellQuote(podLogPath)} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${shellQuote(podLogPath)}`;
+  const baseMainCommand = `set -o pipefail; ${isolatedRuntimePrep}${workspaceSetup}${ccrotateRefresh}; ${authBootstrap}; ${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${shellQuote(podLogPath)}) && : > ${shellQuote(podLogPath)} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${shellQuote(podLogPath)}`;
   // Redirect Chrome's BrowserMetrics spool off the shared CephFS HOME to the
   // main container's per-pod runtime-cache emptyDir. The
   // agent-browser designer tool launches system Chrome with the default
