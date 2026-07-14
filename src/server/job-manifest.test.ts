@@ -1265,6 +1265,30 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       expect(parsed.disabled_providers).toEqual(["opencode"]);
     });
 
+    it("denies env-dump bash commands (PEN-1305) without blocking legit forms", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > \S*opencode\/opencode\.json/);
+      expect(match).toBeTruthy();
+      const parsed = JSON.parse(match![1].replace(/'\\''/g, "'")) as {
+        permission?: { external_directory?: string; bash?: Record<string, string> };
+      };
+      const bash = parsed.permission?.bash ?? {};
+      // Default stays allow (unattended Job pods must not prompt).
+      expect(bash["*"]).toBe("allow");
+      // Dump forms are denied.
+      for (const p of ["env", "printenv", "set", "export -p", "declare -x", "cat /proc/*/environ"]) {
+        expect(bash[p]).toBe("deny");
+      }
+      // Legit set-and-run / flag forms are NOT present as deny keys (bare-token
+      // globs never match args-carrying commands).
+      expect(bash["env *"]).toBeUndefined();
+      expect(bash["set *"]).toBeUndefined();
+      expect(bash["printenv *"]).toBeUndefined();
+      // external_directory bypass preserved under skipPermissions.
+      expect(parsed.permission?.external_directory).toBe("allow");
+    });
+
     // BLO-14758: opencode's turn-zero workspace snapshot (`git add --all
     // --sparse` into a shadow git store) pegs a core in uninterruptible
     // disk I/O for 20-30+ minutes against large/cold agent workspace dirs,
