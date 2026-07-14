@@ -556,6 +556,37 @@ function providerConfig(agent: { id: string; name?: string | null }): Record<str
   };
 }
 
+/**
+ * PEN-1305 Layer 1 (config arm) — deny full-environment dump commands at the
+ * opencode `permission.bash` layer so agents cannot dump live secret-bearing
+ * runtime variables into the run transcript.
+ *
+ * Patterns are scoped to the *dump* forms only; legitimate uses of the same
+ * binaries must NOT be blocked:
+ *   - `env` / `printenv` bare = dump → deny; `env FOO=bar cmd` (set-and-run)
+ *     and `printenv PATH` (single named var) carry args, so the bare-token
+ *     globs below never match them.
+ *   - `set` bare = dump → deny; `set -euo pipefail` carries args → not matched.
+ *   - `export -p` / `declare -x` = dump → deny (with trailing-arg variants).
+ *   - `cat /proc/<pid>/environ` = dump → deny.
+ *
+ * This is the stable, config-only arm. A `tool.execute.before` plugin arm
+ * (robust regex + shell-wrapper unwrapping, mirroring the claude adapter's
+ * PreToolUse guard and server/src/agent-shell-guard.ts) is a canary-gated
+ * follow-up. The server-side transcript redaction remains the backstop for any
+ * wrapped form (`sh -lc "env"`) that glob matching cannot catch.
+ */
+const ENV_DUMP_BASH_DENY: Record<string, "deny"> = {
+  env: "deny",
+  printenv: "deny",
+  set: "deny",
+  "export -p": "deny",
+  "export -p *": "deny",
+  "declare -x": "deny",
+  "declare -x *": "deny",
+  "cat /proc/*/environ": "deny",
+};
+
 function buildRuntimeConfigJson(
   config: Record<string, unknown>,
   agent: { id: string; name?: string | null },
@@ -566,8 +597,17 @@ function buildRuntimeConfigJson(
     provider: providerConfig(agent),
     snapshot: false,
   };
+  // Always deny env-dump commands. Under skipPermissions (the unattended Job
+  // default) everything else stays "allow" so no command prompts; otherwise the
+  // specific denies are added without changing opencode's default prompt
+  // behaviour for unmatched commands.
   if (skipPermissions) {
-    runtime.permission = { external_directory: "allow" };
+    runtime.permission = {
+      external_directory: "allow",
+      bash: { "*": "allow", ...ENV_DUMP_BASH_DENY },
+    };
+  } else {
+    runtime.permission = { bash: { ...ENV_DUMP_BASH_DENY } };
   }
   return JSON.stringify(runtime, null, 2);
 }
