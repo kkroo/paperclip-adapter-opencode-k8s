@@ -1482,6 +1482,9 @@ export async function ensureAgentDbPvc(
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { config: rawConfig, onLog, onMeta } = ctx;
+  const onExternalRuntimeLaunched = (ctx as AdapterExecutionContext & {
+    onExternalRuntimeLaunched?: (identity: { jobName: string; jobUid: string }) => Promise<void>;
+  }).onExternalRuntimeLaunched;
   const adapterConfig = parseObject(rawConfig);
 
   // Phase E.2: when paperclip dispatches a heartbeat with a remote/k8s
@@ -1831,6 +1834,31 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       timedOut: false,
       errorMessage: `Failed to create Kubernetes Job: ${msg}`,
       errorCode: "k8s_job_create_failed",
+    };
+  }
+  const createdJobUid = createdJob.metadata?.uid;
+  if (!createdJobUid || !onExternalRuntimeLaunched) {
+    await cleanupJob(namespace, jobName, onLog, kubeconfigPath, promptSecretName, podLogPath);
+    return {
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      errorMessage: !createdJobUid
+        ? "Created Kubernetes Job did not return a UID"
+        : "Paperclip did not provide an external-runtime launch acknowledgment",
+      errorCode: "k8s_job_identity_unacknowledged",
+    };
+  }
+  try {
+    await onExternalRuntimeLaunched({ jobName, jobUid: createdJobUid });
+  } catch (err) {
+    await cleanupJob(namespace, jobName, onLog, kubeconfigPath, promptSecretName, podLogPath);
+    return {
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      errorMessage: `External runtime launch acknowledgment failed: ${err instanceof Error ? err.message : String(err)}`,
+      errorCode: "k8s_job_identity_unacknowledged",
     };
   }
 
