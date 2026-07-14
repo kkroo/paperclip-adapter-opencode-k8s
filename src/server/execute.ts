@@ -1422,6 +1422,14 @@ export function buildAgentDbWorkspaceSubPath(
   return `.opencode-db/${companyId}/${agentId}/${sanitizeTaskKeyForPath(taskKey)}`;
 }
 
+export function buildAgentDbIsolationSubPath(
+  companyId: string,
+  agentId: string,
+  isolationKeyHash: string,
+): string {
+  return `.opencode-db/${companyId}/${agentId}/isolation/${isolationKeyHash}`;
+}
+
 /**
  * Ensure the per-agent dedicated PVC exists (dedicated_pvc mode) or return
  * null (ephemeral / workspace_subpath, where no separate PVC is needed).
@@ -1557,7 +1565,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // Serialize guard-check + job-create per shared-state slot to prevent TOCTOU
   // races. Shared/malformed isolation keeps the legacy per-agent mutex; isolated
   // mode only narrows it once the server supplied a validated isolation key.
-  const guardKey = runIsolation.mode === "isolated" && runIsolation.keyHash
+  const guardKey = runIsolation.mode !== "shared" && runIsolation.keyHash
     ? `${agentId}:${runIsolation.keyHash}`
     : agentId;
   const prevLock = agentCreationMutex.get(guardKey) ?? Promise.resolve();
@@ -1587,9 +1595,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             : [];
           const otherJobs = running.filter((j) => !sameTaskJobs.includes(j));
           const blockingJobs = otherJobs.filter((j) => {
-            if (runIsolation.mode !== "isolated" || !runIsolation.keyHash) return true;
+            if (runIsolation.mode === "shared" || !runIsolation.keyHash) return true;
             const labels = j.metadata?.labels ?? {};
-            return labels["paperclip.io/isolation-mode"] !== "isolated" ||
+            const existingMode = labels["paperclip.io/isolation-mode"];
+            return !["isolated", "run", "workspace"].includes(existingMode ?? "") ||
               labels["paperclip.io/isolation-key-hash"] === runIsolation.keyHash ||
               !labels["paperclip.io/isolation-key-hash"];
           });
@@ -1718,8 +1727,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const agentDbMode = (asString(config.agentDbMode, "workspace_subpath").trim() || "workspace_subpath") as AgentDbMode;
   let agentDbClaimName: string | null | undefined;
   let agentDbWorkspaceSubPath: string | undefined;
-  if (agentDbMode === "workspace_subpath") {
-    if (sanitizeTaskKeyForPath(ctx.runtime.taskKey) === "_no_task_") {
+  if (runIsolation.mode === "run") {
+    agentDbClaimName = null;
+  } else if (agentDbMode === "workspace_subpath") {
+    if (runIsolation.mode === "workspace" && runIsolation.keyHash) {
+      agentDbWorkspaceSubPath = buildAgentDbIsolationSubPath(
+        ctx.agent.companyId,
+        agentId,
+        runIsolation.keyHash,
+      );
+    } else if (sanitizeTaskKeyForPath(ctx.runtime.taskKey) === "_no_task_") {
       agentDbClaimName = null;
     } else {
       agentDbWorkspaceSubPath = buildAgentDbWorkspaceSubPath(

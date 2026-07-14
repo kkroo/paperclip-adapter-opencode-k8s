@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import {
   execute,
+  buildAgentDbIsolationSubPath,
   ensureAgentDbPvc,
   tailPodLogFile,
   mergeEnvironmentConfig,
@@ -77,7 +78,8 @@ vi.mock("./job-manifest.js", async () => {
     ),
     readRunIsolationDescriptor: vi.fn((ctx: AdapterExecutionContext, config: Record<string, unknown> = {}) => {
       const context = (ctx.context ?? {}) as Record<string, unknown>;
-      const raw = [
+      const runtimeRaw = (ctx.runtime as unknown as { isolation?: Record<string, unknown> | null }).isolation;
+      const raw = runtimeRaw ?? [
         context.k8sRunIsolation,
         context.runIsolation,
         context.isolation,
@@ -91,17 +93,52 @@ vi.mock("./job-manifest.js", async () => {
         : typeof raw?.key === "string" && raw.key.trim()
           ? raw.key.trim()
           : null;
-      if (mode !== "isolated" || !key) {
-        return { mode: "shared", key: null, keyHash: null, workspaceRoot: null, homeRoot: null, cacheRoot: null, sessionScope: null };
+      if (mode !== "isolated" && mode !== "run" && mode !== "workspace") {
+        return {
+          mode: "shared",
+          source: runtimeRaw ? "runtime" : "shared",
+          key: null,
+          keyHash: null,
+          workspaceRoot: null,
+          homeRoot: null,
+          sessionRoot: null,
+          cacheRoot: null,
+          sessionScope: null,
+          storage: { workspace: "persistent", home: "persistent", session: "ephemeral", cache: "ephemeral" },
+        };
+      }
+      if (!key) {
+        if (!runtimeRaw) {
+          return {
+            mode: "shared",
+            source: "shared",
+            key: null,
+            keyHash: null,
+            workspaceRoot: null,
+            homeRoot: null,
+            sessionRoot: null,
+            cacheRoot: null,
+            sessionScope: null,
+            storage: { workspace: "persistent", home: "persistent", session: "ephemeral", cache: "ephemeral" },
+          };
+        }
+        throw new Error(`runtime ${String(mode)} isolation descriptor is incomplete`);
       }
       return {
-        mode: "isolated",
+        mode,
+        source: runtimeRaw ? "runtime" : "legacy",
         key,
         keyHash: createHash("sha256").update(key).digest("hex").slice(0, 16),
         workspaceRoot: typeof raw?.workspaceRoot === "string" ? raw.workspaceRoot : null,
         homeRoot: typeof raw?.homeRoot === "string" ? raw.homeRoot : null,
+        sessionRoot: typeof raw?.sessionRoot === "string" ? raw.sessionRoot : null,
         cacheRoot: typeof raw?.cacheRoot === "string" ? raw.cacheRoot : null,
-        sessionScope: typeof raw?.sessionScope === "string" ? raw.sessionScope : null,
+        sessionScope: typeof raw?.sessionScope === "string"
+          ? raw.sessionScope
+          : typeof (raw?.sessionScope as { isolationKey?: unknown } | undefined)?.isolationKey === "string"
+            ? (raw?.sessionScope as { isolationKey: string }).isolationKey
+            : key,
+        storage: raw?.storage ?? { workspace: "persistent", home: "persistent", session: "persistent", cache: "persistent" },
       };
     }),
     LARGE_PROMPT_THRESHOLD_BYTES: 256 * 1024,
@@ -212,6 +249,31 @@ function makeCtx(configOverrides: Record<string, unknown> = {}, contextOverrides
     onLog: vi.fn().mockResolvedValue(undefined),
     onExternalRuntimeLaunched: vi.fn().mockResolvedValue(undefined),
   } as unknown as AdapterExecutionContext;
+}
+
+function setRuntimeIsolation(
+  ctx: AdapterExecutionContext,
+  isolationKey: string,
+  mode: "run" | "workspace" = "workspace",
+) {
+  ctx.runtime = {
+    ...ctx.runtime,
+    isolation: {
+      isolationMode: mode,
+      isolationKey,
+      workspaceRoot: mode === "run" ? "/runtime-cache/run/workspace" : "/paperclip/workspace",
+      homeRoot: mode === "run" ? "/runtime-cache/run/home" : "/paperclip/isolation/home",
+      sessionRoot: mode === "run" ? "/runtime-cache/run/session" : "/paperclip/isolation/session",
+      cacheRoot: "/runtime-cache/run/cache",
+      storage: {
+        workspace: mode === "run" ? "ephemeral" : "persistent",
+        home: mode === "run" ? "ephemeral" : "persistent",
+        session: mode === "run" ? "ephemeral" : "persistent",
+        cache: "ephemeral",
+      },
+      sessionScope: { taskKey: "this-task-id", isolationKey },
+    },
+  } as unknown as AdapterExecutionContext["runtime"];
 }
 
 /**
@@ -523,17 +585,8 @@ describe("execute — concurrency guard", () => {
     ]);
     vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
 
-    const ctx = makeCtx({}, {
-      taskId: "this-task-id",
-      k8sRunIsolation: {
-        isolationMode: "isolated",
-        isolationKey: "agent:this-task",
-        workspaceRoot: "/paperclip/isolated/this-task/workspace",
-        homeRoot: "/paperclip/isolated/this-task/home",
-        cacheRoot: "/paperclip/isolated/this-task/cache",
-        sessionScope: "agent:this-task",
-      },
-    });
+    const ctx = makeCtx({}, { taskId: "this-task-id" });
+    setRuntimeIsolation(ctx, "agent:this-task");
 
     const result = await execute(ctx);
 
@@ -558,10 +611,8 @@ describe("execute — concurrency guard", () => {
     ]);
     vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
 
-    const ctx = makeCtx({}, {
-      taskId: "this-task-id",
-      k8sRunIsolation: { isolationMode: "isolated", isolationKey: key },
-    });
+    const ctx = makeCtx({}, { taskId: "this-task-id" });
+    setRuntimeIsolation(ctx, key);
     const result = await execute(ctx);
 
     expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
@@ -1860,6 +1911,12 @@ describe("waitForJobCompletion — transient read tolerance (BLO-10448)", () => 
 });
 
 describe("execute — config edge paths", () => {
+  it("builds a stable workspace-keyed OpenCode DB subpath", () => {
+    expect(buildAgentDbIsolationSubPath("co-1", "agent-1", "abc123")).toBe(
+      ".opencode-db/co-1/agent-1/isolation/abc123",
+    );
+  });
+
   it("uses an ephemeral opencode DB for default workspace_subpath no-task runs", async () => {
     const ctx = makeCtx({ agentDbMode: "workspace_subpath" });
     const result = await execute(ctx);
@@ -1881,6 +1938,35 @@ describe("execute — config edge paths", () => {
     expect(buildArgs.agentDbWorkspaceSubPath).toBe(".opencode-db/co-1/agent-id-test/blo-11715");
     expect(buildArgs.agentDbClaimName).toBeUndefined();
     expect(vi.mocked(getPvc)).not.toHaveBeenCalled();
+  });
+
+  it("forces stateless run isolation onto an ephemeral OpenCode DB", async () => {
+    const ctx = makeCtx({ agentDbMode: "dedicated_pvc", agentDbStorageClass: "fast" });
+    (ctx.runtime as { taskKey: string | null }).taskKey = "pr-review-42";
+    setRuntimeIsolation(ctx, "run:run-test-123", "run");
+
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBeUndefined();
+    const buildArgs = vi.mocked(buildJobManifest).mock.calls[0][0];
+    expect(buildArgs.agentDbClaimName).toBeNull();
+    expect(buildArgs.agentDbWorkspaceSubPath).toBeUndefined();
+    expect(vi.mocked(getPvc)).not.toHaveBeenCalled();
+  });
+
+  it("keys durable OpenCode DB persistence by workspace isolation", async () => {
+    const isolationKey = "workspace:workspace-1";
+    const ctx = makeCtx({ agentDbMode: "workspace_subpath" });
+    setRuntimeIsolation(ctx, isolationKey, "workspace");
+
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBeUndefined();
+    const buildArgs = vi.mocked(buildJobManifest).mock.calls[0][0];
+    expect(buildArgs.agentDbWorkspaceSubPath).toBe(
+      `.opencode-db/co-1/agent-id-test/isolation/${isoHash(isolationKey)}`,
+    );
+    expect(buildArgs.agentDbClaimName).toBeUndefined();
   });
 
   it("logs a warning but continues when instructionsFilePath cannot be read", async () => {
