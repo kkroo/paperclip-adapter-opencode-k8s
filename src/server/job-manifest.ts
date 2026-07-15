@@ -110,7 +110,6 @@ const AGENT_CACHE_ENV_LEAVES: Record<string, string> = {
   BUN_INSTALL_CACHE: "bun",
   PIP_CACHE_DIR: "pip",
   PLAYWRIGHT_BROWSERS_PATH: "ms-playwright",
-  TMPDIR: "tmp",
 };
 
 const AGENT_SESSION_ENV_LEAVES: Record<string, string> = {
@@ -131,6 +130,7 @@ export interface RunIsolationDescriptor {
   homeRoot: string | null;
   sessionRoot: string | null;
   cacheRoot: string | null;
+  tmpRoot: string | null;
   sessionScope: string | null;
   storage: {
     workspace: IsolationStorage;
@@ -149,6 +149,7 @@ const SHARED_RUN_ISOLATION: RunIsolationDescriptor = {
   homeRoot: null,
   sessionRoot: null,
   cacheRoot: null,
+  tmpRoot: null,
   sessionScope: null,
   storage: {
     workspace: "persistent",
@@ -193,11 +194,12 @@ function readRuntimeIsolationDescriptor(value: unknown): RunIsolationDescriptor 
   const homeRoot = readDescriptorString(raw, "homeRoot");
   const sessionRoot = readDescriptorString(raw, "sessionRoot");
   const cacheRoot = readDescriptorString(raw, "cacheRoot");
+  const tmpRoot = readDescriptorString(raw, "tmpRoot");
   const storage = readObject(raw.storage);
-  if (!key || !workspaceRoot || !homeRoot || !sessionRoot || !cacheRoot || !storage) {
+  if (!key || !workspaceRoot || !homeRoot || !sessionRoot || !cacheRoot || !tmpRoot || !storage) {
     throw new Error(`runtime ${mode} isolation descriptor is incomplete`);
   }
-  for (const [field, candidate] of Object.entries({ workspaceRoot, homeRoot, sessionRoot, cacheRoot })) {
+  for (const [field, candidate] of Object.entries({ workspaceRoot, homeRoot, sessionRoot, cacheRoot, tmpRoot })) {
     if (!path.posix.isAbsolute(candidate)) {
       throw new Error(`runtime isolation descriptor ${field} must be absolute`);
     }
@@ -211,6 +213,7 @@ function readRuntimeIsolationDescriptor(value: unknown): RunIsolationDescriptor 
     homeRoot,
     sessionRoot,
     cacheRoot,
+    tmpRoot,
     sessionScope: readDescriptorString(readObject(raw.sessionScope) ?? {}, "isolationKey") ?? key,
     storage: {
       workspace: readStorageValue(storage, "workspace"),
@@ -255,6 +258,7 @@ export function readRunIsolationDescriptor(
     homeRoot: readDescriptorString(raw, "homeRoot"),
     sessionRoot: readDescriptorString(raw, "sessionRoot") ?? readDescriptorString(raw, "homeRoot"),
     cacheRoot: readDescriptorString(raw, "cacheRoot"),
+    tmpRoot: readDescriptorString(raw, "tmpRoot"),
     sessionScope: readDescriptorString(raw, "sessionScope"),
     storage: {
       workspace: "persistent",
@@ -534,6 +538,13 @@ function buildEnvVars(
   // OpenCode-specific: prevent project config pollution, always set after user overrides
   merged.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
   merged.HOME = isolation.homeRoot ?? "/paperclip";
+  // Run-scoped so concurrent stateless Jobs never share a writable temp
+  // directory (BLO-16219). Falls back to the flat runtime-cache mount for
+  // shared mode, preserving its prior (unscoped) temp behavior.
+  const tmpMountPath = isolation.tmpRoot ?? `${cacheMountPath}/tmp`;
+  merged.TMPDIR = tmpMountPath;
+  merged.TMP = tmpMountPath;
+  merged.TEMP = tmpMountPath;
   if (isIsolatedRunMode(isolation.mode)) {
     merged.PAPERCLIP_K8S_ISOLATION_MODE = isolation.mode;
     if (isolation.key) merged.PAPERCLIP_K8S_ISOLATION_KEY = isolation.key;
@@ -541,6 +552,7 @@ function buildEnvVars(
     if (isolation.homeRoot) merged.PAPERCLIP_K8S_HOME_ROOT = isolation.homeRoot;
     if (isolation.sessionRoot) merged.PAPERCLIP_K8S_SESSION_ROOT = isolation.sessionRoot;
     if (isolation.cacheRoot) merged.PAPERCLIP_K8S_CACHE_ROOT = isolation.cacheRoot;
+    if (isolation.tmpRoot) merged.PAPERCLIP_K8S_TMP_ROOT = isolation.tmpRoot;
     if (isolation.sessionScope) merged.PAPERCLIP_K8S_SESSION_SCOPE = isolation.sessionScope;
     if (isolation.workspaceRoot) merged.PAPERCLIP_WORKSPACE_CWD = isolation.workspaceRoot;
   }
@@ -823,7 +835,14 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
   const configuredCwd = asString(config.cwd, "");
-  const workingDir = isolation.workspaceRoot || workspaceCwd || configuredCwd || "/paperclip";
+  // Kubernetes resolves the container workingDir before the non-root process
+  // starts. For a fresh run-scoped emptyDir that would create workspaceRoot as
+  // root and prevent uid 1000 from creating its sibling HOME/session roots.
+  // Start from the existing source checkout; workspaceSetup prepares and enters
+  // the independent clone after the container has started as uid 1000.
+  const workingDir = isolation.mode === "run"
+    ? workspaceCwd || configuredCwd || "/paperclip"
+    : isolation.workspaceRoot || workspaceCwd || configuredCwd || "/paperclip";
 
   // Job naming: slug + 6-char hash for collision resistance; strip trailing hyphens
   const agentSlug = sanitizeForK8sName(agent.id);
@@ -1183,20 +1202,20 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       ? `( [ -e docs ] || { __pcd="$(dirname "$(dirname "\${AGENT_HOME:-/nonexistent}")")/docs"; [ -d "$__pcd" ] && ln -sfn "$__pcd" docs; } ) 2>/dev/null || true; `
       : "";
   const isolatedRuntimePrep = isIsolatedRunMode(isolation.mode)
-    ? `mkdir -p ${[isolation.homeRoot, isolation.sessionRoot, isolation.cacheRoot, isolation.workspaceRoot, path.posix.dirname(podLogPath)]
+    ? `mkdir -p ${[isolation.homeRoot, isolation.sessionRoot, isolation.cacheRoot, isolation.tmpRoot, isolation.workspaceRoot, path.posix.dirname(podLogPath)]
         .filter((p): p is string => Boolean(p))
         .map(shellQuote)
-        .join(" ")} 2>/dev/null || true; `
+        .join(" ")} || { echo "[paperclip] failed to prepare isolated runtime roots" >&2; exit 1; }; `
     : "";
   const workspaceSetup = isolation.mode === "run" && workspaceCwd && workspaceCwd !== isolation.workspaceRoot
-    ? [
+    ? `{ ${[
         `source_head=$(git -C ${shellQuote(workspaceCwd)} rev-parse HEAD)`,
         `rm -rf ${shellQuote(isolation.workspaceRoot!)}`,
         // Share only immutable Git objects; refs, index, locks, and worktree are run-owned.
         `git clone --shared --no-checkout -- ${shellQuote(workspaceCwd)} ${shellQuote(isolation.workspaceRoot!)}`,
         `git -C ${shellQuote(isolation.workspaceRoot!)} checkout --detach "$source_head"`,
         `cd ${shellQuote(isolation.workspaceRoot!)}`,
-      ].join(" && ") + "; "
+      ].join(" && ")}; } || { echo "[paperclip] failed to prepare isolated workspace" >&2; exit 1; }; `
     : "";
   // opencode-db schema-compat guard (root-caused 2026-06-21, BLO follow-up).
   // The persistent opencode.db is keyed per (company, agent, taskKey) and reused
