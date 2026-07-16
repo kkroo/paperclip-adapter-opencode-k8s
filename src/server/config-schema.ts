@@ -164,8 +164,8 @@ export function getConfigSchema(): AdapterConfigSchema {
         key: "reattachOrphanedJobs",
         label: "Reattach Orphaned Jobs",
         type: "toggle",
-        default: false,
-        hint: "When a running Job for the same task is found after a server restart, reattach (stream logs and await completion) instead of blocking",
+        default: true,
+        hint: "When a running Job for the same task is found after a server restart, reattach (stream logs and await completion) instead of blocking. Default on: a same-task orphan from a prior adapter restart should be reattached, not turned into a k8s_concurrent_run_blocked failure.",
         group: "Kubernetes",
       },
 
