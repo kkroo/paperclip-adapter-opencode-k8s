@@ -1516,7 +1516,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const timeoutSec = asNumber(config.timeoutSec, 0);
   const graceSec = asNumber(config.graceSec, 60);
   const retainJobs = asBoolean(config.retainJobs, false);
-  const reattachOrphanedJobs = asBoolean(config.reattachOrphanedJobs, false);
+  // Default true: a same-task orphan Job from a prior adapter restart should be
+  // reattached (stream + await), not turned into a k8s_concurrent_run_blocked
+  // failure that strands the run until the orphan happens to finish.
+  const reattachOrphanedJobs = asBoolean(config.reattachOrphanedJobs, true);
 
   const budgetGateResult = await enforceBudgetCapBeforeRun(ctx);
   if (budgetGateResult) return budgetGateResult;

@@ -668,6 +668,31 @@ describe("execute — concurrency guard", () => {
     expect(result.sessionId).toBe("ses_happy");
   });
 
+  it("reattaches a same-task orphaned Job by default (reattachOrphanedJobs unset)", async () => {
+    const TASK_ID = "task-uuid-default";
+    const batchApi = makeBatchApi([
+      {
+        metadata: {
+          name: "orphaned-job-default",
+          labels: { "paperclip.io/task-id": TASK_ID },
+        },
+        status: { conditions: [] },
+      },
+    ]);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const ctx = {
+      ...makeCtx(),
+      context: { taskId: TASK_ID, issueId: null, paperclipWorkspace: null, issueIds: null, paperclipWorkspaces: null, paperclipRuntimeServiceIntents: null, paperclipRuntimeServices: null },
+    } as unknown as AdapterExecutionContext;
+    const result = await execute(ctx);
+
+    // Default is now reattach (not block): no new Job, succeeds via reattach.
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+    expect(result.exitCode).toBe(0);
+    expect(result.sessionId).toBe("ses_happy");
+  });
+
   it("blocks (k8s_concurrent_run_blocked) when same-task orphaned Job exists but reattachOrphanedJobs=false", async () => {
     const TASK_ID = "task-uuid-456";
     const batchApi = makeBatchApi([
