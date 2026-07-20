@@ -552,6 +552,31 @@ describe("execute — concurrency guard", () => {
     expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
   });
 
+  it("fails closed when listNamespacedJob never settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const batchApi = makeBatchApi();
+      let markGuardStarted!: () => void;
+      const guardStarted = new Promise<void>((resolve) => { markGuardStarted = resolve; });
+      batchApi.listNamespacedJob.mockImplementation(() => {
+        markGuardStarted();
+        return new Promise(() => {});
+      });
+      vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+      const resultPromise = execute(makeCtx());
+      await guardStarted;
+      await vi.advanceTimersByTimeAsync(15_000);
+      const result = await resultPromise;
+
+      expect(result.errorCode).toBe("k8s_concurrency_guard_unreachable");
+      expect(result.errorMessage).toContain("timed out after 15s");
+      expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("blocks (k8s_concurrent_run_blocked) when a different-task job is running even with reattachOrphanedJobs=true", async () => {
     const batchApi = makeBatchApi([
       {

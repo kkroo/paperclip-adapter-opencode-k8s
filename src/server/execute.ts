@@ -24,9 +24,26 @@ const POLL_INTERVAL_MS = 2000;
 // brief apiserver blips without aborting a healthy run (BLO-10448).
 const MAX_CONSECUTIVE_READ_ERRORS = 5;
 const KEEPALIVE_INTERVAL_MS = 15_000;
+const K8S_CONCURRENCY_GUARD_TIMEOUT_MS = 15_000;
 const LOG_EXIT_COMPLETION_GRACE_MS = parseInt(process.env.LOG_EXIT_COMPLETION_GRACE_MS ?? "30000", 10);
 const DEFAULT_COMPACT_THRESHOLD = 90_000;
 const COMPACT_WINDOW_FRACTION = 0.5;
+
+async function withK8sConcurrencyGuardTimeout<T>(operation: Promise<T>): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      reject(new Error(
+        `Kubernetes Job concurrency guard timed out after ${K8S_CONCURRENCY_GUARD_TIMEOUT_MS / 1000}s`,
+      ));
+    }, K8S_CONCURRENCY_GUARD_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([operation, deadline]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
 
 export const MODEL_CONTEXT_WINDOWS: Array<{ pattern: RegExp; tokens: number }> = [
   { pattern: /^gpt-5\.6(?:-|$)/, tokens: 1_048_576 },
@@ -1585,10 +1602,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     while (true) {
       try {
         const batchApi = getBatchApi(kubeconfigPath);
-        const existing = await batchApi.listNamespacedJob({
-          namespace: guardNamespace,
-          labelSelector: `paperclip.io/agent-id=${agentId},paperclip.io/adapter-type=opencode_k8s`,
-        });
+        const existing = await withK8sConcurrencyGuardTimeout(
+          batchApi.listNamespacedJob({
+            namespace: guardNamespace,
+            labelSelector: `paperclip.io/agent-id=${agentId},paperclip.io/adapter-type=opencode_k8s`,
+          }),
+        );
         const running = existing.items.filter(
           (j) => !j.status?.conditions?.some((c) => (c.type === "Complete" || c.type === "Failed") && c.status === "True"),
         );
