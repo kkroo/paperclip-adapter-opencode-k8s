@@ -326,6 +326,37 @@ describe("buildJobManifest", () => {
     expect(result.job.spec?.template?.spec?.volumes?.find((volume) => volume.name === "opencode-db")?.emptyDir).toEqual({});
   });
 
+  it("creates a private empty run workspace when the fallback cwd is not a git checkout", () => {
+    const ctx = withRuntimeIsolation({
+      ...mockCtx,
+      context: {
+        ...mockCtx.context,
+        paperclipWorkspace: { cwd: "/paperclip/agent-fallback" },
+      },
+    }, {
+      isolationMode: "run",
+      isolationKey: "run:run123456",
+      workspaceRoot: "/runtime-cache/paperclip-runs/run123456/workspace",
+      homeRoot: "/runtime-cache/paperclip-runs/run123456/home",
+      sessionRoot: "/runtime-cache/paperclip-runs/run123456/session",
+      cacheRoot: "/runtime-cache/paperclip-runs/run123456/cache",
+      tmpRoot: "/runtime-cache/paperclip-runs/run123456/tmp",
+      storage: runtimeStorage("ephemeral"),
+      sessionScope: { taskKey: "issue-monitor", isolationKey: "run:run123456" },
+    });
+
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod, agentDbClaimName: null });
+    const container = result.job.spec?.template?.spec?.containers?.[0];
+    const command = container?.command?.[2] ?? "";
+
+    expect(container?.workingDir).toBe("/paperclip/agent-fallback");
+    expect(command).toContain("if git -C '/paperclip/agent-fallback' rev-parse --verify HEAD >/dev/null 2>&1; then");
+    expect(command).toContain("git clone --shared --no-checkout -- '/paperclip/agent-fallback' '/runtime-cache/paperclip-runs/run123456/workspace'");
+    expect(command).toContain("else rm -rf '/runtime-cache/paperclip-runs/run123456/workspace' && mkdir -p '/runtime-cache/paperclip-runs/run123456/workspace';");
+    expect(command).toContain("fi && cd '/runtime-cache/paperclip-runs/run123456/workspace'");
+    expect(command).toContain("failed to prepare isolated workspace");
+  });
+
   it("gives two concurrent stateless runs distinct, non-colliding TMPDIR/TMP/TEMP values", () => {
     const buildForRun = (runId: string) => {
       const runCtx = withRuntimeIsolation({ ...mockCtx, runId }, {
