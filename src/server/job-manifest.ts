@@ -1209,13 +1209,21 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     : "";
   const workspaceSetup = isolation.mode === "run" && workspaceCwd && workspaceCwd !== isolation.workspaceRoot
     ? `{ ${[
-        `source_head=$(git -C ${shellQuote(workspaceCwd)} rev-parse HEAD)`,
-        `rm -rf ${shellQuote(isolation.workspaceRoot!)}`,
-        // Share only immutable Git objects; refs, index, locks, and worktree are run-owned.
-        `git clone --shared --no-checkout -- ${shellQuote(workspaceCwd)} ${shellQuote(isolation.workspaceRoot!)}`,
-        `git -C ${shellQuote(isolation.workspaceRoot!)} checkout --detach "$source_head"`,
-        `cd ${shellQuote(isolation.workspaceRoot!)}`,
-      ].join(" && ")}; } || { echo "[paperclip] failed to prepare isolated workspace" >&2; exit 1; }; `
+        `if git -C ${shellQuote(workspaceCwd)} rev-parse --verify HEAD >/dev/null 2>&1; then`,
+        `${[
+          `source_head=$(git -C ${shellQuote(workspaceCwd)} rev-parse HEAD)`,
+          `rm -rf ${shellQuote(isolation.workspaceRoot!)}`,
+          // Share only immutable Git objects; refs, index, locks, and worktree are run-owned.
+          `git clone --shared --no-checkout -- ${shellQuote(workspaceCwd)} ${shellQuote(isolation.workspaceRoot!)}`,
+          `git -C ${shellQuote(isolation.workspaceRoot!)} checkout --detach "$source_head"`,
+        ].join(" && ")};`,
+        // Issue-scoped review/monitor wakes can start from the generic per-agent
+        // fallback directory, which intentionally is not a repository. Give the
+        // run a private empty cwd; the agent can inspect external state or clone
+        // a target repository without sharing mutable workspace state.
+        `else rm -rf ${shellQuote(isolation.workspaceRoot!)} && mkdir -p ${shellQuote(isolation.workspaceRoot!)};`,
+        `fi && cd ${shellQuote(isolation.workspaceRoot!)}`,
+      ].join(" ")}; } || { echo "[paperclip] failed to prepare isolated workspace" >&2; exit 1; }; `
     : "";
   // opencode-db schema-compat guard (root-caused 2026-06-21, BLO follow-up).
   // The persistent opencode.db is keyed per (company, agent, taskKey) and reused
