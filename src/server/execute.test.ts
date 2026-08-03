@@ -73,6 +73,7 @@ vi.mock("./job-manifest.js", async () => {
   const { createHash } = await import("node:crypto");
   return {
     buildJobManifest: vi.fn(),
+    sanitizeLabelValue: vi.fn((value: string) => value),
     buildPodLogPath: vi.fn((companyId: string, agentId: string, runId: string) =>
       `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/${runId}.pod.ndjson`
     ),
@@ -497,7 +498,7 @@ describe("execute — concurrency guard", () => {
     const ctx = makeCtx();
     const result = await execute(ctx);
 
-    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+    expect(result.errorCode, result.errorMessage ?? undefined).toBe("k8s_concurrent_run_blocked");
     expect(result.exitCode).toBeNull();
     expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
   });
@@ -666,7 +667,7 @@ describe("execute — concurrency guard", () => {
     expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
   });
 
-  it("reattaches and streams logs when same-task orphaned Job exists and reattachOrphanedJobs=true", async () => {
+  it("blocks a distinct same-task Job instead of trusting task identity", async () => {
     const TASK_ID = "task-uuid-123";
     const ORPHAN_JOB = "orphaned-job-abc";
     const batchApi = makeBatchApi([
@@ -686,20 +687,18 @@ describe("execute — concurrency guard", () => {
     } as unknown as AdapterExecutionContext;
     const result = await execute(ctx);
 
-    // Should NOT create a new Job — reattached to the orphan
     expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
-    // Should have succeeded by reattaching
-    expect(result.exitCode).toBe(0);
-    expect(result.sessionId).toBe("ses_happy");
+    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
   });
 
-  it("reattaches a same-task orphaned Job by default (reattachOrphanedJobs unset)", async () => {
+  it("ignores the exact persisted lifecycle Job for the current run", async () => {
     const TASK_ID = "task-uuid-default";
     const batchApi = makeBatchApi([
       {
         metadata: {
-          name: "orphaned-job-default",
-          labels: { "paperclip.io/task-id": TASK_ID },
+          name: "current-job",
+          uid: "current-uid",
+          labels: { "paperclip.io/task-id": TASK_ID, "paperclip.io/run-id": "run-test-123" },
         },
         status: { conditions: [] },
       },
@@ -708,23 +707,31 @@ describe("execute — concurrency guard", () => {
 
     const ctx = {
       ...makeCtx(),
+      externalRuntime: { reservationId: "reservation-1", slotId: 0, jobName: "current-job", jobUid: "current-uid" },
       context: { taskId: TASK_ID, issueId: null, paperclipWorkspace: null, issueIds: null, paperclipWorkspaces: null, paperclipRuntimeServiceIntents: null, paperclipRuntimeServices: null },
     } as unknown as AdapterExecutionContext;
     const result = await execute(ctx);
 
-    // Default is now reattach (not block): no new Job, succeeds via reattach.
-    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+    expect(batchApi.createNamespacedJob).toHaveBeenCalled();
     expect(result.exitCode).toBe(0);
-    expect(result.sessionId).toBe("ses_happy");
   });
 
-  it("blocks (k8s_concurrent_run_blocked) when same-task orphaned Job exists but reattachOrphanedJobs=false", async () => {
+  it("blocks a second same-run Job when the exact current Job is present", async () => {
     const TASK_ID = "task-uuid-456";
     const batchApi = makeBatchApi([
       {
         metadata: {
-          name: "orphaned-job-xyz",
-          labels: { "paperclip.io/task-id": TASK_ID },
+          name: "current-job",
+          uid: "current-uid",
+          labels: { "paperclip.io/task-id": TASK_ID, "paperclip.io/run-id": "run-test-123" },
+        },
+        status: { conditions: [] },
+      },
+      {
+        metadata: {
+          name: "duplicate-job",
+          uid: "duplicate-uid",
+          labels: { "paperclip.io/task-id": TASK_ID, "paperclip.io/run-id": "run-test-123" },
         },
         status: { conditions: [] },
       },
@@ -732,13 +739,27 @@ describe("execute — concurrency guard", () => {
     vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
 
     const ctx = {
-      ...makeCtx({ reattachOrphanedJobs: false }),
+      ...makeCtx(),
+      externalRuntime: { reservationId: "reservation-1", slotId: 0, jobName: "current-job", jobUid: "current-uid" },
       context: { taskId: TASK_ID, issueId: null, paperclipWorkspace: null, issueIds: null, paperclipWorkspaces: null, paperclipRuntimeServiceIntents: null, paperclipRuntimeServices: null },
     } as unknown as AdapterExecutionContext;
     const result = await execute(ctx);
 
     expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
     expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+  });
+
+  it("does not treat a deleting Job as a live owner", async () => {
+    const batchApi = makeBatchApi([{
+      metadata: { name: "deleting-job", deletionTimestamp: new Date() },
+      status: { conditions: [] },
+    }]);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorCode).toBeUndefined();
+    expect(batchApi.createNamespacedJob).toHaveBeenCalled();
   });
 });
 

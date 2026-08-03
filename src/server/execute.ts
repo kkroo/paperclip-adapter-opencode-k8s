@@ -15,7 +15,7 @@ import {
 import { computeOpenAICompatibleCost } from "./pricing.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
 import { PassThrough } from "node:stream";
-import { buildJobManifest, LARGE_PROMPT_THRESHOLD_BYTES, buildPodLogPath, readRunIsolationDescriptor } from "./job-manifest.js";
+import { buildJobManifest, LARGE_PROMPT_THRESHOLD_BYTES, buildPodLogPath, readRunIsolationDescriptor, sanitizeLabelValue } from "./job-manifest.js";
 import type * as k8s from "@kubernetes/client-node";
 
 const POLL_INTERVAL_MS = 2000;
@@ -1533,11 +1533,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const timeoutSec = asNumber(config.timeoutSec, 0);
   const graceSec = asNumber(config.graceSec, 60);
   const retainJobs = asBoolean(config.retainJobs, false);
-  // Default true: a same-task orphan Job from a prior adapter restart should be
-  // reattached (stream + await), not turned into a k8s_concurrent_run_blocked
-  // failure that strands the run until the orphan happens to finish.
-  const reattachOrphanedJobs = asBoolean(config.reattachOrphanedJobs, true);
-
   const budgetGateResult = await enforceBudgetCapBeforeRun(ctx);
   if (budgetGateResult) return budgetGateResult;
 
@@ -1576,7 +1571,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     : undefined;
 
   const agentId = ctx.agent.id;
-  const taskId = asString(ctx.context.taskId ?? ctx.context.issueId, "").trim();
+  const currentJobIdentity = (ctx as AdapterExecutionContext & {
+    externalRuntime?: { jobName?: string | null; jobUid?: string | null };
+  }).externalRuntime;
   const runIsolation = readRunIsolationDescriptor(ctx, config);
   const selfPod = await getSelfPodInfo(kubeconfigPath);
   const guardNamespace = asString(config.namespace, "") || selfPod.namespace;
@@ -1609,14 +1606,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           }),
         );
         const running = existing.items.filter(
-          (j) => !j.status?.conditions?.some((c) => (c.type === "Complete" || c.type === "Failed") && c.status === "True"),
+          (j) => !j.metadata?.deletionTimestamp
+            && !j.status?.conditions?.some((c) => (c.type === "Complete" || c.type === "Failed") && c.status === "True"),
         );
         if (running.length > 0) {
-          const sameTaskJobs = taskId
-            ? running.filter((j) => j.metadata?.labels?.["paperclip.io/task-id"] === taskId)
-            : [];
-          const otherJobs = running.filter((j) => !sameTaskJobs.includes(j));
-          const blockingJobs = otherJobs.filter((j) => {
+          const competingJobs = running.filter((j) => !(
+            j.metadata?.labels?.["paperclip.io/run-id"] === sanitizeLabelValue(ctx.runId)
+            && currentJobIdentity?.jobName
+            && currentJobIdentity.jobUid
+            && j.metadata?.name === currentJobIdentity.jobName
+            && j.metadata?.uid === currentJobIdentity.jobUid
+          ));
+          const blockingJobs = competingJobs.filter((j) => {
             if (runIsolation.mode === "shared" || !runIsolation.keyHash) return true;
             const labels = j.metadata?.labels ?? {};
             const existingMode = labels["paperclip.io/isolation-mode"];
@@ -1652,25 +1653,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             continue;
           }
 
-          if (sameTaskJobs.length > 0) {
-            const orphanJob = sameTaskJobs[0];
-            const orphanJobName = orphanJob.metadata?.name ?? "";
-            if (reattachOrphanedJobs) {
-              await onLog("stdout", `[paperclip] Reattaching to orphaned Job ${orphanJobName} from prior server instance (task: ${taskId})...\n`);
-              activeJobs.set(orphanJobName, { namespace: guardNamespace, kubeconfigPath });
-              // Reattach needs podLogPath — compute it here for the orphaned job
-              const podLogPath = buildPodLogPath(ctx.agent.companyId, agentId, ctx.runId);
-              return streamAndAwaitJob(ctx, orphanJobName, guardNamespace, timeoutSec, graceSec, kubeconfigPath, retainJobs, podLogPath);
-            }
-            await onLog("stderr", `[paperclip] Orphaned Job ${orphanJobName} found for this task but reattachOrphanedJobs is disabled.\n`);
-            return {
-              exitCode: null,
-              signal: null,
-              timedOut: false,
-              errorMessage: `Orphaned Job ${orphanJobName} is still running (reattachOrphanedJobs disabled)`,
-              errorCode: "k8s_concurrent_run_blocked",
-            };
-          }
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
