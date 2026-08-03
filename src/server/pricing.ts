@@ -19,6 +19,7 @@ export const OPENAI_PRICING_USD_PER_MTOK: Record<
   string,
   { input: number; cachedInput: number; output: number }
 > = {
+  "anthropic/claude-opus-5": { input: 5.0, cachedInput: 0.5, output: 25.0 },
   "openai/gpt-5.6-sol": { input: 5.0, cachedInput: 0.5, output: 30.0 },
   "openai/gpt-5.6-terra": { input: 2.5, cachedInput: 0.25, output: 15.0 },
   "openai/gpt-5.6-luna": { input: 1.0, cachedInput: 0.1, output: 6.0 },

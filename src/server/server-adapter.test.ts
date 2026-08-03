@@ -11,6 +11,7 @@ describe("createServerAdapter", () => {
     const adapter = createServerAdapter();
     expect(Array.isArray(adapter.models)).toBe(true);
     expect(adapter.models!.length).toBeGreaterThan(0);
+    expect(adapter.models!.some((m) => m.id === "anthropic/claude-opus-5")).toBe(true);
     for (const m of adapter.models!) {
       expect(m.id).toMatch(/^[^/]+\/.+/);
       expect(m.label).toBe(m.id);

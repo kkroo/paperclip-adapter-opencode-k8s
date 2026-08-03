@@ -13,6 +13,21 @@ describe("computeOpenAICompatibleCost", () => {
     expect(cost).toBeCloseTo(0.65, 4);
   });
 
+  it("prices Claude Opus 5 by Anthropic list rates", () => {
+    expect(OPENAI_PRICING_USD_PER_MTOK["anthropic/claude-opus-5"]).toEqual({
+      input: 5.0,
+      cachedInput: 0.5,
+      output: 25.0,
+    });
+    expect(
+      computeOpenAICompatibleCost("anthropic/claude-opus-5", {
+        inputTokens: 1_000_000,
+        cachedInputTokens: 1_000_000,
+        outputTokens: 1_000_000,
+      }),
+    ).toBeCloseTo(30.5, 6);
+  });
+
   it("prices GPT-5.6 Codex variants by their public tiers", () => {
     expect(OPENAI_PRICING_USD_PER_MTOK["openai/gpt-5.6-sol"]).toEqual({
       input: 5.0,
