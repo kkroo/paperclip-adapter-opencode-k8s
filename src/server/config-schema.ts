@@ -20,6 +20,14 @@ export function getConfigSchema(): AdapterConfigSchema {
         group: "Core",
       },
       {
+        key: "envGuardPlugin",
+        label: "Env-Guard Plugin (PEN-1305)",
+        type: "toggle",
+        default: false,
+        hint: "Install the tool.execute.before env-dump guard plugin (blocks wrapped forms like sh -lc \"env\" that the permission.bash deny globs miss). Canary-gated: default off until fleet rollout.",
+        group: "Core",
+      },
+      {
         key: "agentDbMode",
         label: "Agent DB Mode",
         type: "select",

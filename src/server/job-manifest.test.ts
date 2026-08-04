@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { buildJobManifest, sanitizeLabelValue, type JobBuildInput } from "./job-manifest.js";
+import { ENV_GUARD_PLUGIN_SCRIPT } from "./env-guard-plugin.js";
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
@@ -1491,6 +1492,34 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       expect(bash["printenv *"]).toBeUndefined();
       // external_directory bypass preserved under skipPermissions.
       expect(parsed.permission?.external_directory).toBe("allow");
+    });
+
+    // PEN-1305 plugin arm — canary-gated behind adapter config envGuardPlugin.
+    it("does NOT install the env-guard plugin by default (canary gate off)", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      expect(cmd).not.toContain("paperclip-env-guard.js");
+      expect(cmd).not.toContain("GUARD_OC_DIR");
+    });
+
+    it("installs the env-guard plugin into the global opencode plugin dir when envGuardPlugin=true", () => {
+      const ctx: JobBuildInput["ctx"] = {
+        ...mockCtx,
+        config: { envGuardPlugin: true },
+      };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      // Targets the same XDG base the runtime opencode.json setup uses, so the
+      // plugin lands in the dir opencode's {plugin,plugins}/*.{ts,js} glob scans.
+      expect(cmd).toContain('GUARD_OC_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"');
+      expect(cmd).toContain('"$GUARD_OC_DIR/plugin/paperclip-env-guard.js"');
+      expect(cmd).toContain('"$GUARD_OC_DIR/safe-env-inspect.mjs"');
+      // The exact plugin artifact ships base64-embedded and round-trips.
+      const pluginB64 = Buffer.from(ENV_GUARD_PLUGIN_SCRIPT, "utf8").toString("base64");
+      expect(cmd).toContain(pluginB64);
+      // Install runs before opencode starts, and fails open.
+      expect(cmd.indexOf("GUARD_OC_DIR")).toBeLessThan(cmd.indexOf("cat /tmp/prompt/prompt.txt"));
+      expect(cmd).toContain('|| echo "[paperclip-env-guard] plugin install skipped" >&2');
     });
 
     // BLO-14758: opencode's turn-zero workspace snapshot (`git add --all

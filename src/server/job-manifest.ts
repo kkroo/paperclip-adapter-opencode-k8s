@@ -16,6 +16,7 @@ import {
   renderPaperclipWakePrompt,
 } from "@paperclipai/adapter-utils/server-utils";
 import type { SelfPodInfo } from "./k8s-client.js";
+import { buildEnvGuardPluginSetupShell } from "./env-guard-plugin.js";
 
 /**
  * Path to the project-scope .mcp.json that paperclip's helm-chart seed-init
@@ -1149,6 +1150,15 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const configSetup = runtimeConfigJson
     ? `mkdir -p "\${XDG_CONFIG_HOME:-$HOME/.config}/opencode" && echo '${runtimeConfigJson.replace(/'/g, "'\\''")}' > "\${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json" && `
     : "";
+  // PEN-1305 Layer 1 (plugin arm) — canary-gated per-agent via adapter config.
+  // Installs the tool.execute.before guard plugin into the global opencode
+  // config plugin dir (auto-discovered by opencode's {plugin,plugins}/*.{ts,js}
+  // glob). Catches the shell-wrapper/chain forms the permission.bash deny globs
+  // in buildRuntimeConfigJson cannot. Default OFF until the fleet canary
+  // validates a live run; see env-guard-plugin.ts.
+  const envGuardPluginSetup = asBoolean(config.envGuardPlugin, false)
+    ? `${buildEnvGuardPluginSetupShell()}; `
+    : "";
   // `set -o pipefail` so an opencode binary crash surfaces as a non-zero
   // shell exit code instead of being masked by tee's exit code. Mirrors
   // the claude_k8s adapter's fix.
@@ -1242,7 +1252,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const dbResetGuard = hasAgentDb
     ? `__ocdb=/opencode-db/opencode.db; __ocdir="$(dirname "$__ocdb")"; __ocver="$(opencode --version 2>/dev/null | head -n1)"; __ocprev="$(cat "$__ocdir/.opencode-version" 2>/dev/null || true)"; if [ -n "$__ocver" ] && [ -f "$__ocdb" ] && [ "$__ocver" != "$__ocprev" ]; then echo "[paperclip] opencode upgraded ('$__ocprev' -> '$__ocver'); resetting $__ocdb to avoid stale-schema crash" >&2; rm -f "$__ocdb" "$__ocdb-shm" "$__ocdb-wal" 2>/dev/null || true; else __ocbytes=0; for __ocf in "$__ocdb" "$__ocdb-wal" "$__ocdb-shm"; do if [ -f "$__ocf" ]; then __ocsz="$(wc -c < "$__ocf" 2>/dev/null || echo 0)"; __ocsz="\${__ocsz##* }"; __ocbytes=$((__ocbytes + \${__ocsz:-0})); fi; done; if [ -f "$__ocdb" ] && [ "$__ocbytes" -gt 524288000 ]; then echo "[paperclip] opencode DB $__ocbytes bytes exceeds 524288000; resetting $__ocdb to cap growth" >&2; rm -f "$__ocdb" "$__ocdb-shm" "$__ocdb-wal" 2>/dev/null || true; fi; fi; if [ -n "$__ocver" ]; then mkdir -p "$__ocdir" 2>/dev/null || true; printf '%s' "$__ocver" > "$__ocdir/.opencode-version" 2>/dev/null || true; fi; `
     : "";
-  const baseMainCommand = `set -o pipefail; ${isolatedRuntimePrep}${workspaceSetup}${ccrotateRefresh}; ${authBootstrap}; ${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${shellQuote(podLogPath)}) && : > ${shellQuote(podLogPath)} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${shellQuote(podLogPath)}`;
+  const baseMainCommand = `set -o pipefail; ${isolatedRuntimePrep}${workspaceSetup}${ccrotateRefresh}; ${authBootstrap}; ${envGuardPluginSetup}${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${shellQuote(podLogPath)}) && : > ${shellQuote(podLogPath)} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${shellQuote(podLogPath)}`;
   // Redirect Chrome's BrowserMetrics spool off the shared CephFS HOME to the
   // main container's per-pod runtime-cache emptyDir. The
   // agent-browser designer tool launches system Chrome with the default
