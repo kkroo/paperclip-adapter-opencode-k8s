@@ -32,6 +32,13 @@ const blocked = [
   "sh -lc env",
   "bash -c printenv",
   "/bin/sh -lc env",
+  "sh -c env ignored",
+  "sh -lc env ignored",
+  "bash -c printenv ignored",
+  'bash -c "env" ignored',
+  "bash -c 'printenv' ignored",
+  "/bin/sh -lc env ignored",
+  'bash -lc "sh -c env ignored"',
   "paperclip-safe-env && printenv",
   "env; ./scripts/safe-env-inspect.mjs",
 ];
@@ -39,6 +46,8 @@ const allowed = [
   // Legitimate env USE (set-and-run) must not be blocked.
   "env FOO=bar node script.js",
   "printenv PATH",
+  'sh -c "env FOO=bar node script.js" ignored',
+  'bash -c "printenv PATH" ignored',
   // set with flags is ubiquitous in agent shells.
   "set -euo pipefail",
   "set -e",
