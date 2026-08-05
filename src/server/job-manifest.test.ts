@@ -1495,11 +1495,12 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
     });
 
     // PEN-1305 plugin arm — canary-gated behind adapter config envGuardPlugin.
-    it("does NOT install the env-guard plugin by default (canary gate off)", () => {
+    it("cleans up stale env-guard plugin artifacts by default (canary gate off)", () => {
       const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
       const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
-      expect(cmd).not.toContain("paperclip-env-guard.js");
-      expect(cmd).not.toContain("GUARD_OC_DIR");
+      expect(cmd).toContain('GUARD_OC_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"');
+      expect(cmd).toContain('rm -f "$GUARD_OC_DIR/plugin/paperclip-env-guard.js" "$GUARD_OC_DIR/safe-env-inspect.mjs"');
+      expect(cmd).not.toContain("base64 -d >");
     });
 
     it("installs the env-guard plugin into the global opencode plugin dir when envGuardPlugin=true", () => {

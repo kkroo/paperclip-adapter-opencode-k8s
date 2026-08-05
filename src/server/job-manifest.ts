@@ -16,7 +16,7 @@ import {
   renderPaperclipWakePrompt,
 } from "@paperclipai/adapter-utils/server-utils";
 import type { SelfPodInfo } from "./k8s-client.js";
-import { buildEnvGuardPluginSetupShell } from "./env-guard-plugin.js";
+import { buildEnvGuardPluginCleanupShell, buildEnvGuardPluginSetupShell } from "./env-guard-plugin.js";
 
 /**
  * Path to the project-scope .mcp.json that paperclip's helm-chart seed-init
@@ -1158,7 +1158,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // validates a live run; see env-guard-plugin.ts.
   const envGuardPluginSetup = asBoolean(config.envGuardPlugin, false)
     ? `${buildEnvGuardPluginSetupShell()}; `
-    : "";
+    : `${buildEnvGuardPluginCleanupShell()}; `;
   // `set -o pipefail` so an opencode binary crash surfaces as a non-zero
   // shell exit code instead of being masked by tee's exit code. Mirrors
   // the claude_k8s adapter's fix.
