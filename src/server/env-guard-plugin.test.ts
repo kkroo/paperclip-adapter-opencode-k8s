@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -7,6 +8,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import {
   ENV_GUARD_PLUGIN_SCRIPT,
   SAFE_ENV_INSPECT_SCRIPT,
+  buildEnvGuardPluginCleanupShell,
   buildEnvGuardPluginSetupShell,
   classifyAgentShellCommand,
 } from "./env-guard-plugin.js";
@@ -27,6 +29,11 @@ const blocked = [
   "ls && printenv",
   'sh -lc "env"',
   "bash -c 'printenv'",
+  "sh -lc env",
+  "bash -c printenv",
+  "/bin/sh -lc env",
+  "paperclip-safe-env && printenv",
+  "env; ./scripts/safe-env-inspect.mjs",
 ];
 const allowed = [
   // Legitimate env USE (set-and-run) must not be blocked.
@@ -202,5 +209,26 @@ describe("buildEnvGuardPluginSetupShell", () => {
   it("contains no raw single quotes inside the base64 payloads (sh -c safety)", () => {
     const pluginB64 = Buffer.from(ENV_GUARD_PLUGIN_SCRIPT, "utf8").toString("base64");
     expect(pluginB64).toMatch(/^[A-Za-z0-9+/=]+$/);
+  });
+});
+
+describe("buildEnvGuardPluginCleanupShell", () => {
+  it("removes stale guard artifacts from a reused config root", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "pc-oc-guard-cleanup-"));
+    scratchDirs.push(root);
+    const opencodeDir = path.join(root, "opencode");
+    const pluginDir = path.join(opencodeDir, "plugin");
+    mkdirSync(pluginDir, { recursive: true });
+    const pluginPath = path.join(pluginDir, "paperclip-env-guard.js");
+    const helperPath = path.join(opencodeDir, "safe-env-inspect.mjs");
+    writeFileSync(pluginPath, "stale");
+    writeFileSync(helperPath, "stale");
+
+    execFileSync("sh", ["-c", buildEnvGuardPluginCleanupShell()], {
+      env: { ...process.env, XDG_CONFIG_HOME: root, HOME: root },
+    });
+
+    expect(existsSync(pluginPath)).toBe(false);
+    expect(existsSync(helperPath)).toBe(false);
   });
 });
