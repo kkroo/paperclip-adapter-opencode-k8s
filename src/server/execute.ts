@@ -1606,8 +1606,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           }),
         );
         const running = existing.items.filter(
-          (j) => !j.metadata?.deletionTimestamp
-            && !j.status?.conditions?.some((c) => (c.type === "Complete" || c.type === "Failed") && c.status === "True"),
+          (j) => !j.status?.conditions?.some((c) => (c.type === "Complete" || c.type === "Failed") && c.status === "True"),
         );
         if (running.length > 0) {
           const competingJobs = running.filter((j) => !(

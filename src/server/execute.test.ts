@@ -749,10 +749,23 @@ describe("execute — concurrency guard", () => {
     expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
   });
 
-  it("does not treat a deleting Job as a live owner", async () => {
+  it("blocks a deleting nonterminal Job because its pod may still be running", async () => {
     const batchApi = makeBatchApi([{
       metadata: { name: "deleting-job", deletionTimestamp: new Date() },
       status: { conditions: [] },
+    }]);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+  });
+
+  it("does not block on a deleting Job that is already terminal failed", async () => {
+    const batchApi = makeBatchApi([{
+      metadata: { name: "deleting-failed-job", deletionTimestamp: new Date() },
+      status: { conditions: [{ type: "Failed", status: "True" }] },
     }]);
     vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
 
