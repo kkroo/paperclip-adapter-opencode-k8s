@@ -508,34 +508,44 @@ export async function waitForJobCompletion(
 export async function completionWithGrace(
   completionPromise: Promise<JobCompletionResult>,
   graceMs: number,
+  graceStartsAfter: Promise<unknown> = Promise.resolve(),
 ): Promise<JobCompletionResult> {
-  // graceMs <= 0 disables the cap entirely.  Without this guard a graceMs of 0
-  // arms a setTimeout(_, 0) that fires on the next tick with timedOut=true and
-  // wins the race against any in-flight job — turning "no timeout configured"
-  // into a 0-second deadline (BLO-2436).
-  // A *rejected* completionPromise means we couldn't determine the job's
-  // outcome (e.g. sustained k8s read errors from waitForJobCompletion), NOT
-  // that the job exceeded a deadline. Returning timedOut:true here mislabels a
-  // finished/running job as a timeout — with timeoutSec=0 it surfaces as the
-  // bogus "Timed out after 0s" and discards an otherwise-successful run
-  // (BLO-10448). Return timedOut:false so the caller adjudicates via the pod's
-  // real exit code (getPodTerminatedInfo). Only the grace timer below is a true
-  // timeout.
+  const outcomeUnknown: JobCompletionResult = {
+    succeeded: false,
+    timedOut: false,
+    jobGone: false,
+  };
+
+  // The grace cap is only for the gap between the container log stream ending
+  // and the Job condition settling. It is not the adapter wall-clock timeout,
+  // so expiring it must never produce timedOut=true. The completion poll owns
+  // that classification because it observes either the configured deadline or
+  // Kubernetes' DeadlineExceeded condition.
   if (graceMs <= 0) {
     try {
       return await completionPromise;
     } catch {
-      return { succeeded: false, timedOut: false, jobGone: false };
+      return outcomeUnknown;
     }
   }
-  const graceExpired = new Promise<JobCompletionResult>(
-    (resolve) => setTimeout(() => resolve({ succeeded: false, timedOut: true, jobGone: false }), graceMs),
-  );
-  try {
-    return await Promise.race([completionPromise, graceExpired]);
-  } catch {
-    return { succeeded: false, timedOut: false, jobGone: false };
-  }
+
+  return await new Promise<JobCompletionResult>((resolve) => {
+    let settled = false;
+    let graceTimer: ReturnType<typeof setTimeout> | null = null;
+    const settle = (result: JobCompletionResult) => {
+      if (settled) return;
+      settled = true;
+      if (graceTimer) clearTimeout(graceTimer);
+      resolve(result);
+    };
+    const armGrace = () => {
+      if (settled || graceTimer) return;
+      graceTimer = setTimeout(() => settle(outcomeUnknown), graceMs);
+    };
+
+    void completionPromise.then(settle, () => settle(outcomeUnknown));
+    void graceStartsAfter.then(armGrace, armGrace);
+  });
 }
 
 async function getPodTerminatedInfo(
@@ -1002,17 +1012,21 @@ async function streamAndAwaitJob(
       return onLog(stream, chunk);
     };
 
-    // Run the file tail and the job-completion poll in parallel so that the
-    // tail loop has a way to stop: when waitForJobCompletion resolves it sets
-    // stopSignal.stopped, which lets tailPodLogFile drain and return.
+    // Run the log tail and the job-completion poll in parallel. The grace cap
+    // starts only after the log stream exits; starting it here would mark every
+    // healthy finite-timeout run as timed out after 30 seconds while still
+    // preserving the pod's eventual exit code 0 (BLO-22922).
     const completionPromise = waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath)
       .then((r) => { stopSignal.stopped = true; return r; });
-    // When timeoutSec=0 (completionTimeoutMs=0), the user opted out of all
-    // deadlines.  Passing 0 here disables the log-exit grace cap so it cannot
-    // race the legitimate job completion (BLO-2436).
+    const tailPromise = tailPodContainerLogs(namespace, podName, "opencode", {
+      onLog: wrappedOnLog,
+      stopSignal,
+      kubeconfigPath,
+    });
     const completionGraced = completionWithGrace(
       completionPromise,
-      completionTimeoutMs > 0 ? LOG_EXIT_COMPLETION_GRACE_MS : 0,
+      LOG_EXIT_COMPLETION_GRACE_MS,
+      tailPromise,
     );
     // Stream pod stdout via the Kubernetes log API instead of polling
     // the tee'd PVC file. The previous file-polling path silently
@@ -1022,11 +1036,7 @@ async function streamAndAwaitJob(
     // post-mortem. The tee is preserved by job-manifest.ts for forensic
     // backup but no longer participates in the live tail.
     const [tailSettled, completionSettled] = await Promise.allSettled([
-      tailPodContainerLogs(namespace, podName, "opencode", {
-        onLog: wrappedOnLog,
-        stopSignal,
-        kubeconfigPath,
-      }),
+      tailPromise,
       completionGraced,
     ]);
     stdout = tailSettled.status === "fulfilled" ? tailSettled.value : "";
@@ -1050,6 +1060,13 @@ async function streamAndAwaitJob(
     exitCode = terminatedInfo.exitCode;
     podTerminatedReason = terminatedInfo.reason;
     terminatedPodName = terminatedInfo.podName;
+    if (jobTimedOut && exitCode === 0) {
+      jobTimedOut = false;
+      await onLog(
+        "stderr",
+        "[paperclip] Ignoring inconsistent timeout marker because the opencode container exited successfully.\n",
+      );
+    }
   } finally {
     if (keepaliveTimer) {
       clearInterval(keepaliveTimer);
