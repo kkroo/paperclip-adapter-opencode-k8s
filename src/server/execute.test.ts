@@ -1261,12 +1261,37 @@ describe("execute — timeout", () => {
       status: { conditions: [{ type: "Failed", status: "True", reason: "DeadlineExceeded" }] },
     });
     vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+    vi.mocked(getCoreApi).mockReturnValue(
+      makeCoreApi(137, "DeadlineExceeded") as unknown as ReturnType<typeof getCoreApi>,
+    );
 
     const ctx = makeCtx({ timeoutSec: 300 });
     const result = await execute(ctx);
 
     expect(result.timedOut).toBe(true);
     expect(result.errorCode).toBe("timeout");
+  });
+
+  it("does not report timedOut when the pod has a confirmed successful exit", async () => {
+    const batchApi = makeBatchApi();
+    batchApi.readNamespacedJob.mockResolvedValue({
+      status: { conditions: [{ type: "Failed", status: "True", reason: "DeadlineExceeded" }] },
+    });
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+    vi.mocked(getCoreApi).mockReturnValue(
+      makeCoreApi(0) as unknown as ReturnType<typeof getCoreApi>,
+    );
+
+    const ctx = makeCtx({ timeoutSec: 300 });
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.timedOut).toBe(false);
+    expect(result.errorCode).toBeUndefined();
+    expect(ctx.onLog).toHaveBeenCalledWith(
+      "stderr",
+      expect.stringContaining("Ignoring inconsistent timeout marker"),
+    );
   });
 });
 
@@ -1896,7 +1921,7 @@ describe("completionWithGrace", () => {
     expect(result).toEqual({ succeeded: true, timedOut: false, jobGone: false });
   });
 
-  it("returns timedOut result when grace expires first", async () => {
+  it("returns outcome unknown, not timedOut, when log-exit grace expires first", async () => {
     const { completionWithGrace } = await import("./execute.js");
     vi.useFakeTimers();
     try {
@@ -1904,7 +1929,37 @@ describe("completionWithGrace", () => {
       const racePromise = completionWithGrace(slowCompletion, 50);
       await vi.advanceTimersByTimeAsync(60);
       const result = await racePromise;
-      expect(result).toEqual({ succeeded: false, timedOut: true, jobGone: false });
+      expect(result).toEqual({ succeeded: false, timedOut: false, jobGone: false });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not start the grace timer until the log stream exits", async () => {
+    const { completionWithGrace } = await import("./execute.js");
+    vi.useFakeTimers();
+    try {
+      const slowCompletion = new Promise<{ succeeded: boolean; timedOut: boolean; jobGone: boolean }>(() => {});
+      let finishLogStream!: () => void;
+      const logStream = new Promise<void>((resolve) => {
+        finishLogStream = resolve;
+      });
+      const racePromise = completionWithGrace(slowCompletion, 50, logStream);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      const beforeLogExit = await Promise.race([
+        racePromise.then(() => "race-resolved" as const),
+        Promise.resolve("still-pending" as const),
+      ]);
+      expect(beforeLogExit).toBe("still-pending");
+
+      finishLogStream();
+      await vi.advanceTimersByTimeAsync(60);
+      await expect(racePromise).resolves.toEqual({
+        succeeded: false,
+        timedOut: false,
+        jobGone: false,
+      });
     } finally {
       vi.useRealTimers();
     }
