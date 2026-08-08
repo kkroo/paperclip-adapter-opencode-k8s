@@ -727,7 +727,7 @@ describe("execute — concurrency guard", () => {
     expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
   });
 
-  it("ignores the exact persisted lifecycle Job for the current run", async () => {
+  it("reattaches to the exact persisted lifecycle Job without recreating its prompt Secret or Job", async () => {
     const TASK_ID = "task-uuid-default";
     const batchApi = makeBatchApi([
       {
@@ -736,7 +736,54 @@ describe("execute — concurrency guard", () => {
           uid: "current-uid",
           labels: { "paperclip.io/task-id": TASK_ID, "paperclip.io/run-id": "run-test-123" },
         },
+        spec: {
+          template: {
+            spec: {
+              volumes: [{ name: "prompt-secret", secret: { secretName: "current-job-prompt" } }],
+            },
+          },
+        },
         status: { conditions: [] },
+      },
+    ]);
+    const coreApi = makeCoreApi();
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+    const onExternalRuntimeLaunched = vi.fn().mockResolvedValue(undefined);
+    const ctx = {
+      ...makeCtx(),
+      onExternalRuntimeLaunched,
+      externalRuntime: { reservationId: "reservation-1", slotId: 0, jobName: "current-job", jobUid: "current-uid" },
+      context: { taskId: TASK_ID, issueId: null, paperclipWorkspace: null, issueIds: null, paperclipWorkspaces: null, paperclipRuntimeServiceIntents: null, paperclipRuntimeServices: null },
+    } as unknown as AdapterExecutionContext;
+    const result = await execute(ctx);
+
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+    expect(coreApi.createNamespacedSecret).not.toHaveBeenCalled();
+    expect(coreApi.deleteNamespacedSecret).toHaveBeenCalledWith({
+      name: "current-job-prompt",
+      namespace: NAMESPACE,
+    });
+    expect(buildJobManifest).not.toHaveBeenCalled();
+    expect(onExternalRuntimeLaunched).not.toHaveBeenCalled();
+    expect(ctx.onLog).toHaveBeenCalledWith(
+      "stdout",
+      expect.stringContaining("Reattaching to persisted K8s Job current-job"),
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.sessionId).toBe("ses_happy");
+  });
+
+  it("reattaches when the exact persisted lifecycle Job completed before recovery", async () => {
+    const batchApi = makeBatchApi([
+      {
+        metadata: {
+          name: "current-job",
+          uid: "current-uid",
+          labels: { "paperclip.io/run-id": "run-test-123" },
+        },
+        status: { conditions: [{ type: "Complete", status: "True" }] },
       },
     ]);
     vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
@@ -744,12 +791,13 @@ describe("execute — concurrency guard", () => {
     const ctx = {
       ...makeCtx(),
       externalRuntime: { reservationId: "reservation-1", slotId: 0, jobName: "current-job", jobUid: "current-uid" },
-      context: { taskId: TASK_ID, issueId: null, paperclipWorkspace: null, issueIds: null, paperclipWorkspaces: null, paperclipRuntimeServiceIntents: null, paperclipRuntimeServices: null },
     } as unknown as AdapterExecutionContext;
     const result = await execute(ctx);
 
-    expect(batchApi.createNamespacedJob).toHaveBeenCalled();
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+    expect(buildJobManifest).not.toHaveBeenCalled();
     expect(result.exitCode).toBe(0);
+    expect(result.sessionId).toBe("ses_happy");
   });
 
   it("blocks a second same-run Job when the exact current Job is present", async () => {
