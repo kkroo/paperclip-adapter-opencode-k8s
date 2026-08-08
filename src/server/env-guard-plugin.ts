@@ -39,7 +39,7 @@ export type AgentShellCommandDecision =
 const SAFE_ENV_INSPECTION_COMMAND_RE =
   /^(?:node\s+)?(?:~\/\.claude\/safe-env-inspect\.mjs|\.\/scripts\/safe-env-inspect\.mjs|scripts\/safe-env-inspect\.mjs|safe-env-inspect|paperclip-safe-env)\s*$/;
 
-const SHELL_WRAPPER_RE = /^(?:\/bin\/)?(?:ba|z|)?sh\s+-l?c\s+(?:(["'])([\s\S]*)\1|([^\s][\s\S]*))\s*$/;
+const SHELL_COMMAND_PREFIX_RE = /^(?:\/bin\/)?(?:ba|z|)?sh\s+-l?c(?:\s+|$)/;
 
 const FULL_ENV_DUMP_RE = new RegExp(
   [
@@ -53,12 +53,33 @@ const FULL_ENV_DUMP_RE = new RegExp(
   "i",
 );
 
+function readShellCommandArgument(input: string): string {
+  const rest = input.trimStart();
+  if (!rest) return "";
+  const quote = rest[0];
+  if (quote === "'" || quote === '"') {
+    let out = "";
+    for (let i = 1; i < rest.length; i += 1) {
+      const ch = rest[i];
+      if (ch === quote) return out;
+      if (quote === '"' && ch === "\\" && i + 1 < rest.length) {
+        i += 1;
+        out += rest[i] ?? "";
+      } else {
+        out += ch;
+      }
+    }
+    return out;
+  }
+  return /^[^\s]+/.exec(rest)?.[0] ?? "";
+}
+
 function unwrapShell(command: string): string {
   let current = command.trim();
   for (let i = 0; i < 3; i += 1) {
-    const match = SHELL_WRAPPER_RE.exec(current);
+    const match = SHELL_COMMAND_PREFIX_RE.exec(current);
     if (!match) return current;
-    current = match[2] ?? match[3] ?? current;
+    current = readShellCommandArgument(current.slice(match[0].length));
   }
   return current;
 }
@@ -96,14 +117,35 @@ export const ENV_GUARD_PLUGIN_SCRIPT = String.raw`// paperclip-env-guard.js — 
 // paperclip-adapter-opencode-k8s; do not edit in the pod.
 const SAFE_ENV_INSPECTION_COMMAND_RE =
   /^(?:node\s+)?(?:~\/\.claude\/safe-env-inspect\.mjs|\.\/scripts\/safe-env-inspect\.mjs|scripts\/safe-env-inspect\.mjs|safe-env-inspect|paperclip-safe-env)\s*$/;
-const SHELL_WRAPPER_RE = /^(?:\/bin\/)?(?:ba|z|)?sh\s+-l?c\s+(?:(["'])([\s\S]*)\1|([^\s][\s\S]*))\s*$/;
+const SHELL_COMMAND_PREFIX_RE = /^(?:\/bin\/)?(?:ba|z|)?sh\s+-l?c(?:\s+|$)/;
 const FULL_ENV_DUMP_RE = /(?:^|[;&|]\s*)(?:command\s+)?(?:\/usr\/bin\/)?(?:env|printenv)(?:\s*(?:[;&|]|$))|(?:^|[;&|]\s*)(?:set)(?:\s*(?:[;&|]|$))|(?:^|[;&|]\s*)export\s+-p(?:\s*(?:[;&|]|$))|(?:^|[;&|]\s*)declare\s+-x(?:\s*(?:[;&|]|$))|(?:^|[;&|]\s*)cat\s+\/proc\/(?:self|\d+)\/environ(?:\s*(?:[;&|]|$))|\/proc\/(?:self|\d+)\/environ/i;
+function readShellCommandArgument(input) {
+  const rest = String(input || "").trimStart();
+  if (!rest) return "";
+  const quote = rest[0];
+  if (quote === "'" || quote === '"') {
+    let out = "";
+    for (let i = 1; i < rest.length; i += 1) {
+      const ch = rest[i];
+      if (ch === quote) return out;
+      if (quote === '"' && ch === "\\" && i + 1 < rest.length) {
+        i += 1;
+        out += rest[i] || "";
+      } else {
+        out += ch;
+      }
+    }
+    return out;
+  }
+  const match = /^[^\s]+/.exec(rest);
+  return match ? match[0] : "";
+}
 function unwrapShell(command) {
   let current = String(command || "").trim();
   for (let i = 0; i < 3; i += 1) {
-    const match = SHELL_WRAPPER_RE.exec(current);
+    const match = SHELL_COMMAND_PREFIX_RE.exec(current);
     if (!match) return current;
-    current = match[2] != null ? match[2] : match[3] != null ? match[3] : current;
+    current = readShellCommandArgument(current.slice(match[0].length));
   }
   return current;
 }
