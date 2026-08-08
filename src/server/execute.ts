@@ -1622,17 +1622,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             labelSelector: `paperclip.io/agent-id=${agentId},paperclip.io/adapter-type=opencode_k8s`,
           }),
         );
+        const exactCurrentJob = currentJobIdentity?.jobName && currentJobIdentity.jobUid
+          ? existing.items.find((j) => (
+              j.metadata?.labels?.["paperclip.io/run-id"] === sanitizeLabelValue(ctx.runId)
+              && j.metadata?.name === currentJobIdentity.jobName
+              && j.metadata?.uid === currentJobIdentity.jobUid
+            ))
+          : undefined;
         const running = existing.items.filter(
           (j) => !j.status?.conditions?.some((c) => (c.type === "Complete" || c.type === "Failed") && c.status === "True"),
         );
         if (running.length > 0) {
-          const competingJobs = running.filter((j) => !(
-            j.metadata?.labels?.["paperclip.io/run-id"] === sanitizeLabelValue(ctx.runId)
-            && currentJobIdentity?.jobName
-            && currentJobIdentity.jobUid
-            && j.metadata?.name === currentJobIdentity.jobName
-            && j.metadata?.uid === currentJobIdentity.jobUid
-          ));
+          const competingJobs = running.filter((j) => j !== exactCurrentJob);
           const blockingJobs = competingJobs.filter((j) => {
             if (runIsolation.mode === "shared" || !runIsolation.keyHash) return true;
             const labels = j.metadata?.labels ?? {};
@@ -1669,6 +1670,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             continue;
           }
 
+        }
+
+        if (exactCurrentJob) {
+          const exactJobName = exactCurrentJob.metadata?.name as string;
+          const promptSecretName = exactCurrentJob.spec?.template.spec?.volumes
+            ?.find((volume) => volume.name === "prompt-secret")
+            ?.secret?.secretName;
+          const podLogPath = buildPodLogPath(ctx.agent.companyId, agentId, ctx.runId);
+          await onLog(
+            "stdout",
+            `[paperclip] Reattaching to persisted K8s Job ${exactJobName} for the current run after adapter restart.\n`,
+          );
+          activeJobs.set(exactJobName, { namespace: guardNamespace, kubeconfigPath, promptSecretName });
+          return streamAndAwaitJob(
+            ctx,
+            exactJobName,
+            guardNamespace,
+            timeoutSec,
+            graceSec,
+            kubeconfigPath,
+            retainJobs,
+            podLogPath,
+            promptSecretName,
+          );
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
