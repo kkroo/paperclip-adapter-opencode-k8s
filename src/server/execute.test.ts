@@ -311,6 +311,42 @@ function makeLogApiFromFsMock() {
   };
 }
 
+/**
+ * Log API mock whose stream stays OPEN until the returned `endLogStream()` is
+ * called. Models a long-running agent that keeps streaming stdout for the whole
+ * run — the shape that exposed BLO-22997, where the log-exit grace timer was
+ * armed at construction instead of on log-stream exit.
+ *
+ * `started` resolves once `.log()` has actually been invoked, so tests can
+ * advance fake timers only after the tail is really attached.
+ */
+function makeHeldOpenLogApi() {
+  let stream: import("node:stream").Writable | null = null;
+  let endRequested = false;
+  let signalStarted!: () => void;
+  const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+  const logApi = {
+    log: vi.fn(async (
+      _namespace: string,
+      _podName: string,
+      _container: string,
+      writable: import("node:stream").Writable,
+    ) => {
+      const payload = getMockPayload();
+      if (payload) writable.write(payload);
+      stream = writable;
+      if (endRequested) writable.end();
+      signalStarted();
+      return { abort: vi.fn() } as unknown as AbortController;
+    }),
+  };
+  return {
+    logApi,
+    started,
+    endLogStream: () => { endRequested = true; stream?.end(); },
+  };
+}
+
 function makeLogApi(payload: string = "") {
   return {
     log: vi.fn(async (
@@ -1293,6 +1329,84 @@ describe("execute — timeout", () => {
       expect.stringContaining("Ignoring inconsistent timeout marker"),
     );
   });
+
+  // Production shape of BLO-22997: run 90ac448e ran 6m23s under timeoutSec=3600,
+  // streamed logs the whole time, exited 0 — and was still reported as
+  // "Timed out after 3600s" because LOG_EXIT_COMPLETION_GRACE_MS armed a 30s
+  // deadline at construction rather than on log-stream exit.
+  it("does not report a timeout when a long-running job completes successfully after the log-exit grace window (BLO-22997)", async () => {
+    vi.useFakeTimers();
+    try {
+      let jobComplete = false;
+      const batchApi = makeBatchApi();
+      batchApi.readNamespacedJob.mockImplementation(async () => ({
+        status: { conditions: jobComplete ? [{ type: "Complete", status: "True" }] : [] },
+      }));
+      vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+      vi.mocked(getCoreApi).mockReturnValue(
+        makeCoreApi(0) as unknown as ReturnType<typeof getCoreApi>,
+      );
+
+      const { logApi, started, endLogStream } = makeHeldOpenLogApi();
+      vi.mocked(getLogApi).mockReturnValue(logApi as unknown as ReturnType<typeof getLogApi>);
+
+      const ctx = makeCtx({ timeoutSec: 3600 });
+      const executePromise = execute(ctx);
+      await started;
+
+      // Well past LOG_EXIT_COMPLETION_GRACE_MS (30s) with the log stream still
+      // open: the grace countdown must not have started yet.
+      await vi.advanceTimersByTimeAsync(90_000);
+
+      jobComplete = true;
+      endLogStream();
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      const result = await executePromise;
+
+      expect(result.exitCode).toBe(0);
+      expect(result.timedOut).toBe(false);
+      expect(result.errorCode).toBeUndefined();
+      expect(result.errorMessage ?? "").not.toMatch(/Timed out/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still reports timedOut when the configured wall-clock deadline is exceeded", async () => {
+    vi.useFakeTimers();
+    try {
+      // Job never reaches a terminal condition, so waitForJobCompletion's own
+      // deadline is what fires. Pod is SIGKILLed, so exitCode is non-zero and
+      // the exit-code-0 consistency guard correctly stays out of the way.
+      const batchApi = makeBatchApi();
+      batchApi.readNamespacedJob.mockResolvedValue({ status: { conditions: [] } });
+      vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+      vi.mocked(getCoreApi).mockReturnValue(
+        makeCoreApi(137, "DeadlineExceeded") as unknown as ReturnType<typeof getCoreApi>,
+      );
+
+      const { logApi, started, endLogStream } = makeHeldOpenLogApi();
+      vi.mocked(getLogApi).mockReturnValue(logApi as unknown as ReturnType<typeof getLogApi>);
+
+      // completionTimeoutMs = (timeoutSec + graceSec) * 1000 = 75s.
+      const ctx = makeCtx({ timeoutSec: 60, graceSec: 15 });
+      const executePromise = execute(ctx);
+      await started;
+
+      await vi.advanceTimersByTimeAsync(90_000);
+      endLogStream();
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      const result = await executePromise;
+
+      expect(result.timedOut).toBe(true);
+      expect(result.errorCode).toBe("timeout");
+      expect(result.errorMessage).toBe("Timed out after 60s");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("execute — retainJobs config", () => {
@@ -1960,6 +2074,28 @@ describe("completionWithGrace", () => {
         timedOut: false,
         jobGone: false,
       });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns a late successful completion instead of capping it, while the log stream is still open (BLO-22997)", async () => {
+    const { completionWithGrace } = await import("./execute.js");
+    vi.useFakeTimers();
+    try {
+      let finishCompletion!: (r: { succeeded: boolean; timedOut: boolean; jobGone: boolean }) => void;
+      const completion = new Promise<{ succeeded: boolean; timedOut: boolean; jobGone: boolean }>(
+        (resolve) => { finishCompletion = resolve; },
+      );
+      // Log stream never exits — the agent is still streaming stdout.
+      const logStream = new Promise<void>(() => {});
+      const graced = completionWithGrace(completion, 30_000, logStream);
+
+      // 6m23s, the real elapsed time of production run 90ac448e.
+      await vi.advanceTimersByTimeAsync(383_000);
+      finishCompletion({ succeeded: true, timedOut: false, jobGone: false });
+
+      await expect(graced).resolves.toEqual({ succeeded: true, timedOut: false, jobGone: false });
     } finally {
       vi.useRealTimers();
     }
