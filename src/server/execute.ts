@@ -810,13 +810,6 @@ async function streamAndAwaitJob(
     // stopSignal.stopped, which lets tailPodLogFile drain and return.
     const completionPromise = waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath)
       .then((r) => { stopSignal.stopped = true; return r; });
-    // When timeoutSec=0 (completionTimeoutMs=0), the user opted out of all
-    // deadlines.  Passing 0 here disables the log-exit grace cap so it cannot
-    // race the legitimate job completion (BLO-2436).
-    const completionGraced = completionWithGrace(
-      completionPromise,
-      completionTimeoutMs > 0 ? LOG_EXIT_COMPLETION_GRACE_MS : 0,
-    );
     // Stream pod stdout via the Kubernetes log API instead of polling
     // the tee'd PVC file. The previous file-polling path silently
     // truncated long runs to ~300 bytes because cephfs's metadata cap
@@ -824,13 +817,37 @@ async function streamAndAwaitJob(
     // writing — see tailPodContainerLogs doc-comment for the full
     // post-mortem. The tee is preserved by job-manifest.ts for forensic
     // backup but no longer participates in the live tail.
-    const [tailSettled, completionSettled] = await Promise.allSettled([
+    // Await the log tail FIRST, then arm the log-exit grace. The grace bounds
+    // how long we keep waiting for the Job to report terminal state *after the
+    // logs have drained* — that is what LOG_EXIT_COMPLETION_GRACE_MS means.
+    //
+    // Arming it up-front (inside this allSettled, alongside the tail) made it a
+    // 30-second deadline on the whole run: completionWithGrace resolves
+    // timedOut:true at T+30s, while the tail keeps streaming until the REAL
+    // completionPromise sets stopSignal.stopped. allSettled then waits for the
+    // tail, so a run executed to completion for minutes and was still stamped
+    // timedOut from a timer that fired at 30s. Line ~884 reports that as
+    // `Timed out after ${timeoutSec}s`, so it surfaced as "Timed out after
+    // 7200s" on runs that ran 102-968s, and their finished work was discarded.
+    // Observed 2026-08-08: 242 such runs for one agent in 24h.
+    //
+    // timeoutSec=0 masked this entirely (grace 0 = disabled, BLO-2436), which
+    // is why it only appears once a non-zero timeout is configured.
+    const [tailSettled] = await Promise.allSettled([
       tailPodContainerLogs(namespace, podName, "opencode", {
         onLog: wrappedOnLog,
         stopSignal,
         kubeconfigPath,
       }),
-      completionGraced,
+    ]);
+    // When timeoutSec=0 (completionTimeoutMs=0), the user opted out of all
+    // deadlines.  Passing 0 here disables the log-exit grace cap so it cannot
+    // race the legitimate job completion (BLO-2436).
+    const [completionSettled] = await Promise.allSettled([
+      completionWithGrace(
+        completionPromise,
+        completionTimeoutMs > 0 ? LOG_EXIT_COMPLETION_GRACE_MS : 0,
+      ),
     ]);
     stdout = tailSettled.status === "fulfilled" ? tailSettled.value : "";
     if (completionSettled.status === "rejected") {
