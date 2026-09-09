@@ -11,6 +11,8 @@ Paperclip adapter plugin that runs OpenCode agents as isolated Kubernetes Jobs i
 - Per-agent concurrency guard
 - Skills bundle injection — skill markdown content prepended to each run prompt at execution time
 - Optional per-agent database PVC (`agentDbMode: dedicated_pvc`) for persistent agent state across runs
+- Optional external launcher support for Caveman/Penstock routing
+- Optional Ponytail plugin wiring with explicit mode selection
 - Configurable resources, namespace, kubeconfig, node selectors, and tolerations
 - Runtime config injection for permission bypass
 
@@ -103,10 +105,10 @@ rules:
     resources: ["persistentvolumeclaims"]
     verbs: ["get", "create", "delete"]
 
-  # Verify optional secrets; create/delete prompt-delivery Secrets for large prompts (> 256 KiB)
+  # Create/delete per-run prompt, environment, and MCP Secrets; patch owner references
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["create", "delete", "get"]
+    verbs: ["create", "delete", "get", "patch"]
 
   # RBAC self-test during adapter validation
   - apiGroups: ["authorization.k8s.io"]
@@ -180,6 +182,9 @@ Agent-level configuration fields:
 |-------|----------|---------|-------------|
 | `model` | **yes** | — | OpenCode model in `provider/model` format |
 | `variant` | no | — | Reasoning profile variant |
+| `agentCommand` | no | `opencode` | One executable used to launch OpenCode; set to the reviewed Caveman/Penstock launcher to route through Penstock |
+| `ponytailPluginPath` | no | — | Absolute path to the installed Ponytail `.mjs` plugin file |
+| `ponytailDefaultMode` | no | — | `off`, `lite`, `full`, or `ultra`; explicit `PONYTAIL_DEFAULT_MODE` takes precedence |
 | `instructionsFilePath` | no | — | Absolute path to a markdown file prepended to every run prompt (e.g. `/paperclip/.claude/projects/COMPANY/agents/AGENT/AGENTS.md`) |
 | `dangerouslySkipPermissions` | no | `true` | Inject runtime config granting `permission.external_directory=allow` |
 | `agentDbMode` | no | `ephemeral` | `ephemeral` (emptyDir, lost on exit) or `dedicated_pvc` (per-agent RWX PVC at `/opencode-db`) |
@@ -210,6 +215,12 @@ Agent-level configuration fields:
 | `graceSec` | no | `30` | Grace period after timeout before forceful termination |
 | `env` | no | — | Additional environment variables for Jobs |
 
+Credential-shaped literal environment values are placed in a per-run Kubernetes
+Secret and referenced from the Job with `secretKeyRef`. Keep provider and
+Penstock credentials in Paperclip/Kubernetes secret bindings rather than source,
+adapter metadata, or comments. External launcher mode leaves OpenCode's own
+auth files untouched because the configured launcher owns authentication.
+
 ### Default Resource Requests and Limits
 
 If not overridden, agent Job pods use:
@@ -233,6 +244,22 @@ resources:
 5. **Job creation** — a Kubernetes Job is created in the target namespace. The Job pod mounts the shared RWX PVC at `/paperclip`, inherits all secrets and env vars, and runs the OpenCode agent.
 6. **Log streaming** — the adapter streams stdout/stderr from the Job pod back to the Paperclip UI in real time, with automatic reconnect on K8s API drops and replay deduplication to avoid duplicate output.
 7. **Cleanup** — completed Jobs are automatically deleted after `ttlSecondsAfterFinished` seconds (default 300), or retained if `retainJobs` is enabled.
+
+### Caveman and Ponytail
+
+Set `agentCommand` to the absolute path of the reviewed Penstock runtime (for
+example `/opt/penstock/bin/penstock-agent-runtime.mjs`). The adapter passes
+native
+OpenCode arguments after that executable, sets `PENSTOCK_AGENT_COMMAND=opencode`,
+and defaults `PENSTOCK_PROVIDER=openai`; an explicit provider environment value
+wins. `ponytailPluginPath` must point at the packaged Ponytail module (for
+example `/opt/penstock/ponytail/.opencode/plugins/ponytail.mjs`) and is written
+into both the normal XDG OpenCode config and the `OPENCODE_CONFIG` override used
+when MCP configuration is present.
+
+This wiring does not install either asset or claim that a Paperclip image ships
+them. Verify the runtime and plugin paths in the exact Job image, then run one
+non-production smoke task before enabling heartbeats.
 
 ### Security Context
 

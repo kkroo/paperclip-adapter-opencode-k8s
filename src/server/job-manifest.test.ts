@@ -1,5 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
-import { buildJobManifest, sanitizeLabelValue, type JobBuildInput } from "./job-manifest.js";
+import {
+  buildJobManifest,
+  sanitizeLabelValue,
+  type JobBuildInput,
+  validatePonytailPluginPath,
+} from "./job-manifest.js";
 import { ENV_GUARD_PLUGIN_SCRIPT } from "./env-guard-plugin.js";
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -135,6 +140,13 @@ describe("buildJobManifest — context-overflow auto-remediation (/compact prefi
 });
 
 describe("buildJobManifest", () => {
+  it("accepts the packaged Ponytail OpenCode module and rejects a directory path", () => {
+    expect(validatePonytailPluginPath("/opt/penstock/ponytail/.opencode/plugins/ponytail.mjs"))
+      .toBe("/opt/penstock/ponytail/.opencode/plugins/ponytail.mjs");
+    expect(() => validatePonytailPluginPath("/opt/penstock/ponytail"))
+      .toThrow("absolute .mjs file path");
+  });
+
   it("creates job with agent-opencode- prefix in name", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
 
@@ -269,7 +281,11 @@ describe("buildJobManifest", () => {
     expect(envValue("TMPDIR")).toBe("/paperclip/isolated/task-123/cache/tmp");
     expect(envValue("TMP")).toBe("/paperclip/isolated/task-123/cache/tmp");
     expect(envValue("TEMP")).toBe("/paperclip/isolated/task-123/cache/tmp");
-    expect(envValue("PAPERCLIP_K8S_ISOLATION_KEY")).toBe("co123:agent-abc:task-123");
+    const isolationKeyEnv = env.find((e) => e.name === "PAPERCLIP_K8S_ISOLATION_KEY");
+    expect(isolationKeyEnv?.value).toBeUndefined();
+    expect(isolationKeyEnv?.valueFrom?.secretKeyRef?.name).toBe(result.envSecret?.name);
+    expect(isolationKeyEnv?.valueFrom?.secretKeyRef?.key).toBe("PAPERCLIP_K8S_ISOLATION_KEY");
+    expect(result.envSecret?.data.PAPERCLIP_K8S_ISOLATION_KEY).toBe("co123:agent-abc:task-123");
     expect(result.podLogPath).toBe("/paperclip/isolated/task-123/cache/run-logs/run123456.pod.ndjson");
   });
 
@@ -1120,7 +1136,11 @@ describe("buildJobManifest — env wiring branches", () => {
     const ctx = { ...mockCtx, authToken: "tok_abc" };
     const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
     const env = result.job.spec?.template.spec?.containers[0]?.env ?? [];
-    expect(env.find((e) => e.name === "PAPERCLIP_API_KEY")?.value).toBe("tok_abc");
+    const apiKeyEnv = env.find((e) => e.name === "PAPERCLIP_API_KEY");
+    expect(apiKeyEnv?.value).toBeUndefined();
+    expect(apiKeyEnv?.valueFrom?.secretKeyRef?.name).toBe(result.envSecret?.name);
+    expect(apiKeyEnv?.valueFrom?.secretKeyRef?.key).toBe("PAPERCLIP_API_KEY");
+    expect(result.envSecret?.data.PAPERCLIP_API_KEY).toBe("tok_abc");
   });
 
   it("inherits PAPERCLIP_API_URL from selfPod inheritedEnv", () => {
@@ -1190,7 +1210,7 @@ describe("buildJobManifest — MCP fleet wiring", () => {
     expect(initCmd).not.toContain("opencode.json");
   });
 
-  it("translates per-agent mcpServers (claude shape + native opencode shape) and ships OPENCODE_CONFIG", () => {
+  it("translates per-agent mcpServers and ships OPENCODE_CONFIG through a Secret", () => {
     const ctx: JobBuildInput["ctx"] = {
       ...mockCtx,
       config: {
@@ -1236,9 +1256,8 @@ describe("buildJobManifest — MCP fleet wiring", () => {
     expect(mainEnv.find((e) => e.name === "OPENCODE_CONFIG")?.value).toBe("/tmp/prompt/opencode.json");
 
     const init = result.job.spec!.template.spec!.initContainers![0]!;
-    const cfgEnv = (init.env ?? []).find((e) => e.name === "OPENCODE_CONFIG_JSON");
-    expect(cfgEnv).toBeDefined();
-    const parsed = JSON.parse(cfgEnv!.value!) as {
+    expect(result.mcpConfigSecret).not.toBeNull();
+    const parsed = JSON.parse(result.mcpConfigSecret!.data["opencode.json"]!) as {
       $schema: string;
       permission: { external_directory: string };
       disabled_providers: string[];
@@ -1292,7 +1311,43 @@ describe("buildJobManifest — MCP fleet wiring", () => {
     });
 
     const initCmd = (init.command ?? []).join(" ");
-    expect(initCmd).toContain('printf \'%s\' "$OPENCODE_CONFIG_JSON" > /tmp/prompt/opencode.json');
+    expect(initCmd).toContain("cp /tmp/mcp-secret/opencode.json /tmp/prompt/opencode.json");
+    expect((init.env ?? []).map((entry) => entry.name)).not.toContain("OPENCODE_CONFIG_JSON");
+    expect(result.job.spec!.template.spec!.volumes).toContainEqual({
+      name: "mcp-config-secret",
+      secret: { secretName: result.mcpConfigSecret!.name, optional: false },
+    });
+    expect(init.volumeMounts).toContainEqual({
+      name: "mcp-config-secret",
+      mountPath: "/tmp/mcp-secret",
+      readOnly: true,
+    });
+  });
+
+  it("keeps MCP bearer material out of the serialized Job and shell command", () => {
+    const bearer = "Bearer mcp-secret-only-7f3a";
+    const ctx: JobBuildInput["ctx"] = {
+      ...mockCtx,
+      config: {
+        mcpServers: {
+          private: {
+            type: "http",
+            url: "https://private-mcp.example.test/mcp",
+            headers: { Authorization: bearer },
+          },
+        },
+      },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const serializedJob = JSON.stringify(result.job);
+    const serializedCommands = JSON.stringify(
+      result.job.spec?.template.spec?.containers?.flatMap((container) => container.command ?? []) ?? [],
+    );
+
+    expect(result.mcpConfigSecret?.data["opencode.json"]).toContain(bearer);
+    expect(serializedJob).not.toContain(bearer);
+    expect(serializedCommands).not.toContain(bearer);
+    expect(serializedJob).not.toContain("OPENCODE_CONFIG_JSON");
   });
 });
 
@@ -1470,6 +1525,36 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       expect(parsed.disabled_providers).toEqual(["opencode"]);
     });
 
+    it("includes the Ponytail module in both OpenCode config paths", () => {
+      const pluginPath = "/opt/penstock/ponytail/.opencode/plugins/ponytail.mjs";
+      const defaultResult = buildJobManifest({
+        ctx: { ...mockCtx, config: { ponytailPluginPath: pluginPath } },
+        selfPod: mockSelfPod,
+      });
+      const defaultCommand = defaultResult.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const defaultMatch = defaultCommand.match(/echo '([^']+(?:'\\''[^']*)*)' > \S*opencode\/opencode\.json/);
+      expect(defaultMatch).toBeTruthy();
+      const defaultConfig = JSON.parse(defaultMatch![1].replace(/'\\''/g, "'")) as {
+        plugin?: string[];
+      };
+      expect(defaultConfig.plugin).toEqual([pluginPath]);
+
+      const mcpResult = buildJobManifest({
+        ctx: {
+          ...mockCtx,
+          config: {
+            ponytailPluginPath: pluginPath,
+            mcpServers: { paperclip: { command: "node", args: ["/app/mcp.js"] } },
+          },
+        },
+        selfPod: mockSelfPod,
+      });
+      const mcpConfig = JSON.parse(mcpResult.mcpConfigSecret!.data["opencode.json"]!) as {
+        plugin?: string[];
+      };
+      expect(mcpConfig.plugin).toEqual([pluginPath]);
+    });
+
     it("denies env-dump bash commands (PEN-1305) without blocking legit forms", () => {
       const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
       const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
@@ -1536,7 +1621,7 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       expect(parsed.snapshot).toBe(false);
     });
 
-    it("sets snapshot=false on the MCP-path opencode.json (OPENCODE_CONFIG_JSON)", () => {
+    it("sets snapshot=false on the MCP-path Secret-backed opencode.json", () => {
       const ctx: JobBuildInput["ctx"] = {
         ...mockCtx,
         config: {
@@ -1546,10 +1631,7 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
         },
       };
       const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
-      const init = result.job.spec!.template.spec!.initContainers![0]!;
-      const cfgEnv = (init.env ?? []).find((e) => e.name === "OPENCODE_CONFIG_JSON");
-      expect(cfgEnv).toBeDefined();
-      const parsed = JSON.parse(cfgEnv!.value!) as { snapshot?: boolean };
+      const parsed = JSON.parse(result.mcpConfigSecret!.data["opencode.json"]!) as { snapshot?: boolean };
       expect(parsed.snapshot).toBe(false);
     });
 
@@ -1571,7 +1653,7 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       expect(parsed.provider?.openai?.options?.chunkTimeout).toBe(240_000);
     });
 
-    it("sets provider.openai.options.chunkTimeout on the MCP-path opencode.json (OPENCODE_CONFIG_JSON)", () => {
+    it("sets provider.openai.options.chunkTimeout on the MCP-path Secret-backed opencode.json", () => {
       const ctx: JobBuildInput["ctx"] = {
         ...mockCtx,
         config: {
@@ -1581,10 +1663,7 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
         },
       };
       const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
-      const init = result.job.spec!.template.spec!.initContainers![0]!;
-      const cfgEnv = (init.env ?? []).find((e) => e.name === "OPENCODE_CONFIG_JSON");
-      expect(cfgEnv).toBeDefined();
-      const parsed = JSON.parse(cfgEnv!.value!) as {
+      const parsed = JSON.parse(result.mcpConfigSecret!.data["opencode.json"]!) as {
         provider?: { openai?: { options?: { chunkTimeout?: number } } };
       };
       expect(parsed.provider?.openai?.options?.chunkTimeout).toBe(240_000);
@@ -1615,7 +1694,7 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       expect(parsed.provider?.openai?.options?.chunkTimeout).toBe(240_000);
     });
 
-    it("stamps x-penstock-session on the MCP-path opencode.json too", () => {
+    it("stamps x-penstock-session on the MCP-path Secret-backed opencode.json too", () => {
       const ctx: JobBuildInput["ctx"] = {
         ...mockCtx,
         config: {
@@ -1625,9 +1704,7 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
         },
       };
       const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
-      const init = result.job.spec!.template.spec!.initContainers![0]!;
-      const cfgEnv = (init.env ?? []).find((e) => e.name === "OPENCODE_CONFIG_JSON");
-      const parsed = JSON.parse(cfgEnv!.value!) as ProviderHeaderShape;
+      const parsed = JSON.parse(result.mcpConfigSecret!.data["opencode.json"]!) as ProviderHeaderShape;
       expect(parsed.provider?.anthropic?.options?.headers?.["x-penstock-session"]).toBe(
         "agent:Test Agent",
       );

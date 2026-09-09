@@ -12,6 +12,33 @@ export function getConfigSchema(): AdapterConfigSchema {
         group: "Core",
       },
       {
+        key: "agentCommand",
+        label: "Agent Launcher",
+        type: "text",
+        hint: "Optional executable used to launch OpenCode. Set this to the reviewed Caveman/Penstock launcher path; arguments and shell syntax are rejected.",
+        group: "Core",
+      },
+      {
+        key: "ponytailPluginPath",
+        label: "Ponytail Plugin Path",
+        type: "text",
+        hint: "Absolute path to the installed Ponytail .mjs plugin file. It is included in both OpenCode config paths.",
+        group: "Core",
+      },
+      {
+        key: "ponytailDefaultMode",
+        label: "Ponytail Default Mode",
+        type: "select",
+        options: [
+          { label: "Off", value: "off" },
+          { label: "Lite", value: "lite" },
+          { label: "Full", value: "full" },
+          { label: "Ultra", value: "ultra" },
+        ],
+        hint: "Default Ponytail intensity for this agent. An explicit PONYTAIL_DEFAULT_MODE in env takes precedence.",
+        group: "Core",
+      },
+      {
         key: "dangerouslySkipPermissions",
         label: "Skip Permission Checks",
         type: "toggle",

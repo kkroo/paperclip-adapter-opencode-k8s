@@ -419,6 +419,31 @@ function isoHash(key: string): string {
   return createHash("sha256").update(key).digest("hex").slice(0, 16);
 }
 
+function mockManifestWithSecrets(
+  envSecret: { name: string; namespace: string; data: Record<string, string> } | null = {
+    name: `${JOB_NAME}-env`,
+    namespace: NAMESPACE,
+    data: { OPENAI_API_KEY: "env-secret-value" },
+  },
+  mcpConfigSecret: { name: string; namespace: string; data: Record<string, string> } | null = {
+    name: `${JOB_NAME}-mcp`,
+    namespace: NAMESPACE,
+    data: { "opencode.json": '{"mcp":{"paperclip":{"type":"remote"}}}' },
+  },
+) {
+  vi.mocked(buildJobManifest).mockReturnValue({
+    job: MOCK_JOB as ReturnType<typeof buildJobManifest>["job"],
+    jobName: JOB_NAME,
+    namespace: NAMESPACE,
+    prompt: "Test prompt",
+    opencodeArgs: [],
+    promptMetrics: null,
+    podLogPath: `/paperclip/instances/default/data/run-logs/co-1/agent-id-test/run-test-123.pod.ndjson`,
+    envSecret,
+    mcpConfigSecret,
+  } as unknown as ReturnType<typeof buildJobManifest>);
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   resetFsMocks();
@@ -432,6 +457,8 @@ beforeEach(() => {
     opencodeArgs: [],
     promptMetrics: null,
     podLogPath: `/paperclip/instances/default/data/run-logs/co-1/agent-id-test/run-test-123.pod.ndjson`,
+    envSecret: null,
+    mcpConfigSecret: null,
   } as unknown as ReturnType<typeof buildJobManifest>);
 
   const batchApi = makeBatchApi();
@@ -739,7 +766,21 @@ describe("execute — concurrency guard", () => {
         spec: {
           template: {
             spec: {
-              volumes: [{ name: "prompt-secret", secret: { secretName: "current-job-prompt" } }],
+              volumes: [
+                { name: "prompt-secret", secret: { secretName: "current-job-prompt" } },
+                { name: "mcp-config-secret", secret: { secretName: "current-job-mcp" } },
+              ],
+              containers: [
+                {
+                  name: "opencode",
+                  env: [
+                    {
+                      name: "OPENAI_API_KEY",
+                      valueFrom: { secretKeyRef: { name: "current-job-env", key: "OPENAI_API_KEY" } },
+                    },
+                  ],
+                },
+              ],
             },
           },
         },
@@ -763,6 +804,14 @@ describe("execute — concurrency guard", () => {
     expect(coreApi.createNamespacedSecret).not.toHaveBeenCalled();
     expect(coreApi.deleteNamespacedSecret).toHaveBeenCalledWith({
       name: "current-job-prompt",
+      namespace: NAMESPACE,
+    });
+    expect(coreApi.deleteNamespacedSecret).toHaveBeenCalledWith({
+      name: "current-job-env",
+      namespace: NAMESPACE,
+    });
+    expect(coreApi.deleteNamespacedSecret).toHaveBeenCalledWith({
+      name: "current-job-mcp",
       namespace: NAMESPACE,
     });
     expect(buildJobManifest).not.toHaveBeenCalled();
@@ -1266,6 +1315,84 @@ describe("execute — happy path", () => {
     expect(result.errorCode).toBe("k8s_job_identity_unacknowledged");
     expect(batchApi.deleteNamespacedJob).toHaveBeenCalledWith(
       expect.objectContaining({ name: JOB_NAME, namespace: NAMESPACE }),
+    );
+  });
+});
+
+describe("execute — per-run Secret lifecycle", () => {
+  it("creates env and MCP Secrets before the Job, patches both, and deletes both after success", async () => {
+    mockManifestWithSecrets();
+    const coreApi = makeCoreApi();
+    const batchApi = makeBatchApi();
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    await execute(makeCtx());
+
+    const createdNames = coreApi.createNamespacedSecret.mock.calls.map(
+      ([request]) => request.body.metadata?.name,
+    );
+    expect(createdNames).toEqual([`${JOB_NAME}-env`, `${JOB_NAME}-mcp`]);
+    for (const call of coreApi.createNamespacedSecret.mock.invocationCallOrder) {
+      expect(call).toBeLessThan(batchApi.createNamespacedJob.mock.invocationCallOrder[0]!);
+    }
+    expect(coreApi.patchNamespacedSecret).toHaveBeenCalledTimes(2);
+    expect(coreApi.patchNamespacedSecret.mock.calls.map(([request]) => request.name)).toEqual([
+      `${JOB_NAME}-env`,
+      `${JOB_NAME}-mcp`,
+    ]);
+    expect(coreApi.deleteNamespacedSecret.mock.calls.map(([request]) => request.name)).toEqual(
+      expect.arrayContaining([`${JOB_NAME}-env`, `${JOB_NAME}-mcp`]),
+    );
+  });
+
+  it("deletes every prepared Secret when Job creation fails", async () => {
+    mockManifestWithSecrets();
+    const batchApi = makeBatchApi();
+    batchApi.createNamespacedJob.mockRejectedValue(new Error("quota exceeded"));
+    const coreApi = makeCoreApi();
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+    expect(coreApi.deleteNamespacedSecret.mock.calls.map(([request]) => request.name)).toEqual(
+      expect.arrayContaining([`${JOB_NAME}-env`, `${JOB_NAME}-mcp`]),
+    );
+  });
+
+  it("deletes every prepared Secret when launch acknowledgement fails", async () => {
+    mockManifestWithSecrets();
+    const batchApi = makeBatchApi();
+    const coreApi = makeCoreApi();
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+    const ctx = {
+      ...makeCtx(),
+      onExternalRuntimeLaunched: vi.fn().mockRejectedValue(new Error("reservation released")),
+    } as unknown as AdapterExecutionContext;
+
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("k8s_job_identity_unacknowledged");
+    expect(coreApi.deleteNamespacedSecret.mock.calls.map(([request]) => request.name)).toEqual(
+      expect.arrayContaining([`${JOB_NAME}-env`, `${JOB_NAME}-mcp`]),
+    );
+  });
+
+  it("deletes per-run Secrets even when the Job is retained", async () => {
+    mockManifestWithSecrets();
+    const batchApi = makeBatchApi();
+    const coreApi = makeCoreApi();
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+    await execute(makeCtx({ retainJobs: true }));
+
+    expect(batchApi.deleteNamespacedJob).not.toHaveBeenCalled();
+    expect(coreApi.deleteNamespacedSecret.mock.calls.map(([request]) => request.name)).toEqual(
+      expect.arrayContaining([`${JOB_NAME}-env`, `${JOB_NAME}-mcp`]),
     );
   });
 });
@@ -1790,6 +1917,8 @@ describe("execute — large-prompt Secret path", () => {
       opencodeArgs: [],
       promptMetrics: null,
       podLogPath: `/paperclip/instances/default/data/run-logs/co-1/agent-id-test/run-test-123.pod.ndjson`,
+      envSecret: null,
+      mcpConfigSecret: null,
     } as unknown as ReturnType<typeof buildJobManifest>);
   }
 
@@ -2334,6 +2463,8 @@ describe("execute — large-prompt Secret create failure", () => {
       opencodeArgs: [],
       promptMetrics: null,
       podLogPath: `/paperclip/instances/default/data/run-logs/co-1/agent-id-test/run-test-123.pod.ndjson`,
+      envSecret: null,
+      mcpConfigSecret: null,
     } as unknown as ReturnType<typeof buildJobManifest>);
 
     const coreApi = makeCoreApi();
@@ -2571,6 +2702,12 @@ describe("execute — SIGTERM handler body (FAR-86 coverage)", () => {
         opencodeArgs: [],
         promptMetrics: null,
         podLogPath: `/paperclip/instances/default/data/run-logs/co-1/agent-id-test/run-test-123.pod.ndjson`,
+        envSecret: { name: "fresh-job-env", namespace: NAMESPACE, data: { OPENAI_API_KEY: "env-secret" } },
+        mcpConfigSecret: {
+          name: "fresh-job-mcp",
+          namespace: NAMESPACE,
+          data: { "opencode.json": '{"mcp":{"private":{"headers":{"Authorization":"Bearer secret"}}}}' },
+        },
       }),
       buildPodLogPath: vi.fn((companyId: string, agentId: string, runId: string) =>
         `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/${runId}.pod.ndjson`
@@ -2611,6 +2748,14 @@ describe("execute — SIGTERM handler body (FAR-86 coverage)", () => {
     // Wait long enough for the async handler body to settle
     await new Promise((r) => setTimeout(r, 50));
     expect(batchApi.deleteNamespacedJob).toHaveBeenCalled();
+    expect(coreApi.deleteNamespacedSecret).toHaveBeenCalledWith({
+      name: "fresh-job-env",
+      namespace: NAMESPACE,
+    });
+    expect(coreApi.deleteNamespacedSecret).toHaveBeenCalledWith({
+      name: "fresh-job-mcp",
+      namespace: NAMESPACE,
+    });
     expect(exitSpy).toHaveBeenCalled();
 
     exitSpy.mockRestore();
