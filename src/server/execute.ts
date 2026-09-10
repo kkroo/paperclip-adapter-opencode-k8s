@@ -818,12 +818,31 @@ export async function tailPodContainerLogs(
   return accumulator.join("");
 }
 
+async function cleanupSecrets(
+  namespace: string,
+  secretNames: Iterable<string | undefined>,
+  kubeconfigPath?: string,
+): Promise<void> {
+  const names = new Set(
+    Array.from(secretNames).filter((name): name is string => Boolean(name)),
+  );
+  for (const secretName of names) {
+    try {
+      await getCoreApi(kubeconfigPath).deleteNamespacedSecret({ name: secretName, namespace });
+    } catch {
+      // best-effort: the Secret may already have been garbage-collected
+    }
+  }
+}
+
 async function cleanupJob(
   namespace: string,
   jobName: string,
   onLog: AdapterExecutionContext["onLog"],
   kubeconfigPath?: string,
   promptSecretName?: string,
+  envSecretName?: string,
+  mcpConfigSecretName?: string,
   podLogPath?: string,
 ): Promise<void> {
   try {
@@ -837,14 +856,11 @@ async function cleanupJob(
     const msg = err instanceof Error ? err.message : String(err);
     await onLog("stderr", `[paperclip] Warning: failed to cleanup job ${jobName}: ${msg}\n`);
   }
-  if (promptSecretName) {
-    try {
-      const coreApi = getCoreApi(kubeconfigPath);
-      await coreApi.deleteNamespacedSecret({ name: promptSecretName, namespace });
-    } catch {
-      // best-effort — Secret may already be GC'd via ownerReference
-    }
-  }
+  await cleanupSecrets(
+    namespace,
+    [promptSecretName, envSecretName, mcpConfigSecretName],
+    kubeconfigPath,
+  );
   if (podLogPath) {
     try {
       const { unlink } = await import("node:fs/promises");
@@ -910,6 +926,8 @@ async function streamAndAwaitJob(
   retainJobs: boolean,
   podLogPath: string,
   promptSecretName?: string,
+  envSecretName?: string,
+  mcpConfigSecretName?: string,
 ): Promise<AdapterExecutionResult> {
   const { onLog } = ctx;
   const config = parseObject(ctx.config);
@@ -1074,8 +1092,24 @@ async function streamAndAwaitJob(
     }
     activeJobs.delete(jobName);
     if (!retainJobs) {
-      await cleanupJob(namespace, jobName, onLog, kubeconfigPath, promptSecretName, podLogPath);
+      await cleanupJob(
+        namespace,
+        jobName,
+        onLog,
+        kubeconfigPath,
+        promptSecretName,
+        envSecretName,
+        mcpConfigSecretName,
+        podLogPath,
+      );
     } else {
+      // Retaining a Job for debugging must never retain provider or control
+      // plane credentials with it. The Job can remain; per-run Secrets cannot.
+      await cleanupSecrets(
+        namespace,
+        [promptSecretName, envSecretName, mcpConfigSecretName],
+        kubeconfigPath,
+      );
       await onLog("stdout", `[paperclip] Retaining job ${jobName} for debugging (retainJobs=true)\n`);
     }
   }
@@ -1397,7 +1431,13 @@ async function streamAndAwaitJob(
 const agentCreationMutex = new Map<string, Promise<void>>();
 
 // Active Jobs tracked for SIGTERM cleanup.
-const activeJobs = new Map<string, { namespace: string; kubeconfigPath?: string; promptSecretName?: string }>();
+const activeJobs = new Map<string, {
+  namespace: string;
+  kubeconfigPath?: string;
+  promptSecretName?: string;
+  envSecretName?: string;
+  mcpConfigSecretName?: string;
+}>();
 let sigtermHandlerInstalled = false;
 
 function ensureSigtermHandler(): void {
@@ -1406,16 +1446,30 @@ function ensureSigtermHandler(): void {
   process.once("SIGTERM", () => {
     void (async () => {
       await Promise.allSettled(
-        Array.from(activeJobs.entries()).flatMap(([jobName, { namespace, kubeconfigPath, promptSecretName }]) => {
+        Array.from(activeJobs.entries()).flatMap(([
+          jobName,
+          {
+            namespace,
+            kubeconfigPath,
+            promptSecretName,
+            envSecretName,
+            mcpConfigSecretName,
+          },
+        ]) => {
           const ops: Promise<unknown>[] = [
             getBatchApi(kubeconfigPath)
               .deleteNamespacedJob({ name: jobName, namespace, body: { propagationPolicy: "Background" } })
               .catch(() => {}),
           ];
-          if (promptSecretName) {
+          const secretNames = new Set(
+            [promptSecretName, envSecretName, mcpConfigSecretName].filter(
+              (name): name is string => Boolean(name),
+            ),
+          );
+          for (const secretName of secretNames) {
             ops.push(
               getCoreApi(kubeconfigPath)
-                .deleteNamespacedSecret({ name: promptSecretName, namespace })
+                .deleteNamespacedSecret({ name: secretName, namespace })
                 .catch(() => {}),
             );
           }
@@ -1677,12 +1731,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           const promptSecretName = exactCurrentJob.spec?.template.spec?.volumes
             ?.find((volume) => volume.name === "prompt-secret")
             ?.secret?.secretName;
+          const expectedEnvSecretName = `${exactJobName}-env`;
+          const envSecretName = exactCurrentJob.spec?.template.spec?.containers
+            ?.flatMap((container) => container.env ?? [])
+            .find((entry) => entry.valueFrom?.secretKeyRef?.name === expectedEnvSecretName)
+            ?.valueFrom?.secretKeyRef?.name;
+          const mcpConfigSecretName = exactCurrentJob.spec?.template.spec?.volumes
+            ?.find((volume) => volume.name === "mcp-config-secret")
+            ?.secret?.secretName;
           const podLogPath = buildPodLogPath(ctx.agent.companyId, agentId, ctx.runId);
           await onLog(
             "stdout",
             `[paperclip] Reattaching to persisted K8s Job ${exactJobName} for the current run after adapter restart.\n`,
           );
-          activeJobs.set(exactJobName, { namespace: guardNamespace, kubeconfigPath, promptSecretName });
+          activeJobs.set(exactJobName, {
+            namespace: guardNamespace,
+            kubeconfigPath,
+            promptSecretName,
+            envSecretName,
+            mcpConfigSecretName,
+          });
           return streamAndAwaitJob(
             ctx,
             exactJobName,
@@ -1693,6 +1761,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             retainJobs,
             podLogPath,
             promptSecretName,
+            envSecretName,
+            mcpConfigSecretName,
           );
         }
       } catch (err) {
@@ -1828,9 +1898,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // For prompts larger than the threshold, store in a K8s Secret
   let promptSecretName: string | undefined;
   let job = firstBuild.job;
+  let envSecret = firstBuild.envSecret ?? null;
+  let mcpConfigSecret = firstBuild.mcpConfigSecret ?? null;
   if (Buffer.byteLength(prompt, "utf-8") > LARGE_PROMPT_THRESHOLD_BYTES) {
     promptSecretName = `${jobName}-prompt`;
-    job = buildJobManifest({ ...buildArgs, promptSecretName }).job;
+    const rebuilt = buildJobManifest({ ...buildArgs, promptSecretName });
+    job = rebuilt.job;
+    envSecret = rebuilt.envSecret ?? null;
+    mcpConfigSecret = rebuilt.mcpConfigSecret ?? null;
   }
 
   if (onMeta) {
@@ -1851,10 +1926,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   const batchApi = getBatchApi(kubeconfigPath);
+  const coreApi = getCoreApi(kubeconfigPath);
+  const preparedSecretNames = new Set<string>();
+  const cleanupPreparedSecrets = async (additionalNames: Iterable<string | undefined> = []): Promise<void> => {
+    const names = new Set<string>([
+      ...preparedSecretNames,
+      ...Array.from(additionalNames).filter((name): name is string => Boolean(name)),
+    ]);
+    await Promise.allSettled(
+      Array.from(names, (name) =>
+        coreApi.deleteNamespacedSecret({ name, namespace }).catch(() => undefined),
+      ),
+    );
+  };
 
   // Create the prompt Secret before the Job
   if (promptSecretName) {
-    const coreApi = getCoreApi(kubeconfigPath);
     const promptSecret: k8s.V1Secret = {
       apiVersion: "v1",
       kind: "Secret",
@@ -1863,8 +1950,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
     try {
       await coreApi.createNamespacedSecret({ namespace, body: promptSecret });
+      preparedSecretNames.add(promptSecretName);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      await cleanupPreparedSecrets([promptSecretName]);
       await onLog("stderr", `[paperclip] Failed to create prompt Secret: ${msg}\n`);
       return {
         exitCode: null,
@@ -1876,19 +1965,72 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
   }
 
+  // Sensitive literal environment values are never embedded in the Job spec.
+  // Stage them in a per-run Secret before creating the Job; Pod env entries use
+  // secretKeyRef and the Secret is cleaned up on every failure/completion path.
+  if (envSecret) {
+    const envSecretResource: k8s.V1Secret = {
+      apiVersion: "v1",
+      kind: "Secret",
+      metadata: { name: envSecret.name, namespace: envSecret.namespace, labels: job.metadata?.labels },
+      stringData: envSecret.data,
+    };
+    try {
+      await coreApi.createNamespacedSecret({ namespace: envSecret.namespace, body: envSecretResource });
+      preparedSecretNames.add(envSecret.name);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await cleanupPreparedSecrets([envSecret.name]);
+      await onLog("stderr", `[paperclip] Failed to create env Secret: ${msg}\n`);
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        errorMessage: `Failed to create env Secret: ${msg}`,
+        errorCode: "k8s_job_create_failed",
+      };
+    }
+  }
+
+  // MCP-bearing OpenCode config is never placed in the Job spec. Create the
+  // Secret before the Job so the init container's required volume can mount it.
+  if (mcpConfigSecret) {
+    const mcpConfigSecretResource: k8s.V1Secret = {
+      apiVersion: "v1",
+      kind: "Secret",
+      metadata: {
+        name: mcpConfigSecret.name,
+        namespace: mcpConfigSecret.namespace,
+        labels: job.metadata?.labels,
+      },
+      stringData: mcpConfigSecret.data,
+    };
+    try {
+      await coreApi.createNamespacedSecret({
+        namespace: mcpConfigSecret.namespace,
+        body: mcpConfigSecretResource,
+      });
+      preparedSecretNames.add(mcpConfigSecret.name);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await cleanupPreparedSecrets([mcpConfigSecret.name]);
+      await onLog("stderr", `[paperclip] Failed to create mcp-config Secret: ${msg}\n`);
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        errorMessage: `Failed to create mcp-config Secret: ${msg}`,
+        errorCode: "k8s_job_create_failed",
+      };
+    }
+  }
+
   let createdJob: k8s.V1Job | undefined;
   try {
     createdJob = await batchApi.createNamespacedJob({ namespace, body: job });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (promptSecretName) {
-      try {
-        const coreApi = getCoreApi(kubeconfigPath);
-        await coreApi.deleteNamespacedSecret({ name: promptSecretName, namespace });
-      } catch {
-        // best-effort cleanup
-      }
-    }
+    await cleanupPreparedSecrets([promptSecretName, envSecret?.name, mcpConfigSecret?.name]);
     await onLog("stderr", `[paperclip] Failed to create K8s Job: ${msg}\n`);
     return {
       exitCode: null,
@@ -1900,7 +2042,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
   const createdJobUid = createdJob.metadata?.uid;
   if (!createdJobUid || !onExternalRuntimeLaunched) {
-    await cleanupJob(namespace, jobName, onLog, kubeconfigPath, promptSecretName, podLogPath);
+    await cleanupJob(
+      namespace,
+      jobName,
+      onLog,
+      kubeconfigPath,
+      promptSecretName,
+      envSecret?.name,
+      mcpConfigSecret?.name,
+      podLogPath,
+    );
     return {
       exitCode: null,
       signal: null,
@@ -1914,7 +2065,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   try {
     await onExternalRuntimeLaunched({ jobName, jobUid: createdJobUid });
   } catch (err) {
-    await cleanupJob(namespace, jobName, onLog, kubeconfigPath, promptSecretName, podLogPath);
+    await cleanupJob(
+      namespace,
+      jobName,
+      onLog,
+      kubeconfigPath,
+      promptSecretName,
+      envSecret?.name,
+      mcpConfigSecret?.name,
+      podLogPath,
+    );
     return {
       exitCode: null,
       signal: null,
@@ -1924,19 +2084,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   }
 
-  // Set ownerReference on the prompt Secret so kubelet cascade-deletes the
-  // Secret when the Job is garbage-collected. Without this the per-run Secret
-  // leaks forever (BLO-5310). The @kubernetes/client-node PATCH defaults to
-  // `application/json-patch+json` content-type, which expects an RFC 6902
-  // array-of-ops body — not the strategic-merge object we used to send. The
-  // claude_k8s adapter (which has never leaked Secrets) uses the JSON Patch
-  // shape below; mirror it here. blockOwnerDeletion=false so a stuck Secret
-  // never blocks Job GC.
-  if (promptSecretName && createdJob?.metadata?.uid) {
+  // Owner references are the crash-only cleanup backstop. Explicit deletion
+  // still runs on all ordinary completion and failure paths.
+  for (const secretName of [promptSecretName, envSecret?.name, mcpConfigSecret?.name].filter(
+    (name): name is string => Boolean(name),
+  )) {
     try {
-      const coreApi = getCoreApi(kubeconfigPath);
       await coreApi.patchNamespacedSecret({
-        name: promptSecretName,
+        name: secretName,
         namespace,
         body: [
           {
@@ -1947,7 +2102,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 apiVersion: "batch/v1",
                 kind: "Job",
                 name: jobName,
-                uid: createdJob.metadata.uid,
+                uid: createdJobUid,
                 blockOwnerDeletion: false,
               },
             ],
@@ -1955,24 +2110,38 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ] as unknown as k8s.V1Secret,
       });
     } catch (err) {
-      // Non-fatal: explicit cleanup paths still run on success/error/SIGTERM.
-      // We log the failure so operators don't have to grep the cluster for
-      // leaked Secrets (the pre-fix mode where the patch silently failed for
-      // months and orphan Secrets piled up to 3,395 in the paperclip ns).
       const msg = err instanceof Error ? err.message : String(err);
       await onLog(
         "stderr",
-        `[paperclip] Warning: failed to set ownerReference on prompt Secret ${promptSecretName}: ${msg}\n`,
+        `[paperclip] Warning: failed to set ownerReference on Secret ${secretName}: ${msg}\n`,
       );
     }
   }
 
     // Register job for SIGTERM cleanup before releasing the mutex.
-    activeJobs.set(jobName, { namespace, kubeconfigPath, promptSecretName });
+    activeJobs.set(jobName, {
+      namespace,
+      kubeconfigPath,
+      promptSecretName,
+      envSecretName: envSecret?.name,
+      mcpConfigSecretName: mcpConfigSecret?.name,
+    });
 
     await onLog("stdout", `[paperclip] Created K8s Job: ${jobName} in namespace ${namespace} (deadline: ${timeoutSec > 0 ? `${timeoutSec}s` : "none"})\n`);
 
-    return streamAndAwaitJob(ctx, jobName, namespace, timeoutSec, graceSec, kubeconfigPath, retainJobs, podLogPath, promptSecretName);
+    return streamAndAwaitJob(
+      ctx,
+      jobName,
+      namespace,
+      timeoutSec,
+      graceSec,
+      kubeconfigPath,
+      retainJobs,
+      podLogPath,
+      promptSecretName,
+      envSecret?.name,
+      mcpConfigSecret?.name,
+    );
   } finally {
     releaseLock();
     if (agentCreationMutex.get(guardKey) === currentLock) {

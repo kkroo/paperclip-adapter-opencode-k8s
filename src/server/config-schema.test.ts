@@ -55,6 +55,20 @@ describe("getConfigSchema", () => {
     expect(field!.default).toBe(true);
   });
 
+  it("exposes the Caveman and Ponytail fields", () => {
+    const schema = getConfigSchema();
+    const fields = new Map(schema.fields.map((field: ConfigFieldSchema) => [field.key, field]));
+    expect(fields.get("agentCommand")?.type).toBe("text");
+    expect(fields.get("ponytailPluginPath")?.type).toBe("text");
+    expect(fields.get("ponytailDefaultMode")?.type).toBe("select");
+    expect(fields.get("ponytailDefaultMode")?.options).toEqual([
+      { label: "Off", value: "off" },
+      { label: "Lite", value: "lite" },
+      { label: "Full", value: "full" },
+      { label: "Ultra", value: "ultra" },
+    ]);
+  });
+
   it("ttlSecondsAfterFinished defaults to 300", () => {
     const schema = getConfigSchema();
     const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "ttlSecondsAfterFinished");

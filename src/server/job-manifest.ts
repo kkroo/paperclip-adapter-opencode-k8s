@@ -17,6 +17,12 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import type { SelfPodInfo } from "./k8s-client.js";
 import { buildEnvGuardPluginCleanupShell, buildEnvGuardPluginSetupShell } from "./env-guard-plugin.js";
+import {
+  isAgentInheritableEnvFromRef,
+  isAgentInheritableEnvName,
+  isAgentInheritableSecretVolume,
+  SERVER_ONLY_ENV_DENY,
+} from "./inherit-allowlist.js";
 
 /**
  * Path to the project-scope .mcp.json that paperclip's helm-chart seed-init
@@ -294,6 +300,65 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
+const SUPPORTED_PENSTOCK_PROVIDERS = new Set(["anthropic", "openai"]);
+const PONYTAIL_MODES = new Set(["off", "lite", "full", "ultra"]);
+
+export function validatePenstockProvider(raw: unknown): string {
+  if (typeof raw !== "string") {
+    throw new Error("PENSTOCK_PROVIDER must be anthropic or openai");
+  }
+  const value = raw.trim().toLowerCase();
+  if (!SUPPORTED_PENSTOCK_PROVIDERS.has(value)) {
+    throw new Error("PENSTOCK_PROVIDER must be anthropic or openai");
+  }
+  return value;
+}
+
+/** Validate a launcher executable; this field is never a shell fragment. */
+export function validateAgentCommand(raw: unknown, fallback = "opencode"): string {
+  if (raw === undefined || raw === null || raw === "") return fallback;
+  if (typeof raw !== "string") throw new Error("agentCommand must name one executable");
+  const value = raw.trim();
+  if (!value || !/^[A-Za-z0-9._/-]+$/.test(value)) {
+    throw new Error("agentCommand must name one executable without arguments or shell metacharacters");
+  }
+  return value;
+}
+
+export function validatePonytailPluginPath(raw: unknown): string | null {
+  if (raw === undefined || raw === null || raw === "") return null;
+  if (typeof raw !== "string") throw new Error("ponytailPluginPath must be an absolute .mjs file path");
+  const value = raw.trim();
+  if (
+    !value ||
+    !path.posix.isAbsolute(value) ||
+    !value.endsWith(".mjs") ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  ) {
+    throw new Error("ponytailPluginPath must be an absolute .mjs file path without control characters");
+  }
+  return value;
+}
+
+export function validatePonytailDefaultMode(raw: unknown): string | null {
+  if (raw === undefined || raw === null || raw === "") return null;
+  if (typeof raw !== "string") throw new Error("ponytailDefaultMode must be off, lite, full, or ultra");
+  const value = raw.trim().toLowerCase();
+  if (!PONYTAIL_MODES.has(value)) throw new Error("ponytailDefaultMode must be off, lite, full, or ultra");
+  return value;
+}
+
+function hasExplicitEnvName(
+  name: string,
+  envConfig: Record<string, unknown>,
+  inheritedEnv: Record<string, string>,
+  inheritedEnvValueFrom: k8s.V1EnvVar[],
+): boolean {
+  return Object.prototype.hasOwnProperty.call(envConfig, name) ||
+    Object.prototype.hasOwnProperty.call(inheritedEnv, name) ||
+    inheritedEnvValueFrom.some((entry) => entry.name === name);
+}
+
 export interface JobBuildInput {
   ctx: AdapterExecutionContext;
   selfPod: SelfPodInfo;
@@ -352,6 +417,57 @@ export interface JobBuildResult {
   opencodeArgs: string[];
   promptMetrics: Record<string, number>;
   podLogPath: string;
+  /** Sensitive literal env values staged in a per-run Secret. */
+  envSecret: EnvSecret | null;
+  /** MCP-bearing OpenCode config staged in a per-run Secret. */
+  mcpConfigSecret: McpConfigSecret | null;
+}
+
+export interface EnvSecret {
+  name: string;
+  namespace: string;
+  data: Record<string, string>;
+}
+
+/**
+ * OpenCode's merged config can contain remote MCP authorization headers and
+ * local-server environment values. Keep that entire override out of the Job
+ * manifest and deliver it through a short-lived Secret-backed volume.
+ */
+export interface McpConfigSecret {
+  name: string;
+  namespace: string;
+  data: Record<string, string>;
+}
+
+const SENSITIVE_ENV_NAME_RE = /(TOKEN|SECRET|PASSWORD|KEY|CREDENTIAL|AUTH)/i;
+
+export function isSensitiveEnvName(name: string): boolean {
+  return SENSITIVE_ENV_NAME_RE.test(name);
+}
+
+export function findLiteralSensitiveEnvVars(env: k8s.V1EnvVar[]): string[] {
+  return env
+    .filter((entry) =>
+      entry.name &&
+      isSensitiveEnvName(entry.name) &&
+      typeof entry.value === "string" &&
+      entry.value.length > 0
+    )
+    .map((entry) => entry.name);
+}
+
+export function findLiteralSensitiveEnvVarsInPodSpec(podSpec: k8s.V1PodSpec): string[] {
+  const containers: k8s.V1Container[] = [
+    ...(podSpec.initContainers ?? []),
+    ...(podSpec.containers ?? []),
+    ...((podSpec.ephemeralContainers ?? []) as unknown as k8s.V1Container[]),
+  ];
+  return containers.flatMap((container) =>
+    findLiteralSensitiveEnvVars(container.env ?? []).map(
+      (name) => `${container.name || "<unnamed>"}/${name}`,
+    )
+  );
 }
 
 /**
@@ -420,7 +536,8 @@ function buildEnvVars(
   selfPod: SelfPodInfo,
   config: Record<string, unknown>,
   isolation: RunIsolationDescriptor,
-): k8s.V1EnvVar[] {
+  envSecretName: string,
+): { envVars: k8s.V1EnvVar[]; sensitiveEnvData: Record<string, string> } {
   const { runId, agent, context } = ctx;
   const envConfig = parseObject(config.env);
 
@@ -501,9 +618,14 @@ function buildEnvVars(
   if (selfPod.inheritedEnv.PAPERCLIP_API_URL) {
     paperclipEnv.PAPERCLIP_API_URL = selfPod.inheritedEnv.PAPERCLIP_API_URL;
   }
-  // Layer 3: Inherited from Deployment (Bedrock, API keys, etc.)
+  // Layer 3: Inherited from Deployment (Bedrock, API keys, etc.). Re-check the
+  // boundary here because SelfPodInfo is a plain object supplied by the
+  // executor and may be hand-built by a caller or replay path.
+  const filteredInheritedEnv = Object.fromEntries(
+    Object.entries(selfPod.inheritedEnv).filter(([name]) => isAgentInheritableEnvName(name)),
+  );
   const merged: Record<string, string> = {
-    ...selfPod.inheritedEnv,
+    ...filteredInheritedEnv,
     ...paperclipEnv,
   };
 
@@ -558,20 +680,29 @@ function buildEnvVars(
     if (isolation.workspaceRoot) merged.PAPERCLIP_WORKSPACE_CWD = isolation.workspaceRoot;
   }
 
-  // Convert literal-value vars to V1EnvVar array
-  const envVars: k8s.V1EnvVar[] = Object.entries(merged).map(([name, value]) => ({
-    name,
-    value,
-  }));
+  // Keep credential-shaped values out of the Job spec. A Secret-backed
+  // secretKeyRef is visible to the kubelet but not to a read-only Pod GET.
+  const sensitiveEnvData: Record<string, string> = {};
+  const envVars: k8s.V1EnvVar[] = Object.entries(merged).map(([name, value]) => {
+    if (isSensitiveEnvName(name) && value) {
+      sensitiveEnvData[name] = value;
+      return { name, valueFrom: { secretKeyRef: { name: envSecretName, key: name } } };
+    }
+    return { name, value };
+  });
 
   // Append valueFrom vars (Secret/ConfigMap-backed) only for names not already overridden
   for (const envVar of selfPod.inheritedEnvValueFrom) {
-    if (!Object.prototype.hasOwnProperty.call(merged, envVar.name)) {
+    if (
+      envVar.name &&
+      !Object.prototype.hasOwnProperty.call(merged, envVar.name) &&
+      isAgentInheritableEnvName(envVar.name)
+    ) {
       envVars.push({ name: envVar.name, valueFrom: envVar.valueFrom });
     }
   }
 
-  return envVars;
+  return { envVars, sensitiveEnvData };
 }
 
 /**
@@ -686,12 +817,20 @@ const ENV_DUMP_BASH_DENY: Record<string, "deny"> = {
 function buildRuntimeConfigJson(
   config: Record<string, unknown>,
   agent: { id: string; name?: string | null },
-): string | null {
+  options: {
+    ponytailPluginPath?: string | null;
+    mcp?: Record<string, unknown>;
+    includeSchema?: boolean;
+  } = {},
+): string {
   const skipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
   const runtime: Record<string, unknown> = {
+    ...(options.includeSchema ? { $schema: "https://opencode.ai/config.json" } : {}),
     disabled_providers: ["opencode"],
     provider: providerConfig(agent),
     snapshot: false,
+    ...(options.ponytailPluginPath ? { plugin: [options.ponytailPluginPath] } : {}),
+    ...(options.mcp && Object.keys(options.mcp).length > 0 ? { mcp: options.mcp } : {}),
   };
   // Always deny env-dump commands. Under skipPermissions (the unattended Job
   // default) everything else stays "allow" so no command prompts; otherwise the
@@ -822,6 +961,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const model = asString(config.model, "").trim();
   const variant = asString(config.variant, "").trim();
   const extraArgs = asStringArray(config.extraArgs);
+  const agentCommand = validateAgentCommand(config.agentCommand, "opencode");
+  const usesExternalLauncher = agentCommand !== "opencode";
+  const ponytailPluginPath = validatePonytailPluginPath(config.ponytailPluginPath);
+  const ponytailDefaultMode = validatePonytailDefaultMode(config.ponytailDefaultMode);
   const timeoutSec = asNumber(config.timeoutSec, 0);
   const ttlSeconds = asNumber(config.ttlSecondsAfterFinished, 300);
   const resources = parseObject(config.resources);
@@ -921,8 +1064,44 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   if (variant) opencodeArgs.push("--variant", variant);
   if (extraArgs.length > 0) opencodeArgs.push(...extraArgs);
 
-  // Build env vars
-  const envVars = buildEnvVars(ctx, selfPod, config, isolation);
+  // Build env vars. Sensitive literal values are returned separately so the
+  // executor can create the Secret before creating the Job.
+  const envSecretName = `${jobName}-env`;
+  const builtEnv = buildEnvVars(ctx, selfPod, config, isolation, envSecretName);
+  const envVars = builtEnv.envVars;
+  const envSecret: EnvSecret | null = Object.keys(builtEnv.sensitiveEnvData).length > 0
+    ? { name: envSecretName, namespace, data: builtEnv.sensitiveEnvData }
+    : null;
+  const envConfig = parseObject(config.env);
+  const hasExplicitEnv = (name: string) => hasExplicitEnvName(
+    name,
+    envConfig,
+    selfPod.inheritedEnv,
+    selfPod.inheritedEnvValueFrom,
+  );
+  if (usesExternalLauncher) {
+    const addEnv = (name: string, value: string) => {
+      if (!hasExplicitEnv(name) && !envVars.some((entry) => entry.name === name)) {
+        envVars.push({ name, value });
+      }
+    };
+    addEnv("PENSTOCK_AGENT_COMMAND", "opencode");
+    if (!hasExplicitEnv("PENSTOCK_PROVIDER")) {
+      addEnv("PENSTOCK_PROVIDER", "openai");
+    } else {
+      const providerEntry = envVars.find((entry) => entry.name === "PENSTOCK_PROVIDER");
+      if (providerEntry && Object.prototype.hasOwnProperty.call(providerEntry, "value")) {
+        providerEntry.value = validatePenstockProvider(providerEntry.value);
+      }
+    }
+  }
+  if (
+    ponytailDefaultMode &&
+    !hasExplicitEnv("PONYTAIL_DEFAULT_MODE") &&
+    !envVars.some((entry) => entry.name === "PONYTAIL_DEFAULT_MODE")
+  ) {
+    envVars.push({ name: "PONYTAIL_DEFAULT_MODE", value: ponytailDefaultMode });
+  }
 
   // OPENCODE_DB: set when a DB volume is present (dedicated PVC, ephemeral
   // emptyDir, or workspace subPath)
@@ -949,46 +1128,37 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // already-opencode-shaped entries pass through unchanged). The merged
   // result is materialized into /tmp/prompt/opencode.json by the
   // write-prompt init container, and OPENCODE_CONFIG points opencode at
-  // it. When the merged set is empty (no baseline + no overrides) we
-  // emit nothing — opencode falls back to ~/.config/opencode/opencode.json
+  // it. MCP-bearing configs are delivered through a Secret-backed volume;
+  // Ponytail-only configs remain safe to inline because they contain no MCP
+  // credentials. When the merged set is empty (no baseline + no overrides)
+  // we emit nothing — opencode falls back to ~/.config/opencode/opencode.json
   // exactly as before.
   const perAgentMcpServers = parseObject(config.mcpServers);
   const baselineMcpServers = loadSharedMcpBaseline();
   const mergedMcpServers = { ...baselineMcpServers, ...perAgentMcpServers };
   const opencodeMcpSection = buildOpencodeMcpSection(mergedMcpServers);
-  const opencodeConfigJson =
-    Object.keys(opencodeMcpSection).length > 0
-      ? JSON.stringify({
-          $schema: "https://opencode.ai/config.json",
-          // permission.external_directory mirrors the chart-baseline at
-          // /paperclip/.config/opencode/opencode.json so we don't lose
-          // the "allow access outside cwd" behavior when overriding via
-          // OPENCODE_CONFIG (opencode does not merge config sources).
-          permission: { external_directory: "allow" },
-          // Disable opencode.ai/zen for the same reason as
-          // buildRuntimeConfigJson: it returns FreeUsageLimitError 429
-          // anonymously and wedges the pod. Opencode falls through to
-          // the bundled `openai` provider in chatgpt-OAuth mode, fed by
-          // the auth.json that buildOpencodeAuthBootstrapShell writes
-          // from ~/.codex/auth.json.
-          disabled_providers: ["opencode"],
-          // Skip the turn-zero workspace `git add --all --sparse` snapshot;
-          // see buildRuntimeConfigJson's snapshot:false comment (BLO-14758).
-          // Both config paths must carry it — opencode does not merge
-          // config sources.
-          snapshot: false,
-          // Chunk timeout + per-agent Penstock session identity; see
-          // providerConfig / OPENAI_PROVIDER_CHUNK_TIMEOUT_MS.
-          provider: providerConfig(agent),
-          mcp: opencodeMcpSection,
-        })
-      : null;
+  // OpenCode does not merge OPENCODE_CONFIG with the default XDG config. Build
+  // both from the same function so permissions, provider routing, and Ponytail
+  // stay identical whenever an override file is required.
+  const runtimeConfigJson = buildRuntimeConfigJson(config, agent, { ponytailPluginPath });
+  const hasMcpConfig = Object.keys(opencodeMcpSection).length > 0;
+  const opencodeConfigJson = hasMcpConfig
+    ? buildRuntimeConfigJson(config, agent, {
+        ponytailPluginPath,
+        mcp: opencodeMcpSection,
+        includeSchema: true,
+      })
+    : null;
+  const mcpConfigSecret: McpConfigSecret | null = opencodeConfigJson
+    ? {
+        name: `${jobName}-mcp`,
+        namespace,
+        data: { "opencode.json": opencodeConfigJson },
+      }
+    : null;
   if (opencodeConfigJson) {
     envVars.push({ name: "OPENCODE_CONFIG", value: "/tmp/prompt/opencode.json" });
   }
-
-  // Runtime config for permissions
-  const runtimeConfigJson = buildRuntimeConfigJson(config, agent);
 
   // Resource defaults
   const resourceRequests = parseObject(resources.requests);
@@ -1036,6 +1206,12 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   if (input.promptSecretName) {
     volumes.push({ name: "prompt-secret", secret: { secretName: input.promptSecretName } });
   }
+  if (mcpConfigSecret) {
+    volumes.push({
+      name: "mcp-config-secret",
+      secret: { secretName: mcpConfigSecret.name, optional: false },
+    });
+  }
 
   // Phase E.2: workspace PVC/mount can be overridden by env config.
   // workspaceVolumeClaim wins over selfPod.pvcClaimName when set.
@@ -1074,11 +1250,18 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     });
   }
 
-  // Mount secret volumes inherited from the Deployment pod
+  // Mount only agent-approved Secret volumes. The same filter is applied by
+  // getSelfPodInfo(); repeat it for hand-built SelfPodInfo values.
   for (const sv of selfPod.secretVolumes) {
+    if (!isAgentInheritableSecretVolume(sv.secretName)) continue;
     volumes.push({
       name: sv.volumeName,
-      secret: { secretName: sv.secretName, defaultMode: sv.defaultMode, optional: true },
+      secret: {
+        secretName: sv.secretName,
+        defaultMode: sv.defaultMode,
+        ...(sv.items ? { items: sv.items } : {}),
+        optional: true,
+      },
     });
     volumeMounts.push({
       name: sv.volumeName,
@@ -1143,13 +1326,21 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       )
     : [];
   const accountsArg = openaiAccounts.length > 0 ? ` --accounts ${openaiAccounts.join(",")}` : "";
-  const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && timeout 30s ccrotate next --yes --target codex${accountsArg} >/dev/null 2>&1) || true`;
-  const authBootstrap = hasEnvVarValue(envVars, "OPENAI_API_KEY")
-    ? buildOpencodeApiKeyAuthCleanupShell()
-    : buildOpencodeAuthBootstrapShell();
-  const configSetup = runtimeConfigJson
-    ? `mkdir -p "\${XDG_CONFIG_HOME:-$HOME/.config}/opencode" && echo '${runtimeConfigJson.replace(/'/g, "'\\''")}' > "\${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json" && `
-    : "";
+  const ccrotateRefresh = usesExternalLauncher
+    ? ""
+    : `(command -v ccrotate >/dev/null 2>&1 && timeout 30s ccrotate next --yes --target codex${accountsArg} >/dev/null 2>&1) || true`;
+  // The external launcher owns provider authentication. Do not mutate
+  // OpenCode's persistent auth files in this mode: the launcher may use its
+  // own credential store, and deleting it would make the adapter unexpectedly
+  // destructive. Native OpenCode mode keeps the existing cleanup/bootstrap
+  // behavior.
+  const authBootstrap = usesExternalLauncher
+    ? ""
+    : hasEnvVarValue(envVars, "OPENAI_API_KEY")
+      ? buildOpencodeApiKeyAuthCleanupShell()
+      : buildOpencodeAuthBootstrapShell();
+  const configSetup =
+    `mkdir -p "\${XDG_CONFIG_HOME:-$HOME/.config}/opencode" && echo '${runtimeConfigJson.replace(/'/g, "'\\''")}' > "\${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json" && `;
   // PEN-1305 Layer 1 (plugin arm) — canary-gated per-agent via adapter config.
   // Installs the tool.execute.before guard plugin into the global opencode
   // config plugin dir (auto-discovered by opencode's {plugin,plugins}/*.{ts,js}
@@ -1192,8 +1383,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const compactArgsEscaped = ["run", "--session", runtimeSessionId, "--format", "json"]
     .map((a) => `'${a.replace(/'/g, "'\\''")}'`)
     .join(" ");
+  const launcherCommand = usesExternalLauncher ? shellQuote(agentCommand) : "opencode";
   const compactPrefix = needsCompactBeforeNextRun
-    ? `echo "[paperclip] running /compact on session ${runtimeSessionId} before main prompt"; echo '/compact' | opencode ${compactArgsEscaped} >/dev/null 2>&1 || echo "[paperclip] /compact returned non-zero; continuing"; `
+    ? `echo "[paperclip] running /compact on session ${runtimeSessionId} before main prompt"; echo '/compact' | ${launcherCommand} ${compactArgsEscaped} >/dev/null 2>&1 || echo "[paperclip] /compact returned non-zero; continuing"; `
     : "";
   // Shared-docs bridge (BLO-10315). For an external instructions bundle, the
   // agent's AGENTS.md "## Shared Documentation" section tells it to `Read
@@ -1252,7 +1444,11 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const dbResetGuard = hasAgentDb
     ? `__ocdb=/opencode-db/opencode.db; __ocdir="$(dirname "$__ocdb")"; __ocver="$(opencode --version 2>/dev/null | head -n1)"; __ocprev="$(cat "$__ocdir/.opencode-version" 2>/dev/null || true)"; if [ -n "$__ocver" ] && [ -f "$__ocdb" ] && [ "$__ocver" != "$__ocprev" ]; then echo "[paperclip] opencode upgraded ('$__ocprev' -> '$__ocver'); resetting $__ocdb to avoid stale-schema crash" >&2; rm -f "$__ocdb" "$__ocdb-shm" "$__ocdb-wal" 2>/dev/null || true; else __ocbytes=0; for __ocf in "$__ocdb" "$__ocdb-wal" "$__ocdb-shm"; do if [ -f "$__ocf" ]; then __ocsz="$(wc -c < "$__ocf" 2>/dev/null || echo 0)"; __ocsz="\${__ocsz##* }"; __ocbytes=$((__ocbytes + \${__ocsz:-0})); fi; done; if [ -f "$__ocdb" ] && [ "$__ocbytes" -gt 524288000 ]; then echo "[paperclip] opencode DB $__ocbytes bytes exceeds 524288000; resetting $__ocdb to cap growth" >&2; rm -f "$__ocdb" "$__ocdb-shm" "$__ocdb-wal" 2>/dev/null || true; fi; fi; if [ -n "$__ocver" ]; then mkdir -p "$__ocdir" 2>/dev/null || true; printf '%s' "$__ocver" > "$__ocdir/.opencode-version" 2>/dev/null || true; fi; `
     : "";
-  const baseMainCommand = `set -o pipefail; ${isolatedRuntimePrep}${workspaceSetup}${ccrotateRefresh}; ${authBootstrap}; ${envGuardPluginSetup}${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${shellQuote(podLogPath)}) && : > ${shellQuote(podLogPath)} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${shellQuote(podLogPath)}`;
+  const credentialSetup = [ccrotateRefresh, authBootstrap]
+    .filter((snippet) => snippet.length > 0)
+    .map((snippet) => `${snippet}; `)
+    .join("");
+  const baseMainCommand = `set -o pipefail; ${isolatedRuntimePrep}${workspaceSetup}${credentialSetup}${envGuardPluginSetup}${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${shellQuote(podLogPath)}) && : > ${shellQuote(podLogPath)} && cat /tmp/prompt/prompt.txt | ${launcherCommand} ${opencodeArgsEscaped} | tee -a ${shellQuote(podLogPath)}`;
   // Redirect Chrome's BrowserMetrics spool off the shared CephFS HOME to the
   // main container's per-pod runtime-cache emptyDir. The
   // agent-browser designer tool launches system Chrome with the default
@@ -1315,24 +1511,27 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
             (() => {
               // Build the init container command + env. Always writes prompt.txt;
               // when an MCP fleet was assembled (baseline or per-agent override),
-              // also writes the merged opencode.json next to it. opencode.json is
-              // small (a few kB) so it travels via env var even when prompt itself
-              // goes the Secret-volume route.
+              // copies the merged opencode.json from its Secret-backed volume.
+              // Ponytail-only configuration stays in the safe XDG config that
+              // the main container writes; OPENCODE_CONFIG is only needed when
+              // MCP entries replace that config source.
               const cmdParts = input.promptSecretName
                 ? ["cp /tmp/prompt-secret/prompt /tmp/prompt/prompt.txt"]
                 : [`printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt`];
               const initEnv: k8s.V1EnvVar[] = input.promptSecretName
                 ? []
                 : [{ name: "PROMPT_CONTENT", value: prompt }];
-              if (opencodeConfigJson) {
-                cmdParts.push(`printf '%s' \"$OPENCODE_CONFIG_JSON\" > /tmp/prompt/opencode.json`);
-                initEnv.push({ name: "OPENCODE_CONFIG_JSON", value: opencodeConfigJson });
+              if (mcpConfigSecret) {
+                cmdParts.push("cp /tmp/mcp-secret/opencode.json /tmp/prompt/opencode.json");
               }
               const initVolumeMounts: k8s.V1VolumeMount[] = [
                 { name: "prompt", mountPath: "/tmp/prompt" },
               ];
               if (input.promptSecretName) {
                 initVolumeMounts.push({ name: "prompt-secret", mountPath: "/tmp/prompt-secret", readOnly: true });
+              }
+              if (mcpConfigSecret) {
+                initVolumeMounts.push({ name: "mcp-config-secret", mountPath: "/tmp/mcp-secret", readOnly: true });
               }
               const initContainer: k8s.V1Container = {
                 name: "write-prompt",
@@ -1361,7 +1560,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
               workingDir,
               command: ["sh", "-c", mainCommand],
               env: envVars,
-              ...(selfPod.inheritedEnvFrom.length > 0 ? { envFrom: selfPod.inheritedEnvFrom } : {}),
+              ...(selfPod.inheritedEnvFrom.filter((source) => {
+                const refName = source.secretRef?.name ?? source.configMapRef?.name;
+                return typeof refName === "string" && isAgentInheritableEnvFromRef(refName);
+              }).length > 0
+                ? {
+                    envFrom: selfPod.inheritedEnvFrom.filter((source) => {
+                      const refName = source.secretRef?.name ?? source.configMapRef?.name;
+                      return typeof refName === "string" && isAgentInheritableEnvFromRef(refName);
+                    }),
+                  }
+                : {}),
               volumeMounts,
               securityContext,
               resources: containerResources,
@@ -1373,5 +1582,44 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     },
   };
 
-  return { job, jobName, namespace, prompt, opencodeArgs, promptMetrics, podLogPath };
+  const podSpec = job.spec?.template.spec;
+  if (!podSpec) throw new Error("opencode_k8s: generated Job is missing a pod spec");
+  const literalSensitiveNames = findLiteralSensitiveEnvVarsInPodSpec(podSpec);
+  if (literalSensitiveNames.length > 0) {
+    throw new Error(
+      `opencode_k8s: refusing to build Job manifest - sensitive-named env var(s) would be injected as a literal value instead of secretKeyRef: ${literalSensitiveNames.join(", ")}`,
+    );
+  }
+  const serverOnlyNames = findServerOnlyEnvVarsInPodSpec(podSpec);
+  if (serverOnlyNames.length > 0) {
+    throw new Error(
+      `opencode_k8s: refusing to build Job manifest - server-only credential env var(s) would be propagated to the agent pod: ${serverOnlyNames.join(", ")}`,
+    );
+  }
+
+  return {
+    job,
+    jobName,
+    namespace,
+    prompt,
+    opencodeArgs,
+    promptMetrics,
+    podLogPath,
+    envSecret,
+    mcpConfigSecret,
+  };
+}
+
+/** Return server-only env names present in any generated pod container. */
+export function findServerOnlyEnvVarsInPodSpec(podSpec: k8s.V1PodSpec): string[] {
+  const containers: k8s.V1Container[] = [
+    ...(podSpec.initContainers ?? []),
+    ...(podSpec.containers ?? []),
+    ...((podSpec.ephemeralContainers ?? []) as unknown as k8s.V1Container[]),
+  ];
+  return containers.flatMap((container) =>
+    (container.env ?? [])
+      .filter((entry) => entry.name && SERVER_ONLY_ENV_DENY.has(entry.name))
+      .map((entry) => `${container.name || "<unnamed>"}/${entry.name}`),
+  );
 }

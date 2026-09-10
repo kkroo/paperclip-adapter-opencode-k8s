@@ -1,5 +1,10 @@
 import * as k8s from "@kubernetes/client-node";
 import { readFileSync } from "node:fs";
+import {
+  isAgentInheritableEnvFromRef,
+  isAgentInheritableEnvName,
+  isAgentInheritableSecretVolume,
+} from "./inherit-allowlist.js";
 
 /**
  * Cached self-pod introspection result. Queried once on first execute(),
@@ -11,6 +16,7 @@ export interface SelfPodSecretVolume {
   secretName: string;
   mountPath: string;
   defaultMode: number | undefined;
+  items?: k8s.V1KeyToPath[];
 }
 
 export interface SelfPodInfo {
@@ -141,16 +147,19 @@ export async function getSelfPodInfo(kubeconfigPath?: string): Promise<SelfPodIn
     pvcClaimName = volume?.persistentVolumeClaim?.claimName ?? null;
   }
 
-  // Discover secret volumes mounted on the main container
+  // Discover only agent-approved Secret volumes. The server pod may mount
+  // control-plane credentials that must never be replayed into Jobs.
   const secretVolumes: SelfPodSecretVolume[] = [];
   for (const vm of mainContainer.volumeMounts ?? []) {
     const vol = spec.volumes?.find((v) => v.name === vm.name);
     if (vol?.secret?.secretName) {
+      if (!isAgentInheritableSecretVolume(vol.secret.secretName)) continue;
       secretVolumes.push({
         volumeName: vm.name,
         secretName: vol.secret.secretName,
         mountPath: vm.mountPath,
         defaultMode: vol.secret.defaultMode,
+        items: vol.secret.items ? [...vol.secret.items] : undefined,
       });
     }
   }
@@ -163,13 +172,17 @@ export async function getSelfPodInfo(kubeconfigPath?: string): Promise<SelfPodIn
   const inheritedEnv: Record<string, string> = {};
   const inheritedEnvValueFrom: k8s.V1EnvVar[] = [];
   for (const envVar of mainContainer.env ?? []) {
+    if (!envVar.name || !isAgentInheritableEnvName(envVar.name)) continue;
     if (envVar.value !== undefined) {
       inheritedEnv[envVar.name] = envVar.value;
     } else if (envVar.valueFrom) {
       inheritedEnvValueFrom.push({ name: envVar.name, valueFrom: envVar.valueFrom });
     }
   }
-  const inheritedEnvFrom: k8s.V1EnvFromSource[] = [...(mainContainer.envFrom ?? [])];
+  const inheritedEnvFrom: k8s.V1EnvFromSource[] = (mainContainer.envFrom ?? []).filter((source) => {
+    const refName = source.secretRef?.name ?? source.configMapRef?.name;
+    return typeof refName === "string" && isAgentInheritableEnvFromRef(refName);
+  });
 
   cachedSelfPod = {
     namespace,
