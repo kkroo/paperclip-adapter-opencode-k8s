@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   buildJobManifest,
+  findServerOnlyEnvVarsInPodSpec,
   sanitizeLabelValue,
   type JobBuildInput,
   validatePonytailPluginPath,
@@ -694,19 +695,49 @@ describe("buildJobManifest", () => {
     expect(result.job.spec?.template?.spec?.nodeSelector).toEqual({ "kubernetes.io/arch": "amd64" });
   });
 
-  it("forwards inheritedEnvValueFrom entries onto the opencode container env", () => {
+  it("forwards the allowlisted Penstock Secret reference onto the opencode container env", () => {
     const selfPod = {
       ...mockSelfPod,
       inheritedEnvValueFrom: [
-        { name: "MY_SECRET", valueFrom: { secretKeyRef: { name: "my-secret", key: "token" } } },
+        {
+          name: "PENSTOCK_API_KEY",
+          valueFrom: {
+            secretKeyRef: { name: "paperclip-penstock-org-key", key: "token" },
+          },
+        },
       ],
     };
     const result = buildJobManifest({ ctx: mockCtx, selfPod });
 
     const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
-    const secretEnv = env.find((e) => e.name === "MY_SECRET");
-    expect(secretEnv?.valueFrom?.secretKeyRef?.name).toBe("my-secret");
+    const secretEnv = env.find((e) => e.name === "PENSTOCK_API_KEY");
+    expect(secretEnv?.valueFrom?.secretKeyRef?.name).toBe("paperclip-penstock-org-key");
     expect(secretEnv?.valueFrom?.secretKeyRef?.key).toBe("token");
+  });
+
+  it("drops server-only and unknown valueFrom entries", () => {
+    const selfPod = {
+      ...mockSelfPod,
+      inheritedEnv: {
+        DATABASE_URL: "postgres://must-not-propagate",
+        UNKNOWN_SERVER_SETTING: "must-not-propagate",
+      },
+      inheritedEnvValueFrom: [
+        {
+          name: "DATABASE_URL",
+          valueFrom: { secretKeyRef: { name: "paperclip", key: "databaseUrl" } },
+        },
+        {
+          name: "PAPERCLIP_AGENT_JWT_SECRET",
+          valueFrom: { secretKeyRef: { name: "paperclip", key: "agentJwtSecret" } },
+        },
+      ],
+    };
+    const result = buildJobManifest({ ctx: mockCtx, selfPod });
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    expect(env.map((entry) => entry.name)).not.toEqual(
+      expect.arrayContaining(["DATABASE_URL", "UNKNOWN_SERVER_SETTING", "PAPERCLIP_AGENT_JWT_SECRET"]),
+    );
   });
 
   it("does not duplicate an inheritedEnvValueFrom entry if the name is already set as a literal", () => {
@@ -725,7 +756,7 @@ describe("buildJobManifest", () => {
     expect(homeEntries.every((e) => e.value !== undefined)).toBe(true);
   });
 
-  it("forwards inheritedEnvFrom onto the opencode container envFrom", () => {
+  it("drops inheritedEnvFrom because whole-object env injection is not allowlisted", () => {
     const selfPod = {
       ...mockSelfPod,
       inheritedEnvFrom: [{ secretRef: { name: "my-config-secret" } }],
@@ -733,7 +764,7 @@ describe("buildJobManifest", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod });
 
     const container = result.job.spec?.template?.spec?.containers?.[0];
-    expect(container?.envFrom).toEqual([{ secretRef: { name: "my-config-secret" } }]);
+    expect(container?.envFrom).toBeUndefined();
   });
 
   it("omits envFrom when inheritedEnvFrom is empty", () => {
@@ -1181,16 +1212,55 @@ describe("buildJobManifest — volume wiring branches", () => {
     expect(mounts.find((m) => m.name === "runtime-cache")?.mountPath).toBe("/runtime-cache");
   });
 
-  it("mounts inherited secret volumes from selfPod.secretVolumes", () => {
+  it("mounts only approved inherited Secret volumes and preserves key selectors", () => {
     const selfPod = {
       ...mockSelfPod,
-      secretVolumes: [{ volumeName: "tls", secretName: "tls-secret", mountPath: "/etc/tls", defaultMode: 0o400 }],
+      secretVolumes: [
+        {
+          volumeName: "github-token",
+          secretName: "paperclip-github-mcp-token",
+          mountPath: "/paperclip/.secrets/github-token",
+          defaultMode: 0o400,
+          items: [{ key: "token", path: "token" }],
+        },
+        { volumeName: "tls", secretName: "tls-secret", mountPath: "/etc/tls", defaultMode: 0o400 },
+      ],
     };
     const result = buildJobManifest({ ctx: mockCtx, selfPod });
     const volumes = result.job.spec?.template.spec?.volumes ?? [];
-    expect(volumes.find((v) => v.name === "tls")?.secret?.secretName).toBe("tls-secret");
+    expect(volumes.find((v) => v.name === "github-token")?.secret).toMatchObject({
+      secretName: "paperclip-github-mcp-token",
+      items: [{ key: "token", path: "token" }],
+    });
+    expect(volumes.find((v) => v.name === "tls")).toBeUndefined();
     const mounts = result.job.spec?.template.spec?.containers[0]?.volumeMounts ?? [];
-    expect(mounts.find((m) => m.name === "tls")).toEqual({ name: "tls", mountPath: "/etc/tls", readOnly: true });
+    expect(mounts.find((m) => m.name === "github-token")).toEqual({
+      name: "github-token",
+      mountPath: "/paperclip/.secrets/github-token",
+      readOnly: true,
+    });
+    expect(mounts.find((m) => m.name === "tls")).toBeUndefined();
+  });
+
+  it("detects server-only names across assembled pod containers", () => {
+    expect(
+      findServerOnlyEnvVarsInPodSpec({
+        containers: [
+          {
+            name: "opencode",
+            image: "paperclip:test",
+            env: [
+              {
+                name: "PAPERCLIP_AGENT_JWT_SECRET",
+                valueFrom: {
+                  secretKeyRef: { name: "paperclip", key: "agentJwtSecret" },
+                },
+              },
+            ],
+          },
+        ],
+      }),
+    ).toEqual(["opencode/PAPERCLIP_AGENT_JWT_SECRET"]);
   });
 });
 

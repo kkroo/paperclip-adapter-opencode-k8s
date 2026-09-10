@@ -175,18 +175,36 @@ describe("getSelfPodInfo", () => {
             name: "paperclip",
             image: "paperclip:1.0",
             env: [
-              { name: "FOO", value: "bar" },
-              { name: "SECRET_REF", valueFrom: { secretKeyRef: { name: "s", key: "k" } } },
+              { name: "PAPERCLIP_API_URL", value: "http://paperclip-api:3100" },
+              {
+                name: "PENSTOCK_API_KEY",
+                valueFrom: { secretKeyRef: { name: "paperclip-penstock-org-key", key: "token" } },
+              },
+              { name: "DATABASE_URL", value: "postgres://must-not-propagate" },
+              { name: "UNKNOWN_SERVER_SETTING", value: "must-not-propagate" },
+              {
+                name: "PAPERCLIP_AGENT_JWT_SECRET",
+                valueFrom: { secretKeyRef: { name: "paperclip", key: "agentJwtSecret" } },
+              },
             ],
             envFrom: [{ configMapRef: { name: "cm" } }],
             volumeMounts: [
               { name: "data", mountPath: "/paperclip" },
+              { name: "github-token", mountPath: "/paperclip/.secrets/github-token" },
               { name: "tls-secret", mountPath: "/etc/tls" },
             ],
           },
         ],
         volumes: [
           { name: "data", persistentVolumeClaim: { claimName: "paperclip-pvc" } },
+          {
+            name: "github-token",
+            secret: {
+              secretName: "paperclip-github-mcp-token",
+              defaultMode: 0o400,
+              items: [{ key: "token", path: "token" }],
+            },
+          },
           { name: "tls-secret", secret: { secretName: "tls", defaultMode: 0o400 } },
         ],
         imagePullSecrets: [{ name: "registry-creds" }, { name: "" }, {}],
@@ -198,18 +216,29 @@ describe("getSelfPodInfo", () => {
     };
   }
 
-  it("introspects the pod and extracts image, env, PVC, secrets, dnsConfig", async () => {
+  it("introspects the pod while filtering inherited env and Secret volumes", async () => {
     mockReadNamespacedPod.mockResolvedValue(basePod());
     const info = await getSelfPodInfo();
     expect(info.namespace).toBe(NAMESPACE);
     expect(info.image).toBe("paperclip:1.0");
     expect(info.pvcClaimName).toBe("paperclip-pvc");
-    expect(info.inheritedEnv).toEqual({ FOO: "bar" });
+    expect(info.inheritedEnv).toEqual({
+      PAPERCLIP_API_URL: "http://paperclip-api:3100",
+    });
+    expect(info.inheritedEnv).not.toHaveProperty("DATABASE_URL");
+    expect(info.inheritedEnv).not.toHaveProperty("UNKNOWN_SERVER_SETTING");
     expect(info.inheritedEnvValueFrom).toHaveLength(1);
-    expect(info.inheritedEnvValueFrom[0].name).toBe("SECRET_REF");
-    expect(info.inheritedEnvFrom).toHaveLength(1);
+    expect(info.inheritedEnvValueFrom[0].name).toBe("PENSTOCK_API_KEY");
+    expect(info.inheritedEnvValueFrom.map((entry) => entry.name)).not.toContain("PAPERCLIP_AGENT_JWT_SECRET");
+    expect(info.inheritedEnvFrom).toEqual([]);
     expect(info.secretVolumes).toEqual([
-      { volumeName: "tls-secret", secretName: "tls", mountPath: "/etc/tls", defaultMode: 0o400 },
+      {
+        volumeName: "github-token",
+        secretName: "paperclip-github-mcp-token",
+        mountPath: "/paperclip/.secrets/github-token",
+        defaultMode: 0o400,
+        items: [{ key: "token", path: "token" }],
+      },
     ]);
     // imagePullSecrets with empty name are filtered out
     expect(info.imagePullSecrets).toEqual([{ name: "registry-creds" }]);

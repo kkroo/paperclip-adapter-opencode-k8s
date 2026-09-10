@@ -17,6 +17,12 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import type { SelfPodInfo } from "./k8s-client.js";
 import { buildEnvGuardPluginCleanupShell, buildEnvGuardPluginSetupShell } from "./env-guard-plugin.js";
+import {
+  isAgentInheritableEnvFromRef,
+  isAgentInheritableEnvName,
+  isAgentInheritableSecretVolume,
+  SERVER_ONLY_ENV_DENY,
+} from "./inherit-allowlist.js";
 
 /**
  * Path to the project-scope .mcp.json that paperclip's helm-chart seed-init
@@ -612,9 +618,14 @@ function buildEnvVars(
   if (selfPod.inheritedEnv.PAPERCLIP_API_URL) {
     paperclipEnv.PAPERCLIP_API_URL = selfPod.inheritedEnv.PAPERCLIP_API_URL;
   }
-  // Layer 3: Inherited from Deployment (Bedrock, API keys, etc.)
+  // Layer 3: Inherited from Deployment (Bedrock, API keys, etc.). Re-check the
+  // boundary here because SelfPodInfo is a plain object supplied by the
+  // executor and may be hand-built by a caller or replay path.
+  const filteredInheritedEnv = Object.fromEntries(
+    Object.entries(selfPod.inheritedEnv).filter(([name]) => isAgentInheritableEnvName(name)),
+  );
   const merged: Record<string, string> = {
-    ...selfPod.inheritedEnv,
+    ...filteredInheritedEnv,
     ...paperclipEnv,
   };
 
@@ -682,7 +693,11 @@ function buildEnvVars(
 
   // Append valueFrom vars (Secret/ConfigMap-backed) only for names not already overridden
   for (const envVar of selfPod.inheritedEnvValueFrom) {
-    if (!Object.prototype.hasOwnProperty.call(merged, envVar.name)) {
+    if (
+      envVar.name &&
+      !Object.prototype.hasOwnProperty.call(merged, envVar.name) &&
+      isAgentInheritableEnvName(envVar.name)
+    ) {
       envVars.push({ name: envVar.name, valueFrom: envVar.valueFrom });
     }
   }
@@ -1235,11 +1250,18 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     });
   }
 
-  // Mount secret volumes inherited from the Deployment pod
+  // Mount only agent-approved Secret volumes. The same filter is applied by
+  // getSelfPodInfo(); repeat it for hand-built SelfPodInfo values.
   for (const sv of selfPod.secretVolumes) {
+    if (!isAgentInheritableSecretVolume(sv.secretName)) continue;
     volumes.push({
       name: sv.volumeName,
-      secret: { secretName: sv.secretName, defaultMode: sv.defaultMode, optional: true },
+      secret: {
+        secretName: sv.secretName,
+        defaultMode: sv.defaultMode,
+        ...(sv.items ? { items: sv.items } : {}),
+        optional: true,
+      },
     });
     volumeMounts.push({
       name: sv.volumeName,
@@ -1538,7 +1560,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
               workingDir,
               command: ["sh", "-c", mainCommand],
               env: envVars,
-              ...(selfPod.inheritedEnvFrom.length > 0 ? { envFrom: selfPod.inheritedEnvFrom } : {}),
+              ...(selfPod.inheritedEnvFrom.filter((source) => {
+                const refName = source.secretRef?.name ?? source.configMapRef?.name;
+                return typeof refName === "string" && isAgentInheritableEnvFromRef(refName);
+              }).length > 0
+                ? {
+                    envFrom: selfPod.inheritedEnvFrom.filter((source) => {
+                      const refName = source.secretRef?.name ?? source.configMapRef?.name;
+                      return typeof refName === "string" && isAgentInheritableEnvFromRef(refName);
+                    }),
+                  }
+                : {}),
               volumeMounts,
               securityContext,
               resources: containerResources,
@@ -1558,6 +1590,12 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       `opencode_k8s: refusing to build Job manifest - sensitive-named env var(s) would be injected as a literal value instead of secretKeyRef: ${literalSensitiveNames.join(", ")}`,
     );
   }
+  const serverOnlyNames = findServerOnlyEnvVarsInPodSpec(podSpec);
+  if (serverOnlyNames.length > 0) {
+    throw new Error(
+      `opencode_k8s: refusing to build Job manifest - server-only credential env var(s) would be propagated to the agent pod: ${serverOnlyNames.join(", ")}`,
+    );
+  }
 
   return {
     job,
@@ -1570,4 +1608,18 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     envSecret,
     mcpConfigSecret,
   };
+}
+
+/** Return server-only env names present in any generated pod container. */
+export function findServerOnlyEnvVarsInPodSpec(podSpec: k8s.V1PodSpec): string[] {
+  const containers: k8s.V1Container[] = [
+    ...(podSpec.initContainers ?? []),
+    ...(podSpec.containers ?? []),
+    ...((podSpec.ephemeralContainers ?? []) as unknown as k8s.V1Container[]),
+  ];
+  return containers.flatMap((container) =>
+    (container.env ?? [])
+      .filter((entry) => entry.name && SERVER_ONLY_ENV_DENY.has(entry.name))
+      .map((entry) => `${container.name || "<unnamed>"}/${entry.name}`),
+  );
 }
