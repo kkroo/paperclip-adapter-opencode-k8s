@@ -4,6 +4,7 @@ import type { AdapterModel } from "@paperclipai/adapter-utils";
 import { asString, ensurePathInEnv, runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 
 export const STATIC_MODELS: AdapterModel[] = [
+  { id: "anthropic/claude-fable-5-1", label: "anthropic/claude-fable-5-1" },
   { id: "anthropic/claude-opus-5", label: "anthropic/claude-opus-5" },
   { id: "anthropic/claude-opus-4-7", label: "anthropic/claude-opus-4-7" },
   { id: "anthropic/claude-sonnet-4-6", label: "anthropic/claude-sonnet-4-6" },
