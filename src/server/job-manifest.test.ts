@@ -551,6 +551,11 @@ describe("buildJobManifest", () => {
     expect(val("GOCACHE")).toBe("/runtime-cache/go-build");
     expect(val("TMPDIR")).toBe("/runtime-cache/tmp");
     expect(val("PLAYWRIGHT_BROWSERS_PATH")).toBe("/runtime-cache/ms-playwright");
+    // Not in inheritedEnv above, so this only passes if the Job sets it itself.
+    expect(val("CARGO_TARGET_DIR")).toBe("/runtime-cache/cargo-target");
+    // The toolchain homes are deliberately left alone (see AGENT_CACHE_ENV_LEAVES).
+    expect(val("CARGO_HOME")).toBeUndefined();
+    expect(val("RUSTUP_HOME")).toBeUndefined();
   });
 
   it("reserves opencode XDG config/data/state onto runtime-cache so it can't crash at boot (BLO-14003)", () => {

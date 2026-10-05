@@ -117,6 +117,13 @@ const AGENT_CACHE_ENV_LEAVES: Record<string, string> = {
   BUN_INSTALL_CACHE: "bun",
   PIP_CACHE_DIR: "pip",
   PLAYWRIGHT_BROWSERS_PATH: "ms-playwright",
+  // Rust build output (BLO-15567): an agent clone with no redirect grew a
+  // 34.81 GB `.cargo-target` on the shared paperclip-data PVC. Only the target
+  // dir moves. CARGO_HOME and RUSTUP_HOME stay where agents installed them
+  // (/paperclip/.cargo, /paperclip/.rustup): the image ships no Rust, so
+  // pointing them at an empty per-job dir would leave the rustup proxies with
+  // no toolchain.
+  CARGO_TARGET_DIR: "cargo-target",
 };
 
 const AGENT_SESSION_ENV_LEAVES: Record<string, string> = {
