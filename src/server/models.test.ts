@@ -152,3 +152,23 @@ describe("discoverK8sModels", () => {
     await expect(discoverK8sModels()).rejects.toThrow("timed out");
   });
 });
+
+describe("STATIC_MODELS", () => {
+  it("lists the OpenAI lineup Codex presents (GPT-6.1 Sol through GPT-5.5)", async () => {
+    const { STATIC_MODELS } = await import("./models.js");
+    const ids = STATIC_MODELS.map((m) => m.id);
+    for (const id of [
+      "openai/gpt-6.1-sol",
+      "openai/gpt-6-astra",
+      "openai/gpt-6-sol",
+      "openai/gpt-6-luna",
+      "openai/gpt-5.6-sol",
+      "openai/gpt-5.6-terra",
+      "openai/gpt-5.6-luna",
+      "openai/gpt-5.5",
+    ]) {
+      expect(ids, id).toContain(id);
+    }
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+});

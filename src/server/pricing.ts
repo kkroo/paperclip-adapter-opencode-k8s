@@ -20,6 +20,15 @@ export const OPENAI_PRICING_USD_PER_MTOK: Record<
   { input: number; cachedInput: number; output: number }
 > = {
   "anthropic/claude-opus-5": { input: 5.0, cachedInput: 0.5, output: 25.0 },
+  // GPT-6 family, standard API rates as published at launch (GPT-6 Sol/Luna
+  // 2026-09-22, GPT-6.1 Sol 2026-09-29; see openai.com/index/introducing-gpt-6-1-sol).
+  // Not modelled: the long-context surcharge (requests above 272K input
+  // tokens bill 2x input/cached and 1.5x output for the whole request), so
+  // this fallback under-estimates runs that cross that line.
+  "openai/gpt-6-astra": { input: 10.0, cachedInput: 1.0, output: 50.0 },
+  "openai/gpt-6.1-sol": { input: 2.0, cachedInput: 0.1, output: 10.0 },
+  "openai/gpt-6-sol": { input: 2.0, cachedInput: 0.2, output: 10.0 },
+  "openai/gpt-6-luna": { input: 0.1, cachedInput: 0.01, output: 0.5 },
   "openai/gpt-5.6-sol": { input: 5.0, cachedInput: 0.5, output: 30.0 },
   "openai/gpt-5.6-terra": { input: 2.5, cachedInput: 0.25, output: 15.0 },
   "openai/gpt-5.6-luna": { input: 1.0, cachedInput: 0.1, output: 6.0 },

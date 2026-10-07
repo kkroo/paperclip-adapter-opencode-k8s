@@ -2,6 +2,17 @@ import { describe, it, expect } from "vitest";
 import { computeOpenAICompatibleCost, OPENAI_PRICING_USD_PER_MTOK } from "./pricing.js";
 
 describe("computeOpenAICompatibleCost", () => {
+  it("prices the GPT-6 family at the published standard rates", () => {
+    expect(OPENAI_PRICING_USD_PER_MTOK["openai/gpt-6-astra"]).toEqual({ input: 10.0, cachedInput: 1.0, output: 50.0 });
+    expect(OPENAI_PRICING_USD_PER_MTOK["openai/gpt-6.1-sol"]).toEqual({ input: 2.0, cachedInput: 0.1, output: 10.0 });
+    expect(OPENAI_PRICING_USD_PER_MTOK["openai/gpt-6-sol"]).toEqual({ input: 2.0, cachedInput: 0.2, output: 10.0 });
+    expect(OPENAI_PRICING_USD_PER_MTOK["openai/gpt-6-luna"]).toEqual({ input: 0.1, cachedInput: 0.01, output: 0.5 });
+    // 1M input + 1M cached + 1M output on 6.1 Sol = 2 + 0.1 + 10
+    expect(
+      computeOpenAICompatibleCost("openai/gpt-6.1-sol", { inputTokens: 1_000_000, cachedInputTokens: 1_000_000, outputTokens: 1_000_000 }),
+    ).toBeCloseTo(12.1, 6);
+  });
+
   it("returns a positive cost for gpt-5.6-sol with non-zero usage", () => {
     const cost = computeOpenAICompatibleCost("openai/gpt-5.6-sol", {
       inputTokens: 100_000,

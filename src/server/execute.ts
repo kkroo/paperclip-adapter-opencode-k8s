@@ -46,6 +46,9 @@ async function withK8sConcurrencyGuardTimeout<T>(operation: Promise<T>): Promise
 }
 
 export const MODEL_CONTEXT_WINDOWS: Array<{ pattern: RegExp; tokens: number }> = [
+  // GPT-6 Astra / Sol / Luna and GPT-6.1 Sol all advertise a 1.05M context
+  // (input capped at 922K); same 2^20 window the GPT-5.5/5.6 rows use.
+  { pattern: /^gpt-6(?:\.|-|$)/, tokens: 1_048_576 },
   { pattern: /^gpt-5\.6(?:-|$)/, tokens: 1_048_576 },
   { pattern: /^gpt-5\.5(?:-|$)/, tokens: 1_048_576 },
   { pattern: /^gemini-2(?:\.|-|$)/, tokens: 1_048_576 },
