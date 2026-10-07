@@ -197,6 +197,7 @@ Agent-level configuration fields:
 |-------|----------|---------|-------------|
 | `namespace` | no | Deployment namespace | K8s namespace for agent Jobs |
 | `image` | no | Deployment image | Override container image for Jobs |
+| `opencodeVersion` | no | `1.18.35` | Exact `opencode-ai` version Job pods install once onto the data PVC and run (`"image"` = use the binary bundled in the container image) |
 | `imagePullPolicy` | no | — | Image pull policy for Job pods |
 | `kubeconfig` | no | In-cluster | Path to kubeconfig file |
 | `serviceAccountName` | no | Default SA | Service account for Job pods |

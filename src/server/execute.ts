@@ -1916,6 +1916,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       commandArgs: opencodeArgs,
       commandNotes: [
         `Image: ${job.spec?.template.spec?.containers[0]?.image ?? "unknown"}`,
+        `OpenCode: ${firstBuild.opencodeVersion ? `${firstBuild.opencodeVersion} (adapter-managed on the data PVC)` : "bundled in the image"}`,
         `Namespace: ${namespace}`,
         `Timeout: ${timeoutSec}s`,
       ],

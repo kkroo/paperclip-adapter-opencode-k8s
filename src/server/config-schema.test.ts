@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { getConfigSchema } from "./config-schema.js";
+import { DEFAULT_OPENCODE_VERSION } from "./runtime-pin.js";
 
 interface ConfigFieldSchema {
   key: string;
@@ -33,6 +34,15 @@ describe("getConfigSchema", () => {
     expect(keys).not.toContain("extraArgs");
     expect(keys).not.toContain("timeoutSec");
     expect(keys).not.toContain("graceSec");
+  });
+
+  it("exposes opencodeVersion defaulting to the adapter pin", () => {
+    const schema = getConfigSchema();
+    const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "opencodeVersion");
+    expect(field).toBeDefined();
+    expect(field!.type).toBe("text");
+    expect(field!.default).toBe(DEFAULT_OPENCODE_VERSION);
+    expect(field!.group).toBe("Kubernetes");
   });
 
   it("has imagePullPolicy as select with correct options", () => {

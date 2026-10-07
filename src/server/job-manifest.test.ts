@@ -6,6 +6,7 @@ import {
   type JobBuildInput,
   validatePonytailPluginPath,
 } from "./job-manifest.js";
+import { DEFAULT_OPENCODE_VERSION } from "./runtime-pin.js";
 import { ENV_GUARD_PLUGIN_SCRIPT } from "./env-guard-plugin.js";
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -2038,5 +2039,60 @@ describe("buildJobManifest — resumeLastSession:false unifies fresh-session sem
     expect(script).toContain("--session' 'ses_resuming'");
     expect(result.promptMetrics.bootstrapPromptChars).toBe(0);
     expect(result.promptMetrics.heartbeatPromptChars).toBe(0);
+  });
+});
+
+describe("buildJobManifest — adapter-managed OpenCode runtime (opencodeVersion)", () => {
+  // Job pods inherit the paperclip image, whose root-owned, layer-cached
+  // `opencode-ai` froze at 1.18.11 while Opus 5.5 / Sonnet 5.5 support lands
+  // in newer releases. The main command therefore bootstraps the pinned binary
+  // onto the data PVC and puts it first on PATH before anything resolves
+  // `opencode`. See runtime-pin.ts.
+  const shell = (r: ReturnType<typeof buildJobManifest>) =>
+    r.job.spec?.template?.spec?.containers?.find((c) => c.name === "opencode")?.command?.[2] ?? "";
+
+  it("bootstraps the default pin right after pipefail and before every opencode call", () => {
+    const built = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+    const command = shell(built);
+    expect(built.opencodeVersion).toBe(DEFAULT_OPENCODE_VERSION);
+    // The main command opens with the Chrome BrowserMetrics redirect (and the
+    // DinD wait when enabled); the runtime bootstrap is the first thing after
+    // `set -o pipefail;` so every later `opencode` resolves through its PATH.
+    expect(command).toContain("set -o pipefail; __pover=");
+    expect(command).toContain(`__pover='${DEFAULT_OPENCODE_VERSION}'`);
+    expect(command).toContain("__poroot='/paperclip/.local/lib/paperclip-k8s-runtimes/opencode'");
+    expect(command).toContain('export PATH="$__podir/node_modules/.bin:$PATH"');
+    const runtimeEnd = command.indexOf("falling back to the image opencode");
+    expect(runtimeEnd).toBeGreaterThan(-1);
+    for (const later of ["ccrotate next", "cat /tmp/prompt/prompt.txt | opencode"]) {
+      const idx = command.indexOf(later);
+      if (idx !== -1) expect(idx, later).toBeGreaterThan(runtimeEnd);
+    }
+    expect(command.indexOf("cat /tmp/prompt/prompt.txt | opencode")).toBeGreaterThan(runtimeEnd);
+  });
+
+  it("honours an explicit exact version", () => {
+    const built = buildJobManifest({ ctx: { ...mockCtx, config: { opencodeVersion: "1.19.0" } }, selfPod: mockSelfPod });
+    expect(built.opencodeVersion).toBe("1.19.0");
+    expect(shell(built)).toContain("__pover='1.19.0'");
+    expect(shell(built)).toContain('"opencode-ai@$__pover"');
+  });
+
+  it('"image" disables the bootstrap and keeps the command on the bundled binary', () => {
+    const built = buildJobManifest({ ctx: { ...mockCtx, config: { opencodeVersion: "image" } }, selfPod: mockSelfPod });
+    expect(built.opencodeVersion).toBe("");
+    expect(shell(built)).not.toContain("__pover=");
+    expect(shell(built)).not.toContain("paperclip-k8s-runtimes");
+  });
+
+  it("rejects a non-exact version instead of interpolating it into the shell", () => {
+    expect(() => buildJobManifest({ ctx: { ...mockCtx, config: { opencodeVersion: "latest" } }, selfPod: mockSelfPod })).toThrow(
+      /opencodeVersion must be an exact version/,
+    );
+  });
+
+  it("installs under the configured workspace mount path when the execution target overrides it", () => {
+    const built = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, workspaceVolumeClaim: "agent-data", workspaceMountPath: "/data" });
+    expect(shell(built)).toContain("__poroot='/data/.local/lib/paperclip-k8s-runtimes/opencode'");
   });
 });

@@ -37,6 +37,7 @@ Core fields:
 Kubernetes fields:
 - namespace (string, optional): namespace for Jobs; defaults to the Deployment namespace
 - image (string, optional): override container image; defaults to the running Deployment image
+- opencodeVersion (string, optional): exact opencode-ai version installed once onto the data PVC and used by Job pods; default 1.18.35; "image" runs the binary bundled in the container image
 - imagePullPolicy (string, optional): image pull policy; default "IfNotPresent"
 - kubeconfig (string, optional): absolute path to a kubeconfig file on disk; defaults to in-cluster service account auth
 - resources (object, optional): { requests: { cpu, memory }, limits: { cpu, memory } }
@@ -58,6 +59,7 @@ Inherited from Deployment (no config needed):
 
 Notes:
 - Session resume works via the shared /paperclip PVC (HOME=/paperclip)
+- The OpenCode binary is adapter-managed: Job pods install the pinned version under <data PVC>/.local/lib/paperclip-k8s-runtimes/opencode/<version> on first use and fall back to the image's bundled binary if that install cannot complete
 - Skills configured in Paperclip have their markdown content read from the PVC and prepended to each run prompt
 - Desired skills are resolved from config (paperclipSkills / paperclipRuntimeSkills) at execute time
 - instructionsFilePath content is prepended before skill content, then before the task prompt
