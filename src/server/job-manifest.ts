@@ -1,6 +1,7 @@
 import { createHash } from "crypto";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { buildOpencodeRuntimeShell, resolveOpencodeVersion } from "./runtime-pin.js";
 import type * as k8s from "@kubernetes/client-node";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import {
@@ -417,6 +418,9 @@ export interface JobBuildResult {
   opencodeArgs: string[];
   promptMetrics: Record<string, number>;
   podLogPath: string;
+  /** Pinned OpenCode version the Job bootstraps onto the data PVC, or ""
+   *  when adapterConfig.opencodeVersion is "image" (use the bundled binary). */
+  opencodeVersion: string;
   /** Sensitive literal env values staged in a per-run Secret. */
   envSecret: EnvSecret | null;
   /** MCP-bearing OpenCode config staged in a per-run Secret. */
@@ -954,6 +958,8 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
 
   const namespace = asString(config.namespace, "") || selfPod.namespace;
   const image = asString(config.image, "") || selfPod.image;
+  // Throws on anything but an exact version or "image" — the value is shell-interpolated.
+  const opencodeVersion = resolveOpencodeVersion(config.opencodeVersion);
   const enableDocker = asBoolean(config.enableDocker, false);
   const dockerImage = asString(config.dockerImage, "docker:28-dind");
   const dockerCpuLimit = asString(config.dockerCpuLimit, "4");
@@ -1448,7 +1454,15 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     .filter((snippet) => snippet.length > 0)
     .map((snippet) => `${snippet}; `)
     .join("");
-  const baseMainCommand = `set -o pipefail; ${isolatedRuntimePrep}${workspaceSetup}${credentialSetup}${envGuardPluginSetup}${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${shellQuote(podLogPath)}) && : > ${shellQuote(podLogPath)} && cat /tmp/prompt/prompt.txt | ${launcherCommand} ${opencodeArgsEscaped} | tee -a ${shellQuote(podLogPath)}`;
+  // Adapter-managed OpenCode runtime (see runtime-pin.ts). Must precede every
+  // `opencode` call in the pipeline: the launchers, the db-reset guard's
+  // `opencode --version` stamp, `/compact` and the main run all resolve the
+  // binary through PATH. Empty when opencodeVersion is "image", which keeps
+  // the command byte-identical to the pre-pin pipeline.
+  const opencodeRuntime = opencodeVersion
+    ? `${buildOpencodeRuntimeShell({ version: opencodeVersion, dataMountPath: workspaceMountPath })}; `
+    : "";
+  const baseMainCommand = `set -o pipefail; ${isolatedRuntimePrep}${opencodeRuntime}${workspaceSetup}${credentialSetup}${envGuardPluginSetup}${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${shellQuote(podLogPath)}) && : > ${shellQuote(podLogPath)} && cat /tmp/prompt/prompt.txt | ${launcherCommand} ${opencodeArgsEscaped} | tee -a ${shellQuote(podLogPath)}`;
   // Redirect Chrome's BrowserMetrics spool off the shared CephFS HOME to the
   // main container's per-pod runtime-cache emptyDir. The
   // agent-browser designer tool launches system Chrome with the default
@@ -1605,6 +1619,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     opencodeArgs,
     promptMetrics,
     podLogPath,
+    opencodeVersion,
     envSecret,
     mcpConfigSecret,
   };

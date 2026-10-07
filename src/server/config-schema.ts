@@ -1,4 +1,5 @@
 import type { AdapterConfigSchema } from "@paperclipai/adapter-utils";
+import { DEFAULT_OPENCODE_VERSION } from "./runtime-pin.js";
 
 export function getConfigSchema(): AdapterConfigSchema {
   return {
@@ -115,6 +116,14 @@ export function getConfigSchema(): AdapterConfigSchema {
           { label: "Never", value: "Never" },
         ],
         default: "IfNotPresent",
+        group: "Kubernetes",
+      },
+      {
+        key: "opencodeVersion",
+        label: "OpenCode Version",
+        type: "text",
+        default: DEFAULT_OPENCODE_VERSION,
+        hint: `Exact opencode-ai version the Job installs once onto the shared data PVC and runs instead of the image's bundled binary (default ${DEFAULT_OPENCODE_VERSION}). Set to "image" to run the binary bundled in the container image. Changing it resets each agent's persistent opencode.db once (schema guard).`,
         group: "Kubernetes",
       },
       {
