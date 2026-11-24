@@ -158,6 +158,8 @@ describe("STATIC_MODELS", () => {
     const { STATIC_MODELS } = await import("./models.js");
     const ids = STATIC_MODELS.map((m) => m.id);
     for (const id of [
+      "openai/gpt-6.2-sol",
+      "openai/gpt-6.2-astra",
       "openai/gpt-6.1-sol",
       "openai/gpt-6-astra",
       "openai/gpt-6-sol",
