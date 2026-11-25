@@ -64,10 +64,11 @@ describe("ensureAgentDbPvc", () => {
     expect(spec.metadata?.labels?.["paperclip.io/agent-id"]).toBe(AGENT_ID);
   });
 
-  it("defaults to dedicated_pvc mode when agentDbMode is not set", async () => {
-    vi.mocked(getPvc).mockResolvedValue({ metadata: { name: `opencode-db-${AGENT_ID}` } } as never);
+  it("defaults to workspace_subpath mode when agentDbMode is not set (no PVC provisioned)", async () => {
     const result = await ensureAgentDbPvc(AGENT_ID, NAMESPACE, { agentDbStorageClass: STORAGE_CLASS });
-    expect(result).toBe(`opencode-db-${AGENT_ID}`);
+    expect(result).toBeNull();
+    expect(getPvc).not.toHaveBeenCalled();
+    expect(createPvc).not.toHaveBeenCalled();
   });
 
   it("defaults storage capacity to 1Gi when agentDbStorageCapacity is not set", async () => {
@@ -151,5 +152,11 @@ describe("buildAgentDbWorkspaceSubPath", () => {
     const { buildAgentDbWorkspaceSubPath } = await import("./execute.js");
     expect(buildAgentDbWorkspaceSubPath("co123", "agent-abc", null))
       .toBe(".opencode-db/co123/agent-abc/_no_task_");
+  });
+
+  it("keeps only the path builder responsible for _no_task_ naming", async () => {
+    const { buildAgentDbWorkspaceSubPath, sanitizeTaskKeyForPath } = await import("./execute.js");
+    expect(sanitizeTaskKeyForPath(null)).toBe("_no_task_");
+    expect(buildAgentDbWorkspaceSubPath("co123", "agent-abc", null).endsWith("/_no_task_")).toBe(true);
   });
 });

@@ -22,7 +22,18 @@ function errorText(value: unknown): string {
 export function parseOpenCodeJsonl(stdout: string) {
   let sessionId: string | null = null;
   const messages: string[] = [];
+  // Run-level errors: model/session `error` events. These are real failures.
   const errors: string[] = [];
+  // In-session tool-call errors (e.g. a `read` on a missing file). The agent
+  // sees these as tool results and routinely recovers from them — they must
+  // NOT be conflated with a run failure (PEN-906). Tracked separately for
+  // diagnostics only.
+  const toolErrors: string[] = [];
+  // Reason of the last `step_finish` event. "stop" means opencode reached a
+  // clean final answer; anything else (tool-calls, max_turns, ...) is mid-run
+  // or a limit. Used to recognize a successful completion even when the CLI
+  // process exits non-zero due to non-fatal tool errors.
+  let lastStepReason: string | null = null;
   const usage = {
     inputTokens: 0,
     cachedInputTokens: 0,
@@ -53,6 +64,8 @@ export function parseOpenCodeJsonl(stdout: string) {
       const part = parseObject(event.part);
       const text = asString(part.message, "").trim();
       if (text) messages.push(text);
+      const reason = asString(part.reason, "").trim();
+      if (reason) lastStepReason = reason;
       const tokens = parseObject(part.tokens);
       const cache = parseObject(tokens.cache);
       usage.inputTokens += asNumber(tokens.input, 0);
@@ -67,7 +80,7 @@ export function parseOpenCodeJsonl(stdout: string) {
       const state = parseObject(part.state);
       if (asString(state.status, "") === "error") {
         const text = asString(state.error, "").trim();
-        if (text) errors.push(text);
+        if (text) toolErrors.push(text);
       }
       continue;
     }
@@ -85,6 +98,11 @@ export function parseOpenCodeJsonl(stdout: string) {
     usage,
     costUsd,
     errorMessage: errors.length > 0 ? errors.join("\n") : null,
+    toolErrorMessage: toolErrors.length > 0 ? toolErrors.join("\n") : null,
+    // True when opencode reached a clean final answer (last step_finish
+    // reason === "stop"). A clean completion is a successful run even if the
+    // CLI process exits non-zero because of non-fatal in-session tool errors.
+    completedCleanly: lastStepReason === "stop",
   };
 }
 
@@ -150,6 +168,44 @@ export function isOpenCodeContextOverflowResult(stdout: string): boolean {
       return true;
     }
     if (/["']code["']\s*:\s*["']context_length_exceeded["']/.test(line)) return true;
+  }
+  return false;
+}
+
+// Detect opencode's internal event-stream parser crash when a Responses-API
+// stream item arrives with a missing/undefined `type` field. In the minified
+// bundle this surfaces as a JavaScriptCore runtime error:
+//   "undefined is not an object (evaluating 'M.type')"
+// The V8 equivalent is:
+//   "Cannot read properties of undefined (reading 'type')"
+// Both are caused by a specific item shape from gpt-5.5 that the adapter's
+// event mapper doesn't guard. The opencode session on disk is untouched —
+// the crash happens before any write — so the next wake can retry the same
+// session intact (observed: failed at 07:11/07:14/07:15, clean run at 07:18).
+export function isOpenCodeTypeDerefError(stdout: string, errorMessage: string): boolean {
+  const haystack = `${stdout}\n${errorMessage}`;
+  // JavaScriptCore (Bun): "undefined is not an object (evaluating 'X.type')"
+  if (/undefined is not an object \(evaluating '[^']*\.type'\)/i.test(haystack)) return true;
+  // V8: "Cannot read properties of undefined (reading 'type')"
+  if (/cannot read propert(?:y|ies) of undefined[^)]*\breading ['"]type['"]/i.test(haystack)) return true;
+  return false;
+}
+
+// Detect opencode's internal model-stream parser failure when the upstream
+// closes mid-JSON chunk. This is transient stream truncation, not session
+// corruption: the next wake should retry with the same session intact.
+export function isOpenCodeStreamEofResult(stdout: string): boolean {
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const event = parseJson(line);
+    if (!event) continue;
+    if (asString(event.type, "") !== "error") continue;
+    const errorObj = parseObject(event.error);
+    if (asString(errorObj.name, "") !== "UnknownError") continue;
+    const data = parseObject(errorObj.data);
+    const message = asString(data.message, "");
+    if (/JSON\s+Parse\s+error.*Unexpected\s+EOF/i.test(message)) return true;
   }
   return false;
 }

@@ -1,5 +1,7 @@
 import { createHash } from "crypto";
 import { readFileSync } from "node:fs";
+import path from "node:path";
+import { buildOpencodeRuntimeShell, resolveOpencodeVersion } from "./runtime-pin.js";
 import type * as k8s from "@kubernetes/client-node";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import {
@@ -15,6 +17,13 @@ import {
   renderPaperclipWakePrompt,
 } from "@paperclipai/adapter-utils/server-utils";
 import type { SelfPodInfo } from "./k8s-client.js";
+import { buildEnvGuardPluginCleanupShell, buildEnvGuardPluginSetupShell } from "./env-guard-plugin.js";
+import {
+  isAgentInheritableEnvFromRef,
+  isAgentInheritableEnvName,
+  isAgentInheritableSecretVolume,
+  SERVER_ONLY_ENV_DENY,
+} from "./inherit-allowlist.js";
 
 /**
  * Path to the project-scope .mcp.json that paperclip's helm-chart seed-init
@@ -46,8 +55,8 @@ function loadSharedMcpBaseline(): Record<string, unknown> {
  * same intent with different field names:
  *   claude  {command: "X", args: [...], env: {...}}
  *     -> opencode {type: "local", command: ["X", ...args], environment: {...}}
- *   claude  {type: "http", url: "..."} / {type: "sse", url: "..."}
- *     -> opencode {type: "remote", url: "..."}
+ *   claude  {type: "http", url: "...", headers: {...}} / {type: "sse", url: "..."}
+ *     -> opencode {type: "remote", url: "...", headers: {...}}
  * SSE entries are emitted as remote — opencode's MCP client may surface a
  * per-server transport error if it can't negotiate SSE; the rest of the
  * fleet stays usable.
@@ -72,7 +81,9 @@ function translateMcpEntryToOpencode(spec: unknown): Record<string, unknown> | n
     return out;
   }
   if (typeof s.url === "string") {
-    return { type: "remote", url: s.url };
+    const out: Record<string, unknown> = { type: "remote", url: s.url };
+    if (s.headers && typeof s.headers === "object" && !Array.isArray(s.headers)) out.headers = s.headers;
+    return out;
   }
   return null;
 }
@@ -96,6 +107,187 @@ function buildOpencodeMcpSection(merged: Record<string, unknown>): Record<string
 // MAX_ARG_STRLEN with headroom for command line + other env values.
 export const LARGE_PROMPT_THRESHOLD_BYTES = 100 * 1024;
 
+const RUNTIME_CACHE_VOLUME_NAME = "runtime-cache";
+const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
+const RUNTIME_CACHE_SIZE_LIMIT = "20Gi";
+const AGENT_CACHE_ENV_LEAVES: Record<string, string> = {
+  XDG_CACHE_HOME: "xdg",
+  GOCACHE: "go-build",
+  GOMODCACHE: "gomod",
+  npm_config_cache: "npm",
+  BUN_INSTALL_CACHE: "bun",
+  PIP_CACHE_DIR: "pip",
+  PLAYWRIGHT_BROWSERS_PATH: "ms-playwright",
+  // Rust build output (BLO-15567): an agent clone with no redirect grew a
+  // 34.81 GB `.cargo-target` on the shared paperclip-data PVC. Only the target
+  // dir moves. CARGO_HOME and RUSTUP_HOME stay where agents installed them
+  // (/paperclip/.cargo, /paperclip/.rustup): the image ships no Rust, so
+  // pointing them at an empty per-job dir would leave the rustup proxies with
+  // no toolchain.
+  CARGO_TARGET_DIR: "cargo-target",
+};
+
+const AGENT_SESSION_ENV_LEAVES: Record<string, string> = {
+  XDG_CONFIG_HOME: "xdg/config",
+  XDG_DATA_HOME: "xdg/data",
+  XDG_STATE_HOME: "xdg/state",
+};
+
+export type RunIsolationMode = "shared" | "run" | "workspace" | "isolated";
+type IsolationStorage = "ephemeral" | "persistent";
+
+export interface RunIsolationDescriptor {
+  mode: RunIsolationMode;
+  source: "runtime" | "legacy" | "shared";
+  key: string | null;
+  keyHash: string | null;
+  workspaceRoot: string | null;
+  homeRoot: string | null;
+  sessionRoot: string | null;
+  cacheRoot: string | null;
+  tmpRoot: string | null;
+  sessionScope: string | null;
+  storage: {
+    workspace: IsolationStorage;
+    home: IsolationStorage;
+    session: IsolationStorage;
+    cache: IsolationStorage;
+  };
+}
+
+const SHARED_RUN_ISOLATION: RunIsolationDescriptor = {
+  mode: "shared",
+  source: "shared",
+  key: null,
+  keyHash: null,
+  workspaceRoot: null,
+  homeRoot: null,
+  sessionRoot: null,
+  cacheRoot: null,
+  tmpRoot: null,
+  sessionScope: null,
+  storage: {
+    workspace: "persistent",
+    home: "persistent",
+    session: "ephemeral",
+    cache: "ephemeral",
+  },
+};
+
+function readObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function readDescriptorString(obj: Record<string, unknown>, key: string): string | null {
+  const value = obj[key];
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function isolationKeyHash(key: string): string {
+  return createHash("sha256").update(key).digest("hex").slice(0, 16);
+}
+
+function readStorageValue(raw: Record<string, unknown>, field: string): IsolationStorage {
+  const value = readDescriptorString(raw, field);
+  if (value !== "ephemeral" && value !== "persistent") {
+    throw new Error(`runtime isolation descriptor has invalid storage.${field}`);
+  }
+  return value;
+}
+
+function readRuntimeIsolationDescriptor(value: unknown): RunIsolationDescriptor | null {
+  if (value === null || value === undefined) return null;
+  const raw = readObject(value);
+  if (!raw) throw new Error("runtime isolation descriptor must be an object");
+  const mode = readDescriptorString(raw, "isolationMode");
+  if (mode === "shared" || !mode) return { ...SHARED_RUN_ISOLATION, source: "runtime" };
+  if (mode !== "run" && mode !== "workspace") {
+    return { ...SHARED_RUN_ISOLATION, source: "runtime" };
+  }
+  const key = readDescriptorString(raw, "isolationKey");
+  const workspaceRoot = readDescriptorString(raw, "workspaceRoot");
+  const homeRoot = readDescriptorString(raw, "homeRoot");
+  const sessionRoot = readDescriptorString(raw, "sessionRoot");
+  const cacheRoot = readDescriptorString(raw, "cacheRoot");
+  const tmpRoot = readDescriptorString(raw, "tmpRoot");
+  const storage = readObject(raw.storage);
+  if (!key || !workspaceRoot || !homeRoot || !sessionRoot || !cacheRoot || !tmpRoot || !storage) {
+    throw new Error(`runtime ${mode} isolation descriptor is incomplete`);
+  }
+  for (const [field, candidate] of Object.entries({ workspaceRoot, homeRoot, sessionRoot, cacheRoot, tmpRoot })) {
+    if (!path.posix.isAbsolute(candidate)) {
+      throw new Error(`runtime isolation descriptor ${field} must be absolute`);
+    }
+  }
+  return {
+    mode,
+    source: "runtime",
+    key,
+    keyHash: isolationKeyHash(key),
+    workspaceRoot,
+    homeRoot,
+    sessionRoot,
+    cacheRoot,
+    tmpRoot,
+    sessionScope: readDescriptorString(readObject(raw.sessionScope) ?? {}, "isolationKey") ?? key,
+    storage: {
+      workspace: readStorageValue(storage, "workspace"),
+      home: readStorageValue(storage, "home"),
+      session: readStorageValue(storage, "session"),
+      cache: readStorageValue(storage, "cache"),
+    },
+  };
+}
+
+export function readRunIsolationDescriptor(
+  ctx: AdapterExecutionContext,
+  config: Record<string, unknown> = parseObject(ctx.config),
+): RunIsolationDescriptor {
+  const runtimeIsolation = readRuntimeIsolationDescriptor(
+    (ctx.runtime as unknown as { isolation?: unknown }).isolation,
+  );
+  if (runtimeIsolation) return runtimeIsolation;
+
+  const context = (ctx.context ?? {}) as Record<string, unknown>;
+  const candidates = [
+    context.k8sRunIsolation,
+    context.runIsolation,
+    context.isolation,
+    config.k8sRunIsolation,
+    config.runIsolation,
+    config.isolation,
+  ];
+  const raw = candidates.map(readObject).find((candidate): candidate is Record<string, unknown> => Boolean(candidate));
+  if (!raw) return SHARED_RUN_ISOLATION;
+
+  const mode = readDescriptorString(raw, "isolationMode") ?? readDescriptorString(raw, "mode");
+  const key = readDescriptorString(raw, "isolationKey") ?? readDescriptorString(raw, "key");
+  if (mode !== "isolated" || !key) return SHARED_RUN_ISOLATION;
+
+  return {
+    mode: "isolated",
+    source: "legacy",
+    key,
+    keyHash: isolationKeyHash(key),
+    workspaceRoot: readDescriptorString(raw, "workspaceRoot"),
+    homeRoot: readDescriptorString(raw, "homeRoot"),
+    sessionRoot: readDescriptorString(raw, "sessionRoot") ?? readDescriptorString(raw, "homeRoot"),
+    cacheRoot: readDescriptorString(raw, "cacheRoot"),
+    tmpRoot: readDescriptorString(raw, "tmpRoot"),
+    sessionScope: readDescriptorString(raw, "sessionScope"),
+    storage: {
+      workspace: "persistent",
+      home: "persistent",
+      session: "persistent",
+      cache: "persistent",
+    },
+  };
+}
+
+function isIsolatedRunMode(mode: RunIsolationMode): mode is Exclude<RunIsolationMode, "shared"> {
+  return mode !== "shared";
+}
+
 function assertSafePathComponent(field: string, value: string): void {
   // Allow alphanumeric, hyphens, and colons (UUIDs like "550e8400-e29b-41d4-a716-446655440000")
   if (!/^[a-zA-Z0-9-:]+$/.test(value)) {
@@ -107,6 +299,74 @@ export function buildPodLogPath(companyId: string, agentId: string, runId: strin
   return `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/${runId}.pod.ndjson`;
 }
 
+function buildIsolatedPodLogPath(isolation: RunIsolationDescriptor, runId: string): string | null {
+  if (!isIsolatedRunMode(isolation.mode) || !isolation.cacheRoot || isolation.storage.cache === "ephemeral") return null;
+  return path.posix.join(isolation.cacheRoot, "run-logs", `${runId}.pod.ndjson`);
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+const SUPPORTED_PENSTOCK_PROVIDERS = new Set(["anthropic", "openai"]);
+const PONYTAIL_MODES = new Set(["off", "lite", "full", "ultra"]);
+
+export function validatePenstockProvider(raw: unknown): string {
+  if (typeof raw !== "string") {
+    throw new Error("PENSTOCK_PROVIDER must be anthropic or openai");
+  }
+  const value = raw.trim().toLowerCase();
+  if (!SUPPORTED_PENSTOCK_PROVIDERS.has(value)) {
+    throw new Error("PENSTOCK_PROVIDER must be anthropic or openai");
+  }
+  return value;
+}
+
+/** Validate a launcher executable; this field is never a shell fragment. */
+export function validateAgentCommand(raw: unknown, fallback = "opencode"): string {
+  if (raw === undefined || raw === null || raw === "") return fallback;
+  if (typeof raw !== "string") throw new Error("agentCommand must name one executable");
+  const value = raw.trim();
+  if (!value || !/^[A-Za-z0-9._/-]+$/.test(value)) {
+    throw new Error("agentCommand must name one executable without arguments or shell metacharacters");
+  }
+  return value;
+}
+
+export function validatePonytailPluginPath(raw: unknown): string | null {
+  if (raw === undefined || raw === null || raw === "") return null;
+  if (typeof raw !== "string") throw new Error("ponytailPluginPath must be an absolute .mjs file path");
+  const value = raw.trim();
+  if (
+    !value ||
+    !path.posix.isAbsolute(value) ||
+    !value.endsWith(".mjs") ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  ) {
+    throw new Error("ponytailPluginPath must be an absolute .mjs file path without control characters");
+  }
+  return value;
+}
+
+export function validatePonytailDefaultMode(raw: unknown): string | null {
+  if (raw === undefined || raw === null || raw === "") return null;
+  if (typeof raw !== "string") throw new Error("ponytailDefaultMode must be off, lite, full, or ultra");
+  const value = raw.trim().toLowerCase();
+  if (!PONYTAIL_MODES.has(value)) throw new Error("ponytailDefaultMode must be off, lite, full, or ultra");
+  return value;
+}
+
+function hasExplicitEnvName(
+  name: string,
+  envConfig: Record<string, unknown>,
+  inheritedEnv: Record<string, string>,
+  inheritedEnvValueFrom: k8s.V1EnvVar[],
+): boolean {
+  return Object.prototype.hasOwnProperty.call(envConfig, name) ||
+    Object.prototype.hasOwnProperty.call(inheritedEnv, name) ||
+    inheritedEnvValueFrom.some((entry) => entry.name === name);
+}
+
 export interface JobBuildInput {
   ctx: AdapterExecutionContext;
   selfPod: SelfPodInfo;
@@ -116,7 +376,7 @@ export interface JobBuildInput {
   skillsBundleContent?: string;
   /**
    * When set, the prompt is stored in this K8s Secret (already created by the caller)
-   * and the init container mounts and copies it instead of using an env var.
+   * and the init container mounts and decompresses it instead of using an env var.
    * Required when the prompt exceeds LARGE_PROMPT_THRESHOLD_BYTES.
    */
   promptSecretName?: string;
@@ -154,6 +414,7 @@ export interface JobBuildInput {
    * target's environment config. Defaults to `/paperclip` when unset.
    */
   workspaceMountPath?: string;
+  isolation?: RunIsolationDescriptor;
 }
 
 export interface JobBuildResult {
@@ -164,6 +425,60 @@ export interface JobBuildResult {
   opencodeArgs: string[];
   promptMetrics: Record<string, number>;
   podLogPath: string;
+  /** Pinned OpenCode version the Job bootstraps onto the data PVC, or ""
+   *  when adapterConfig.opencodeVersion is "image" (use the bundled binary). */
+  opencodeVersion: string;
+  /** Sensitive literal env values staged in a per-run Secret. */
+  envSecret: EnvSecret | null;
+  /** MCP-bearing OpenCode config staged in a per-run Secret. */
+  mcpConfigSecret: McpConfigSecret | null;
+}
+
+export interface EnvSecret {
+  name: string;
+  namespace: string;
+  data: Record<string, string>;
+}
+
+/**
+ * OpenCode's merged config can contain remote MCP authorization headers and
+ * local-server environment values. Keep that entire override out of the Job
+ * manifest and deliver it through a short-lived Secret-backed volume.
+ */
+export interface McpConfigSecret {
+  name: string;
+  namespace: string;
+  data: Record<string, string>;
+}
+
+const SENSITIVE_ENV_NAME_RE = /(TOKEN|SECRET|PASSWORD|KEY|CREDENTIAL|AUTH)/i;
+
+export function isSensitiveEnvName(name: string): boolean {
+  return SENSITIVE_ENV_NAME_RE.test(name);
+}
+
+export function findLiteralSensitiveEnvVars(env: k8s.V1EnvVar[]): string[] {
+  return env
+    .filter((entry) =>
+      entry.name &&
+      isSensitiveEnvName(entry.name) &&
+      typeof entry.value === "string" &&
+      entry.value.length > 0
+    )
+    .map((entry) => entry.name);
+}
+
+export function findLiteralSensitiveEnvVarsInPodSpec(podSpec: k8s.V1PodSpec): string[] {
+  const containers: k8s.V1Container[] = [
+    ...(podSpec.initContainers ?? []),
+    ...(podSpec.containers ?? []),
+    ...((podSpec.ephemeralContainers ?? []) as unknown as k8s.V1Container[]),
+  ];
+  return containers.flatMap((container) =>
+    findLiteralSensitiveEnvVars(container.env ?? []).map(
+      (name) => `${container.name || "<unnamed>"}/${name}`,
+    )
+  );
 }
 
 /**
@@ -231,7 +546,9 @@ function buildEnvVars(
   ctx: AdapterExecutionContext,
   selfPod: SelfPodInfo,
   config: Record<string, unknown>,
-): k8s.V1EnvVar[] {
+  isolation: RunIsolationDescriptor,
+  envSecretName: string,
+): { envVars: k8s.V1EnvVar[]; sensitiveEnvData: Record<string, string> } {
   const { runId, agent, context } = ctx;
   const envConfig = parseObject(config.env);
 
@@ -265,7 +582,27 @@ function buildEnvVars(
   setIfPresent("PAPERCLIP_WORKSPACE_REPO_REF", workspaceContext.repoRef);
   setIfPresent("PAPERCLIP_WORKSPACE_BRANCH", workspaceContext.branchName);
   setIfPresent("PAPERCLIP_WORKSPACE_WORKTREE_PATH", workspaceContext.worktreePath);
-  setIfPresent("AGENT_HOME", workspaceContext.agentHome);
+
+  // AGENT_HOME resolution.
+  //
+  // The agent's instructions (AGENTS.md) point at companion files via
+  // `$AGENT_HOME/HEARTBEAT.md`, `$AGENT_HOME/SOUL.md`, `$AGENT_HOME/TOOLS.md`,
+  // and `$AGENT_HOME/skills/*.md`. For an "external" instructions bundle the
+  // server materializes that whole tree into `instructionsRootPath` (a stable
+  // per-agent dir), NOT into the per-task workspace. If AGENT_HOME stays
+  // pointed at the workspace (which only ever holds repo checkouts), every
+  // `Read $AGENT_HOME/HEARTBEAT.md` the agent performs hits "File not found"
+  // and the run dies before doing useful work — the failure mode that kept
+  // opencode_k8s agents with an external bundle at 100% failure while
+  // claude_k8s agents (whose AGENT_HOME already IS the bundle dir) worked.
+  // Point AGENT_HOME at the bundle root so the companions resolve, mirroring
+  // claude_k8s. Falls back to the server-provided workspace agentHome when no
+  // external bundle is configured (single-file / legacy agents — unchanged).
+  const instructionsBundleMode = asString(config.instructionsBundleMode, "").trim();
+  const instructionsRootPath = asString(config.instructionsRootPath, "").trim();
+  const externalBundleHome =
+    instructionsBundleMode === "external" && instructionsRootPath ? instructionsRootPath : "";
+  setIfPresent("AGENT_HOME", externalBundleHome || workspaceContext.agentHome);
 
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((v): v is string => typeof v === "string" && v.trim().length > 0)
@@ -292,35 +629,91 @@ function buildEnvVars(
   if (selfPod.inheritedEnv.PAPERCLIP_API_URL) {
     paperclipEnv.PAPERCLIP_API_URL = selfPod.inheritedEnv.PAPERCLIP_API_URL;
   }
-  // Layer 3: Inherited from Deployment (Bedrock, API keys, etc.)
+  // Layer 3: Inherited from Deployment (Bedrock, API keys, etc.). Re-check the
+  // boundary here because SelfPodInfo is a plain object supplied by the
+  // executor and may be hand-built by a caller or replay path.
+  const filteredInheritedEnv = Object.fromEntries(
+    Object.entries(selfPod.inheritedEnv).filter(([name]) => isAgentInheritableEnvName(name)),
+  );
   const merged: Record<string, string> = {
-    ...selfPod.inheritedEnv,
+    ...filteredInheritedEnv,
     ...paperclipEnv,
   };
+
+  // Agent jobs do dev/build work (npm install with devDependencies, running
+  // source build/test toolchains). The base paperclip image bakes
+  // NODE_ENV=production, which makes `npm install`/`npm ci` omit
+  // devDependencies and breaks toolchain bootstrap for source builds
+  // (e.g. shaka's closure-make-deps). Default to a non-production NODE_ENV so
+  // dev tooling installs. Set before Layer 4 so the Deployment env (above) or
+  // user config.env can still override it. See BLO-8661.
+  if (!("NODE_ENV" in merged)) {
+    merged.NODE_ENV = "development";
+  }
 
   // Layer 4: User-defined overrides from adapterConfig.env
   for (const [key, value] of Object.entries(envConfig)) {
     if (typeof value === "string") merged[key] = value;
   }
 
+  // Build/package/temp state is always disposable writable cache. OpenCode's
+  // config/data/state carry resumable session metadata, so durable workspace
+  // descriptors route those XDG roots to sessionRoot while run/shared modes
+  // retain writable ephemeral paths.
+  const cacheMountPath = isolation.cacheRoot ?? RUNTIME_CACHE_MOUNT_PATH;
+  for (const [key, leaf] of Object.entries(AGENT_CACHE_ENV_LEAVES)) {
+    merged[key] = `${cacheMountPath}/${leaf}`;
+  }
+  const sessionMountPath = isolation.sessionRoot ?? cacheMountPath;
+  for (const [key, leaf] of Object.entries(AGENT_SESSION_ENV_LEAVES)) {
+    merged[key] = `${sessionMountPath}/${leaf}`;
+  }
+
   // OpenCode-specific: prevent project config pollution, always set after user overrides
   merged.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
-  merged.HOME = "/paperclip";
+  merged.HOME = isolation.homeRoot ?? "/paperclip";
+  // Run-scoped so concurrent stateless Jobs never share a writable temp
+  // directory (BLO-16219). Falls back to the flat runtime-cache mount for
+  // shared mode, preserving its prior (unscoped) temp behavior.
+  const tmpMountPath = isolation.tmpRoot ?? `${cacheMountPath}/tmp`;
+  merged.TMPDIR = tmpMountPath;
+  merged.TMP = tmpMountPath;
+  merged.TEMP = tmpMountPath;
+  if (isIsolatedRunMode(isolation.mode)) {
+    merged.PAPERCLIP_K8S_ISOLATION_MODE = isolation.mode;
+    if (isolation.key) merged.PAPERCLIP_K8S_ISOLATION_KEY = isolation.key;
+    if (isolation.workspaceRoot) merged.PAPERCLIP_K8S_WORKSPACE_ROOT = isolation.workspaceRoot;
+    if (isolation.homeRoot) merged.PAPERCLIP_K8S_HOME_ROOT = isolation.homeRoot;
+    if (isolation.sessionRoot) merged.PAPERCLIP_K8S_SESSION_ROOT = isolation.sessionRoot;
+    if (isolation.cacheRoot) merged.PAPERCLIP_K8S_CACHE_ROOT = isolation.cacheRoot;
+    if (isolation.tmpRoot) merged.PAPERCLIP_K8S_TMP_ROOT = isolation.tmpRoot;
+    if (isolation.sessionScope) merged.PAPERCLIP_K8S_SESSION_SCOPE = isolation.sessionScope;
+    if (isolation.workspaceRoot) merged.PAPERCLIP_WORKSPACE_CWD = isolation.workspaceRoot;
+  }
 
-  // Convert literal-value vars to V1EnvVar array
-  const envVars: k8s.V1EnvVar[] = Object.entries(merged).map(([name, value]) => ({
-    name,
-    value,
-  }));
+  // Keep credential-shaped values out of the Job spec. A Secret-backed
+  // secretKeyRef is visible to the kubelet but not to a read-only Pod GET.
+  const sensitiveEnvData: Record<string, string> = {};
+  const envVars: k8s.V1EnvVar[] = Object.entries(merged).map(([name, value]) => {
+    if (isSensitiveEnvName(name) && value) {
+      sensitiveEnvData[name] = value;
+      return { name, valueFrom: { secretKeyRef: { name: envSecretName, key: name } } };
+    }
+    return { name, value };
+  });
 
   // Append valueFrom vars (Secret/ConfigMap-backed) only for names not already overridden
   for (const envVar of selfPod.inheritedEnvValueFrom) {
-    if (!Object.prototype.hasOwnProperty.call(merged, envVar.name)) {
+    if (
+      envVar.name &&
+      !Object.prototype.hasOwnProperty.call(merged, envVar.name) &&
+      isAgentInheritableEnvName(envVar.name)
+    ) {
       envVars.push({ name: envVar.name, valueFrom: envVar.valueFrom });
     }
   }
 
-  return envVars;
+  return { envVars, sensitiveEnvData };
 }
 
 /**
@@ -340,14 +733,127 @@ function buildEnvVars(
  * `disabled_providers: ["opencode"]` makes the failure loud (opencode exits
  * immediately if no other provider is configured) instead of silently
  * falling through to zen.
+ *
+ * 3. `snapshot: false` — opencode's turn-zero workspace snapshot runs
+ *    `git add --all --sparse` against the whole work tree into a shadow
+ *    git store under XDG_DATA_HOME before the first LLM turn starts. Agent
+ *    workspace dirs accumulate months of checkouts/build trees, so on a
+ *    cold runtime-cache (snapshot store keyed per content hash) this can
+ *    peg a core in uninterruptible disk I/O for 20-30+ minutes with zero
+ *    opencode output — indistinguishable from a hang from the harness's
+ *    point of view. The harness already has its own git/PR discipline for
+ *    every task; opencode's in-session revert-via-snapshot UI is unused
+ *    here, so the snapshot is pure overhead. See BLO-14758.
  */
-function buildRuntimeConfigJson(config: Record<string, unknown>): string | null {
+// Reasoning models (notably gpt-5.5) routinely pause for long stretches between
+// streamed SSE chunks while thinking. OpenCode's default inter-chunk idle guard
+// (`provider.options.chunkTimeout`) aborts the request when no chunk arrives
+// within its window, surfacing `API Error: Stream idle timeout - partial
+// response` and persisting the TRUNCATED assistant turn — e.g. an issue
+// description cut mid-sentence, which then mirrors verbatim to Linear and reads
+// as a "sync clipped my body" bug. 240_000 ms (240s) sits just under the
+// /responses shim's 255s Bun socket idle (onprem-k8s opencode-ccrotate-responses-shim)
+// and matches the MCP idleTimeout=240 convention, so opencode tolerates the same
+// reasoning gap the upstream socket does instead of aborting first. Applied to
+// BOTH config paths because opencode does not merge config sources — whichever
+// of ~/.config/opencode/opencode.json (no-MCP) or OPENCODE_CONFIG (MCP) wins
+// must carry it.
+const OPENAI_PROVIDER_CHUNK_TIMEOUT_MS = 240_000;
+
+/**
+ * Per-agent client-session header for the Penstock gateway (org_penstock
+ * #accounts attribution). Every agent Job shares the one org API key, so
+ * without this the whole fleet melts into a single UNTAGGED bucket on the
+ * consumption dashboard. Penstock's client-session extraction gives
+ * `x-penstock-session` top precedence, so each agent's traffic groups under
+ * `agent:<name>` — one live entry per agent while it is actually flowing.
+ *
+ * Value hygiene mirrors the host's claude_local X-Anthropic-Agent-Id stamp:
+ * strip CR/LF (header injection) and bound the length.
+ */
+function penstockSessionHeaders(agent: { id: string; name?: string | null }): Record<string, string> {
+  const name = String(agent.name ?? "").replace(/[\r\n]/g, "").trim();
+  const id = String(agent.id ?? "").replace(/[\r\n]/g, "").trim();
+  const label = (name || id).slice(0, 128);
+  return { "x-penstock-session": `agent:${label}` };
+}
+
+/**
+ * Provider options for BOTH opencode config paths (opencode does not merge
+ * config sources, so whichever file wins must carry the full set):
+ *  - openai.chunkTimeout: generous inter-chunk idle window for reasoning models
+ *  - per-provider headers: per-agent Penstock session identity (see
+ *    penstockSessionHeaders) — opencode passes `options` to the AI SDK's
+ *    provider factory, which merges `headers` into every request.
+ */
+function providerConfig(agent: { id: string; name?: string | null }): Record<string, unknown> {
+  const headers = penstockSessionHeaders(agent);
+  return {
+    anthropic: { options: { headers } },
+    openai: { options: { chunkTimeout: OPENAI_PROVIDER_CHUNK_TIMEOUT_MS, headers } },
+  };
+}
+
+/**
+ * PEN-1305 Layer 1 (config arm) — deny full-environment dump commands at the
+ * opencode `permission.bash` layer so agents cannot dump live secret-bearing
+ * runtime variables into the run transcript.
+ *
+ * Patterns are scoped to the *dump* forms only; legitimate uses of the same
+ * binaries must NOT be blocked:
+ *   - `env` / `printenv` bare = dump → deny; `env FOO=bar cmd` (set-and-run)
+ *     and `printenv PATH` (single named var) carry args, so the bare-token
+ *     globs below never match them.
+ *   - `set` bare = dump → deny; `set -euo pipefail` carries args → not matched.
+ *   - `export -p` / `declare -x` = dump → deny (with trailing-arg variants).
+ *   - `cat /proc/<pid>/environ` = dump → deny.
+ *
+ * This is the stable, config-only arm. A `tool.execute.before` plugin arm
+ * (robust regex + shell-wrapper unwrapping, mirroring the claude adapter's
+ * PreToolUse guard and server/src/agent-shell-guard.ts) is a canary-gated
+ * follow-up. The server-side transcript redaction remains the backstop for any
+ * wrapped form (`sh -lc "env"`) that glob matching cannot catch.
+ */
+const ENV_DUMP_BASH_DENY: Record<string, "deny"> = {
+  env: "deny",
+  printenv: "deny",
+  set: "deny",
+  "export -p": "deny",
+  "export -p *": "deny",
+  "declare -x": "deny",
+  "declare -x *": "deny",
+  "cat /proc/*/environ": "deny",
+};
+
+function buildRuntimeConfigJson(
+  config: Record<string, unknown>,
+  agent: { id: string; name?: string | null },
+  options: {
+    ponytailPluginPath?: string | null;
+    mcp?: Record<string, unknown>;
+    includeSchema?: boolean;
+  } = {},
+): string {
   const skipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
   const runtime: Record<string, unknown> = {
+    ...(options.includeSchema ? { $schema: "https://opencode.ai/config.json" } : {}),
     disabled_providers: ["opencode"],
+    provider: providerConfig(agent),
+    snapshot: false,
+    ...(options.ponytailPluginPath ? { plugin: [options.ponytailPluginPath] } : {}),
+    ...(options.mcp && Object.keys(options.mcp).length > 0 ? { mcp: options.mcp } : {}),
   };
+  // Always deny env-dump commands. Under skipPermissions (the unattended Job
+  // default) everything else stays "allow" so no command prompts; otherwise the
+  // specific denies are added without changing opencode's default prompt
+  // behaviour for unmatched commands.
   if (skipPermissions) {
-    runtime.permission = { external_directory: "allow" };
+    runtime.permission = {
+      external_directory: "allow",
+      bash: { "*": "allow", ...ENV_DUMP_BASH_DENY },
+    };
+  } else {
+    runtime.permission = { bash: { ...ENV_DUMP_BASH_DENY } };
   }
   return JSON.stringify(runtime, null, 2);
 }
@@ -368,7 +874,19 @@ function buildRuntimeConfigJson(config: Record<string, unknown>): string | null 
  * token expires.
  */
 function buildOpencodeAuthBootstrapShell(): string {
-  return `mkdir -p ~/.local/share/opencode && node -e 'const fs=require("fs"),p=require("path"),H=process.env.HOME||".";try{const c=JSON.parse(fs.readFileSync(p.join(H,".codex","auth.json"),"utf8"));if(c.auth_mode!=="chatgpt"||!c.tokens||!c.tokens.access_token||!c.tokens.refresh_token)process.exit(0);let exp=Date.now()+30*60*1000;try{const part=c.tokens.id_token.split(".")[1];const pad="=".repeat((4-part.length%4)%4);const payload=JSON.parse(Buffer.from((part+pad).replace(/-/g,"+").replace(/_/g,"/"),"base64").toString());if(payload.exp)exp=payload.exp*1000;}catch(e){}const out={openai:{type:"oauth",access:c.tokens.access_token,refresh:c.tokens.refresh_token,expires:exp,accountId:c.tokens.account_id||null}};fs.writeFileSync(p.join(H,".local","share","opencode","auth.json"),JSON.stringify(out));}catch(e){console.error("[opencode-auth-bootstrap] skipped:",e.message);}' || true`;
+  return `mkdir -p "\${XDG_DATA_HOME:-$HOME/.local/share}/opencode" && node -e 'const fs=require("fs"),p=require("path"),H=process.env.HOME||".",D=process.env.XDG_DATA_HOME||p.join(H,".local","share");try{const c=JSON.parse(fs.readFileSync(p.join(H,".codex","auth.json"),"utf8"));if(c.auth_mode!=="chatgpt"||!c.tokens||!c.tokens.access_token||!c.tokens.refresh_token)process.exit(0);let exp=Date.now()+30*60*1000;try{const part=c.tokens.id_token.split(".")[1];const pad="=".repeat((4-part.length%4)%4);const payload=JSON.parse(Buffer.from((part+pad).replace(/-/g,"+").replace(/_/g,"/"),"base64").toString());if(payload.exp)exp=payload.exp*1000;}catch(e){}const out={openai:{type:"oauth",access:c.tokens.access_token,refresh:c.tokens.refresh_token,expires:exp,accountId:c.tokens.account_id||null}};fs.writeFileSync(p.join(D,"opencode","auth.json"),JSON.stringify(out));}catch(e){console.error("[opencode-auth-bootstrap] skipped:",e.message);}' || true`;
+}
+
+function buildOpencodeApiKeyAuthCleanupShell(): string {
+  return `rm -f "\${XDG_DATA_HOME:-$HOME/.local/share}/opencode/auth.json" "\${XDG_DATA_HOME:-$HOME/.local/share}/opencode/account.json" 2>/dev/null || true`;
+}
+
+function hasEnvVarValue(envVars: k8s.V1EnvVar[], name: string): boolean {
+  return envVars.some((envVar) => {
+    if (envVar.name !== name) return false;
+    if (typeof envVar.value === "string" && envVar.value.length > 0) return true;
+    return Boolean(envVar.valueFrom);
+  });
 }
 
 /**
@@ -400,7 +918,12 @@ function buildDindSidecar(opts: {
     name: "dind",
     image: opts.image,
     imagePullPolicy: "IfNotPresent",
-    args: ["dockerd", "--host=unix:///var/run/docker.sock", "--storage-driver=overlay2"],
+    // `--group=1000` makes dockerd create /var/run/docker.sock with group 1000
+    // (mode 0660 root:1000). The main agent container runs as uid 1000 with
+    // the pod's primary runAsGroup=1000, so without this it can't connect to
+    // the socket (which dockerd otherwise creates root:root mode 0660).
+    // BLO-5492.
+    args: ["dockerd", "--host=unix:///var/run/docker.sock", "--storage-driver=overlay2", "--group=1000"],
     securityContext: { privileged: true, runAsUser: 0, runAsNonRoot: false },
     env: [{ name: "DOCKER_TLS_CERTDIR", value: "" }],
     resources: {
@@ -431,6 +954,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const { runId, agent, runtime, config: rawConfig, context, onLog } = ctx;
   const warnLabel = (msg: string) => void onLog("stderr", msg).catch(() => {});
   const config = parseObject(rawConfig);
+  const isolation = input.isolation ?? readRunIsolationDescriptor(ctx, config);
 
   // Validate path components for log file safety
   const companyId = agent.companyId;
@@ -441,13 +965,19 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
 
   const namespace = asString(config.namespace, "") || selfPod.namespace;
   const image = asString(config.image, "") || selfPod.image;
+  // Throws on anything but an exact version or "image" — the value is shell-interpolated.
+  const opencodeVersion = resolveOpencodeVersion(config.opencodeVersion);
   const enableDocker = asBoolean(config.enableDocker, false);
   const dockerImage = asString(config.dockerImage, "docker:28-dind");
-  const dockerCpuLimit = asString(config.dockerCpuLimit, "2");
-  const dockerMemoryLimit = asString(config.dockerMemoryLimit, "2Gi");
+  const dockerCpuLimit = asString(config.dockerCpuLimit, "4");
+  const dockerMemoryLimit = asString(config.dockerMemoryLimit, "8Gi");
   const model = asString(config.model, "").trim();
   const variant = asString(config.variant, "").trim();
   const extraArgs = asStringArray(config.extraArgs);
+  const agentCommand = validateAgentCommand(config.agentCommand, "opencode");
+  const usesExternalLauncher = agentCommand !== "opencode";
+  const ponytailPluginPath = validatePonytailPluginPath(config.ponytailPluginPath);
+  const ponytailDefaultMode = validatePonytailDefaultMode(config.ponytailDefaultMode);
   const timeoutSec = asNumber(config.timeoutSec, 0);
   const ttlSeconds = asNumber(config.ttlSecondsAfterFinished, 300);
   const resources = parseObject(config.resources);
@@ -462,7 +992,14 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
   const configuredCwd = asString(config.cwd, "");
-  const workingDir = workspaceCwd || configuredCwd || "/paperclip";
+  // Kubernetes resolves the container workingDir before the non-root process
+  // starts. For a fresh run-scoped emptyDir that would create workspaceRoot as
+  // root and prevent uid 1000 from creating its sibling HOME/session roots.
+  // Start from the existing source checkout; workspaceSetup prepares and enters
+  // the independent clone after the container has started as uid 1000.
+  const workingDir = isolation.mode === "run"
+    ? workspaceCwd || configuredCwd || "/paperclip"
+    : isolation.workspaceRoot || workspaceCwd || configuredCwd || "/paperclip";
 
   // Job naming: slug + 6-char hash for collision resistance; strip trailing hyphens
   const agentSlug = sanitizeForK8sName(agent.id);
@@ -478,6 +1015,15 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
   const runtimeSessionParams = parseObject(runtime.sessionParams);
   const runtimeSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
+  // resumeLastSession defaults to true (preserve existing behaviour); set to false to start fresh.
+  // A run "is resuming" only when there's a tracked session ID AND the agent
+  // hasn't been configured to start fresh. Prompt-rendering paths below must
+  // use this unified flag — using `Boolean(runtimeSessionId)` alone causes a
+  // skew where `--session` is not passed to opencode (line ~540) but the
+  // prompt is still rendered as a resume-delta, so opencode starts a brand-
+  // new session with a wake-only prompt and no bootstrap/heartbeat context.
+  const resumeLastSession = asBoolean(config.resumeLastSession, true);
+  const isResuming = Boolean(runtimeSessionId) && resumeLastSession;
   const templateData = {
     agentId: agent.id,
     companyId: agent.companyId,
@@ -488,10 +1034,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     context,
   };
   const renderedBootstrapPrompt =
-    !runtimeSessionId && bootstrapPromptTemplate.trim().length > 0
+    !isResuming && bootstrapPromptTemplate.trim().length > 0
       ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
       : "";
-  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: Boolean(runtimeSessionId) });
+  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: isResuming });
   // Server's heartbeat composes `context.paperclipTaskMarkdown` for wakes
   // that carry first-class task context (PR-review wakes, issue wakes,
   // wake-comment wakes). renderPaperclipWakePrompt only covers the
@@ -499,7 +1045,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // github_pr_* wake reaches the pod with NO PR number / repo in the
   // prompt and the reviewer agent has nothing to act on.
   const taskMarkdown = asString(context.paperclipTaskMarkdown, "").trim();
-  const shouldUseResumeDeltaPrompt = Boolean(runtimeSessionId) && wakePrompt.length > 0;
+  const shouldUseResumeDeltaPrompt = isResuming && wakePrompt.length > 0;
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
   const instructionsContent = input.instructionsContent?.trim() ?? "";
@@ -526,15 +1072,49 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
 
   // Build opencode CLI args
   const opencodeArgs = ["run", "--format", "json"];
-  // resumeLastSession defaults to true (preserve existing behaviour); set to false to start fresh.
-  const resumeLastSession = asBoolean(config.resumeLastSession, true);
-  if (runtimeSessionId && resumeLastSession) opencodeArgs.push("--session", runtimeSessionId);
+  if (isResuming) opencodeArgs.push("--session", runtimeSessionId);
   if (model) opencodeArgs.push("--model", model);
   if (variant) opencodeArgs.push("--variant", variant);
   if (extraArgs.length > 0) opencodeArgs.push(...extraArgs);
 
-  // Build env vars
-  const envVars = buildEnvVars(ctx, selfPod, config);
+  // Build env vars. Sensitive literal values are returned separately so the
+  // executor can create the Secret before creating the Job.
+  const envSecretName = `${jobName}-env`;
+  const builtEnv = buildEnvVars(ctx, selfPod, config, isolation, envSecretName);
+  const envVars = builtEnv.envVars;
+  const envSecret: EnvSecret | null = Object.keys(builtEnv.sensitiveEnvData).length > 0
+    ? { name: envSecretName, namespace, data: builtEnv.sensitiveEnvData }
+    : null;
+  const envConfig = parseObject(config.env);
+  const hasExplicitEnv = (name: string) => hasExplicitEnvName(
+    name,
+    envConfig,
+    selfPod.inheritedEnv,
+    selfPod.inheritedEnvValueFrom,
+  );
+  if (usesExternalLauncher) {
+    const addEnv = (name: string, value: string) => {
+      if (!hasExplicitEnv(name) && !envVars.some((entry) => entry.name === name)) {
+        envVars.push({ name, value });
+      }
+    };
+    addEnv("PENSTOCK_AGENT_COMMAND", "opencode");
+    if (!hasExplicitEnv("PENSTOCK_PROVIDER")) {
+      addEnv("PENSTOCK_PROVIDER", "openai");
+    } else {
+      const providerEntry = envVars.find((entry) => entry.name === "PENSTOCK_PROVIDER");
+      if (providerEntry && Object.prototype.hasOwnProperty.call(providerEntry, "value")) {
+        providerEntry.value = validatePenstockProvider(providerEntry.value);
+      }
+    }
+  }
+  if (
+    ponytailDefaultMode &&
+    !hasExplicitEnv("PONYTAIL_DEFAULT_MODE") &&
+    !envVars.some((entry) => entry.name === "PONYTAIL_DEFAULT_MODE")
+  ) {
+    envVars.push({ name: "PONYTAIL_DEFAULT_MODE", value: ponytailDefaultMode });
+  }
 
   // OPENCODE_DB: set when a DB volume is present (dedicated PVC, ephemeral
   // emptyDir, or workspace subPath)
@@ -561,38 +1141,37 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // already-opencode-shaped entries pass through unchanged). The merged
   // result is materialized into /tmp/prompt/opencode.json by the
   // write-prompt init container, and OPENCODE_CONFIG points opencode at
-  // it. When the merged set is empty (no baseline + no overrides) we
-  // emit nothing — opencode falls back to ~/.config/opencode/opencode.json
+  // it. MCP-bearing configs are delivered through a Secret-backed volume;
+  // Ponytail-only configs remain safe to inline because they contain no MCP
+  // credentials. When the merged set is empty (no baseline + no overrides)
+  // we emit nothing — opencode falls back to ~/.config/opencode/opencode.json
   // exactly as before.
   const perAgentMcpServers = parseObject(config.mcpServers);
   const baselineMcpServers = loadSharedMcpBaseline();
   const mergedMcpServers = { ...baselineMcpServers, ...perAgentMcpServers };
   const opencodeMcpSection = buildOpencodeMcpSection(mergedMcpServers);
-  const opencodeConfigJson =
-    Object.keys(opencodeMcpSection).length > 0
-      ? JSON.stringify({
-          $schema: "https://opencode.ai/config.json",
-          // permission.external_directory mirrors the chart-baseline at
-          // /paperclip/.config/opencode/opencode.json so we don't lose
-          // the "allow access outside cwd" behavior when overriding via
-          // OPENCODE_CONFIG (opencode does not merge config sources).
-          permission: { external_directory: "allow" },
-          // Disable opencode.ai/zen for the same reason as
-          // buildRuntimeConfigJson: it returns FreeUsageLimitError 429
-          // anonymously and wedges the pod. Opencode falls through to
-          // the bundled `openai` provider in chatgpt-OAuth mode, fed by
-          // the auth.json that buildOpencodeAuthBootstrapShell writes
-          // from ~/.codex/auth.json.
-          disabled_providers: ["opencode"],
-          mcp: opencodeMcpSection,
-        })
-      : null;
+  // OpenCode does not merge OPENCODE_CONFIG with the default XDG config. Build
+  // both from the same function so permissions, provider routing, and Ponytail
+  // stay identical whenever an override file is required.
+  const runtimeConfigJson = buildRuntimeConfigJson(config, agent, { ponytailPluginPath });
+  const hasMcpConfig = Object.keys(opencodeMcpSection).length > 0;
+  const opencodeConfigJson = hasMcpConfig
+    ? buildRuntimeConfigJson(config, agent, {
+        ponytailPluginPath,
+        mcp: opencodeMcpSection,
+        includeSchema: true,
+      })
+    : null;
+  const mcpConfigSecret: McpConfigSecret | null = opencodeConfigJson
+    ? {
+        name: `${jobName}-mcp`,
+        namespace,
+        data: { "opencode.json": opencodeConfigJson },
+      }
+    : null;
   if (opencodeConfigJson) {
     envVars.push({ name: "OPENCODE_CONFIG", value: "/tmp/prompt/opencode.json" });
   }
-
-  // Runtime config for permissions
-  const runtimeConfigJson = buildRuntimeConfigJson(config);
 
   // Resource defaults
   const resourceRequests = parseObject(resources.requests);
@@ -616,7 +1195,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     "paperclip.io/run-id": sanitizeLabelValue(runId, warnLabel),
     "paperclip.io/company-id": sanitizeLabelValue(agent.companyId, warnLabel),
     "paperclip.io/adapter-type": "opencode_k8s",
+    "paperclip.io/isolation-mode": isolation.mode,
   };
+  if (isolation.keyHash) labels["paperclip.io/isolation-key-hash"] = isolation.keyHash;
+  if (isolation.sessionScope) labels["paperclip.io/session-scope"] = sanitizeLabelValue(isolation.sessionScope, warnLabel);
   const taskId = asString(context.taskId ?? context.issueId, "").trim();
   if (taskId) labels["paperclip.io/task-id"] = sanitizeLabelValue(taskId, warnLabel);
   if (runtimeSessionId) labels["paperclip.io/session-id"] = sanitizeLabelValue(runtimeSessionId, warnLabel);
@@ -625,11 +1207,23 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   }
 
   // Volumes
-  const volumes: k8s.V1Volume[] = [{ name: "prompt", emptyDir: {} }];
-  const volumeMounts: k8s.V1VolumeMount[] = [{ name: "prompt", mountPath: "/tmp/prompt" }];
+  const volumes: k8s.V1Volume[] = [
+    { name: "prompt", emptyDir: {} },
+    { name: RUNTIME_CACHE_VOLUME_NAME, emptyDir: { sizeLimit: RUNTIME_CACHE_SIZE_LIMIT } },
+  ];
+  const volumeMounts: k8s.V1VolumeMount[] = [
+    { name: "prompt", mountPath: "/tmp/prompt" },
+    { name: RUNTIME_CACHE_VOLUME_NAME, mountPath: RUNTIME_CACHE_MOUNT_PATH },
+  ];
 
   if (input.promptSecretName) {
     volumes.push({ name: "prompt-secret", secret: { secretName: input.promptSecretName } });
+  }
+  if (mcpConfigSecret) {
+    volumes.push({
+      name: "mcp-config-secret",
+      secret: { secretName: mcpConfigSecret.name, optional: false },
+    });
   }
 
   // Phase E.2: workspace PVC/mount can be overridden by env config.
@@ -669,11 +1263,18 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     });
   }
 
-  // Mount secret volumes inherited from the Deployment pod
+  // Mount only agent-approved Secret volumes. The same filter is applied by
+  // getSelfPodInfo(); repeat it for hand-built SelfPodInfo values.
   for (const sv of selfPod.secretVolumes) {
+    if (!isAgentInheritableSecretVolume(sv.secretName)) continue;
     volumes.push({
       name: sv.volumeName,
-      secret: { secretName: sv.secretName, defaultMode: sv.defaultMode, optional: true },
+      secret: {
+        secretName: sv.secretName,
+        defaultMode: sv.defaultMode,
+        ...(sv.items ? { items: sv.items } : {}),
+        optional: true,
+      },
     });
     volumeMounts.push({
       name: sv.volumeName,
@@ -694,8 +1295,6 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     runAsNonRoot: true,
     runAsUser: 1000,
     runAsGroup: 1000,
-    fsGroup: 1000,
-    fsGroupChangePolicy: "OnRootMismatch",
   };
 
   // Build the main container command
@@ -723,8 +1322,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // it ccrotate prompts and hangs/exits when all accounts are at extra
   // usage. Failure is non-fatal: if ccrotate isn't on PATH or all
   // accounts are exhausted, we still try opencode with whatever
-  // credentials are on disk.
-  const podLogPath = buildPodLogPath(companyId, agentId, runId);
+  // credentials are on disk. Bound the preflight so a stuck Codex probe inside
+  // ccrotate cannot block the Job before opencode starts.
+  const podLogPath = buildIsolatedPodLogPath(isolation, runId) ?? buildPodLogPath(companyId, agentId, runId);
   const opencodeArgsEscaped = opencodeArgs.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(" ");
   // Phase G.5: per-env credential pool. When `providers.openai.accounts`
   // is a non-empty string array (sourced from the resolved k8s execution
@@ -739,11 +1339,30 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       )
     : [];
   const accountsArg = openaiAccounts.length > 0 ? ` --accounts ${openaiAccounts.join(",")}` : "";
-  const ccrotateRefresh = `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target codex${accountsArg} >/dev/null 2>&1) || true`;
-  const authBootstrap = buildOpencodeAuthBootstrapShell();
-  const configSetup = runtimeConfigJson
-    ? `mkdir -p ~/.config/opencode && echo '${runtimeConfigJson.replace(/'/g, "'\\''")}' > ~/.config/opencode/opencode.json && `
-    : "";
+  const ccrotateRefresh = usesExternalLauncher
+    ? ""
+    : `(command -v ccrotate >/dev/null 2>&1 && timeout 30s ccrotate next --yes --target codex${accountsArg} >/dev/null 2>&1) || true`;
+  // The external launcher owns provider authentication. Do not mutate
+  // OpenCode's persistent auth files in this mode: the launcher may use its
+  // own credential store, and deleting it would make the adapter unexpectedly
+  // destructive. Native OpenCode mode keeps the existing cleanup/bootstrap
+  // behavior.
+  const authBootstrap = usesExternalLauncher
+    ? ""
+    : hasEnvVarValue(envVars, "OPENAI_API_KEY")
+      ? buildOpencodeApiKeyAuthCleanupShell()
+      : buildOpencodeAuthBootstrapShell();
+  const configSetup =
+    `mkdir -p "\${XDG_CONFIG_HOME:-$HOME/.config}/opencode" && echo '${runtimeConfigJson.replace(/'/g, "'\\''")}' > "\${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json" && `;
+  // PEN-1305 Layer 1 (plugin arm) — canary-gated per-agent via adapter config.
+  // Installs the tool.execute.before guard plugin into the global opencode
+  // config plugin dir (auto-discovered by opencode's {plugin,plugins}/*.{ts,js}
+  // glob). Catches the shell-wrapper/chain forms the permission.bash deny globs
+  // in buildRuntimeConfigJson cannot. Default OFF until the fleet canary
+  // validates a live run; see env-guard-plugin.ts.
+  const envGuardPluginSetup = asBoolean(config.envGuardPlugin, false)
+    ? `${buildEnvGuardPluginSetupShell()}; `
+    : `${buildEnvGuardPluginCleanupShell()}; `;
   // `set -o pipefail` so an opencode binary crash surfaces as a non-zero
   // shell exit code instead of being masked by tee's exit code. Mirrors
   // the claude_k8s adapter's fix.
@@ -777,14 +1396,98 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const compactArgsEscaped = ["run", "--session", runtimeSessionId, "--format", "json"]
     .map((a) => `'${a.replace(/'/g, "'\\''")}'`)
     .join(" ");
+  const launcherCommand = usesExternalLauncher ? shellQuote(agentCommand) : "opencode";
   const compactPrefix = needsCompactBeforeNextRun
-    ? `echo "[paperclip] running /compact on session ${runtimeSessionId} before main prompt"; echo '/compact' | opencode ${compactArgsEscaped} >/dev/null 2>&1 || echo "[paperclip] /compact returned non-zero; continuing"; `
+    ? `echo "[paperclip] running /compact on session ${runtimeSessionId} before main prompt"; echo '/compact' | ${launcherCommand} ${compactArgsEscaped} >/dev/null 2>&1 || echo "[paperclip] /compact returned non-zero; continuing"; `
     : "";
-  const baseMainCommand = `set -o pipefail; ${ccrotateRefresh}; ${authBootstrap}; ${configSetup}${compactPrefix}mkdir -p $(dirname ${podLogPath}) && : > ${podLogPath} && cat /tmp/prompt/prompt.txt | opencode ${opencodeArgsEscaped} | tee -a ${podLogPath}`;
+  // Shared-docs bridge (BLO-10315). For an external instructions bundle, the
+  // agent's AGENTS.md "## Shared Documentation" section tells it to `Read
+  // docs/<x>.md` — resolved relative to the run's working dir. But those
+  // company doc-templates are materialized one level above the per-agent
+  // bundle (`<instructionsRootPath>/../../docs`, i.e. companies/<co>/docs/),
+  // NOT in the per-run workspace, so every such read 404s and the run exits 1.
+  // AGENT_HOME already points at the bundle root (the external-bundle fix), so
+  // derive the company docs dir from it and symlink it into the working dir as
+  // `docs/`. Guarded: skip when a `docs/` already exists (e.g. the project
+  // repo's own), only link when the source dir is present, and never fail the
+  // run on error.
+  const sharedDocsBridge =
+    asString(config.instructionsBundleMode, "").trim() === "external" &&
+    asString(config.instructionsRootPath, "").trim()
+      ? `( [ -e docs ] || { __pcd="$(dirname "$(dirname "\${AGENT_HOME:-/nonexistent}")")/docs"; [ -d "$__pcd" ] && ln -sfn "$__pcd" docs; } ) 2>/dev/null || true; `
+      : "";
+  const isolatedRuntimePrep = isIsolatedRunMode(isolation.mode)
+    ? `mkdir -p ${[isolation.homeRoot, isolation.sessionRoot, isolation.cacheRoot, isolation.tmpRoot, isolation.workspaceRoot, path.posix.dirname(podLogPath)]
+        .filter((p): p is string => Boolean(p))
+        .map(shellQuote)
+        .join(" ")} || { echo "[paperclip] failed to prepare isolated runtime roots" >&2; exit 1; }; `
+    : "";
+  const workspaceSetup = isolation.mode === "run" && workspaceCwd && workspaceCwd !== isolation.workspaceRoot
+    ? `{ ${[
+        `if git -C ${shellQuote(workspaceCwd)} rev-parse --verify HEAD >/dev/null 2>&1; then`,
+        `${[
+          `source_head=$(git -C ${shellQuote(workspaceCwd)} rev-parse HEAD)`,
+          `rm -rf ${shellQuote(isolation.workspaceRoot!)}`,
+          // Share only immutable Git objects; refs, index, locks, and worktree are run-owned.
+          `git clone --shared --no-checkout -- ${shellQuote(workspaceCwd)} ${shellQuote(isolation.workspaceRoot!)}`,
+          `git -C ${shellQuote(isolation.workspaceRoot!)} checkout --detach "$source_head"`,
+        ].join(" && ")};`,
+        // Issue-scoped review/monitor wakes can start from the generic per-agent
+        // fallback directory, which intentionally is not a repository. Give the
+        // run a private empty cwd; the agent can inspect external state or clone
+        // a target repository without sharing mutable workspace state.
+        `else rm -rf ${shellQuote(isolation.workspaceRoot!)} && mkdir -p ${shellQuote(isolation.workspaceRoot!)};`,
+        `fi && cd ${shellQuote(isolation.workspaceRoot!)}`,
+      ].join(" ")}; } || { echo "[paperclip] failed to prepare isolated workspace" >&2; exit 1; }; `
+    : "";
+  // opencode-db schema-compat guard (root-caused 2026-06-21, BLO follow-up).
+  // The persistent opencode.db is keyed per (company, agent, taskKey) and reused
+  // across runs (workspace_subpath mode). When the vendored opencode binary is
+  // upgraded, an opencode.db created by the OLD version can carry a schema the
+  // NEW insert path violates — observed live: `NOT NULL constraint failed:
+  // session_message.seq` at SessionPrompt.createUserMessage — which bricks
+  // EVERY run with a generic "Unexpected server error / UnknownError" thrown
+  // before any model call (so the model endpoint looks healthy while the agent
+  // crashloops). A DB built fresh by the current binary is self-consistent, so
+  // reset opencode.db (+ -wal/-shm) when the opencode version that built it
+  // differs from the current binary, stamping the version next to the DB.
+  // If the version is unchanged, cap DB growth by resetting when the DB + WAL
+  // + SHM files exceed 500 MiB. Best-effort and idempotent: never fails the
+  // run. Gated on hasAgentDb (only meaningful when /opencode-db is mounted).
+  const dbResetGuard = hasAgentDb
+    ? `__ocdb=/opencode-db/opencode.db; __ocdir="$(dirname "$__ocdb")"; __ocver="$(opencode --version 2>/dev/null | head -n1)"; __ocprev="$(cat "$__ocdir/.opencode-version" 2>/dev/null || true)"; if [ -n "$__ocver" ] && [ -f "$__ocdb" ] && [ "$__ocver" != "$__ocprev" ]; then echo "[paperclip] opencode upgraded ('$__ocprev' -> '$__ocver'); resetting $__ocdb to avoid stale-schema crash" >&2; rm -f "$__ocdb" "$__ocdb-shm" "$__ocdb-wal" 2>/dev/null || true; else __ocbytes=0; for __ocf in "$__ocdb" "$__ocdb-wal" "$__ocdb-shm"; do if [ -f "$__ocf" ]; then __ocsz="$(wc -c < "$__ocf" 2>/dev/null || echo 0)"; __ocsz="\${__ocsz##* }"; __ocbytes=$((__ocbytes + \${__ocsz:-0})); fi; done; if [ -f "$__ocdb" ] && [ "$__ocbytes" -gt 524288000 ]; then echo "[paperclip] opencode DB $__ocbytes bytes exceeds 524288000; resetting $__ocdb to cap growth" >&2; rm -f "$__ocdb" "$__ocdb-shm" "$__ocdb-wal" 2>/dev/null || true; fi; fi; if [ -n "$__ocver" ]; then mkdir -p "$__ocdir" 2>/dev/null || true; printf '%s' "$__ocver" > "$__ocdir/.opencode-version" 2>/dev/null || true; fi; `
+    : "";
+  const credentialSetup = [ccrotateRefresh, authBootstrap]
+    .filter((snippet) => snippet.length > 0)
+    .map((snippet) => `${snippet}; `)
+    .join("");
+  // Adapter-managed OpenCode runtime (see runtime-pin.ts). Must precede every
+  // `opencode` call in the pipeline: the launchers, the db-reset guard's
+  // `opencode --version` stamp, `/compact` and the main run all resolve the
+  // binary through PATH. Empty when opencodeVersion is "image", which keeps
+  // the command byte-identical to the pre-pin pipeline.
+  const opencodeRuntime = opencodeVersion
+    ? `${buildOpencodeRuntimeShell({ version: opencodeVersion, dataMountPath: workspaceMountPath })}; `
+    : "";
+  const baseMainCommand = `set -o pipefail; ${isolatedRuntimePrep}${opencodeRuntime}${workspaceSetup}${credentialSetup}${envGuardPluginSetup}${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${shellQuote(podLogPath)}) && : > ${shellQuote(podLogPath)} && cat /tmp/prompt/prompt.txt | ${launcherCommand} ${opencodeArgsEscaped} | tee -a ${shellQuote(podLogPath)}`;
+  // Redirect Chrome's BrowserMetrics spool off the shared CephFS HOME to the
+  // main container's per-pod runtime-cache emptyDir. The
+  // agent-browser designer tool launches system Chrome with the default
+  // $HOME/.config/google-chrome profile; on headless Chrome's unclean shutdown
+  // its ~4MiB BrowserMetrics-*.pma buffers are never reaped and accumulated to
+  // 42GiB on the shared PVC, walling the agent fleet at workspace setup with
+  // EDQUOT (BLO-10699). Only BrowserMetrics is redirected — the rest of the
+  // profile (claude.ai/design auth + cookies) stays persistent. Best-effort
+  // and idempotent: never fails the run, skipped when already a symlink.
+  const CHROME_METRICS_REDIRECT =
+    `mkdir -p "$HOME/.config/google-chrome" ${RUNTIME_CACHE_MOUNT_PATH}/chrome-browser-metrics 2>/dev/null; ` +
+    `{ [ -L "$HOME/.config/google-chrome/BrowserMetrics" ] || { rm -rf "$HOME/.config/google-chrome/BrowserMetrics"; ln -sfn ${RUNTIME_CACHE_MOUNT_PATH}/chrome-browser-metrics "$HOME/.config/google-chrome/BrowserMetrics"; }; } 2>/dev/null || true`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket.
-  const mainCommand = enableDocker ? `${DIND_WAIT_PREAMBLE}; ${baseMainCommand}` : baseMainCommand;
+  const mainCommand = enableDocker
+    ? `${CHROME_METRICS_REDIRECT}; ${DIND_WAIT_PREAMBLE}; ${baseMainCommand}`
+    : `${CHROME_METRICS_REDIRECT}; ${baseMainCommand}`;
 
   // Wire the DinD sidecar's shared volumes + DOCKER_HOST env into the main
   // container. Done after volumes/volumeMounts/envVars are otherwise built
@@ -829,18 +1532,18 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
             (() => {
               // Build the init container command + env. Always writes prompt.txt;
               // when an MCP fleet was assembled (baseline or per-agent override),
-              // also writes the merged opencode.json next to it. opencode.json is
-              // small (a few kB) so it travels via env var even when prompt itself
-              // goes the Secret-volume route.
+              // copies the merged opencode.json from its Secret-backed volume.
+              // Ponytail-only configuration stays in the safe XDG config that
+              // the main container writes; OPENCODE_CONFIG is only needed when
+              // MCP entries replace that config source.
               const cmdParts = input.promptSecretName
-                ? ["base64 -d /tmp/prompt-secret/prompt.gz.b64 | gzip -d > /tmp/prompt/prompt.txt"]
+                ? ["gzip -dc /tmp/prompt-secret/prompt.gz > /tmp/prompt/prompt.txt"]
                 : [`printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt`];
               const initEnv: k8s.V1EnvVar[] = input.promptSecretName
                 ? []
                 : [{ name: "PROMPT_CONTENT", value: prompt }];
-              if (opencodeConfigJson) {
-                cmdParts.push(`printf '%s' \"$OPENCODE_CONFIG_JSON\" > /tmp/prompt/opencode.json`);
-                initEnv.push({ name: "OPENCODE_CONFIG_JSON", value: opencodeConfigJson });
+              if (mcpConfigSecret) {
+                cmdParts.push("cp /tmp/mcp-secret/opencode.json /tmp/prompt/opencode.json");
               }
               const initVolumeMounts: k8s.V1VolumeMount[] = [
                 { name: "prompt", mountPath: "/tmp/prompt" },
@@ -848,11 +1551,14 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
               if (input.promptSecretName) {
                 initVolumeMounts.push({ name: "prompt-secret", mountPath: "/tmp/prompt-secret", readOnly: true });
               }
+              if (mcpConfigSecret) {
+                initVolumeMounts.push({ name: "mcp-config-secret", mountPath: "/tmp/mcp-secret", readOnly: true });
+              }
               const initContainer: k8s.V1Container = {
                 name: "write-prompt",
                 image: "busybox:1.36",
                 imagePullPolicy: "IfNotPresent",
-                command: ["sh", "-c", cmdParts.join("; ")],
+                command: ["sh", "-c", cmdParts.join(" && ")],
                 ...(initEnv.length > 0 ? { env: initEnv } : {}),
                 volumeMounts: initVolumeMounts,
                 securityContext,
@@ -875,7 +1581,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
               workingDir,
               command: ["sh", "-c", mainCommand],
               env: envVars,
-              ...(selfPod.inheritedEnvFrom.length > 0 ? { envFrom: selfPod.inheritedEnvFrom } : {}),
+              ...(selfPod.inheritedEnvFrom.filter((source) => {
+                const refName = source.secretRef?.name ?? source.configMapRef?.name;
+                return typeof refName === "string" && isAgentInheritableEnvFromRef(refName);
+              }).length > 0
+                ? {
+                    envFrom: selfPod.inheritedEnvFrom.filter((source) => {
+                      const refName = source.secretRef?.name ?? source.configMapRef?.name;
+                      return typeof refName === "string" && isAgentInheritableEnvFromRef(refName);
+                    }),
+                  }
+                : {}),
               volumeMounts,
               securityContext,
               resources: containerResources,
@@ -887,5 +1603,45 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     },
   };
 
-  return { job, jobName, namespace, prompt, opencodeArgs, promptMetrics, podLogPath };
+  const podSpec = job.spec?.template.spec;
+  if (!podSpec) throw new Error("opencode_k8s: generated Job is missing a pod spec");
+  const literalSensitiveNames = findLiteralSensitiveEnvVarsInPodSpec(podSpec);
+  if (literalSensitiveNames.length > 0) {
+    throw new Error(
+      `opencode_k8s: refusing to build Job manifest - sensitive-named env var(s) would be injected as a literal value instead of secretKeyRef: ${literalSensitiveNames.join(", ")}`,
+    );
+  }
+  const serverOnlyNames = findServerOnlyEnvVarsInPodSpec(podSpec);
+  if (serverOnlyNames.length > 0) {
+    throw new Error(
+      `opencode_k8s: refusing to build Job manifest - server-only credential env var(s) would be propagated to the agent pod: ${serverOnlyNames.join(", ")}`,
+    );
+  }
+
+  return {
+    job,
+    jobName,
+    namespace,
+    prompt,
+    opencodeArgs,
+    promptMetrics,
+    podLogPath,
+    opencodeVersion,
+    envSecret,
+    mcpConfigSecret,
+  };
+}
+
+/** Return server-only env names present in any generated pod container. */
+export function findServerOnlyEnvVarsInPodSpec(podSpec: k8s.V1PodSpec): string[] {
+  const containers: k8s.V1Container[] = [
+    ...(podSpec.initContainers ?? []),
+    ...(podSpec.containers ?? []),
+    ...((podSpec.ephemeralContainers ?? []) as unknown as k8s.V1Container[]),
+  ];
+  return containers.flatMap((container) =>
+    (container.env ?? [])
+      .filter((entry) => entry.name && SERVER_ONLY_ENV_DENY.has(entry.name))
+      .map((entry) => `${container.name || "<unnamed>"}/${entry.name}`),
+  );
 }

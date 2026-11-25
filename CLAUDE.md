@@ -49,6 +49,10 @@ This is a Paperclip adapter plugin that runs OpenCode agents as isolated Kuberne
 9. **JSONL parsing** (`parseOpenCodeJsonl`) — extracts session ID, usage tokens, cost, summary, and errors from OpenCode JSONL output
 10. **Result synthesis** — returns exit code, usage metrics, session params for resume, and billing type inference
 
+### Adapter-managed OpenCode runtime (`src/server/runtime-pin.ts`)
+
+The Job image bundles whatever `opencode-ai` its cached Dockerfile layer froze (1.18.11 on 2026-10-06), root-owned, so Job pods (uid 1000) cannot upgrade it and model/provider support stays version-bound to that layer. The adapter pins the binary (`opencodeVersion`, default `DEFAULT_OPENCODE_VERSION`) and the main command installs it once into `<data PVC>/.local/lib/paperclip-k8s-runtimes/opencode/<version>` (mkdir lock, staged install, rename after `--version` succeeds, `.complete` marker) and prepends it to PATH before the launchers, the db-reset guard, `/compact` and the main run resolve `opencode`. If the install cannot complete the run falls back to the bundled binary and says so on stderr. Bumping the pin changes `opencode --version`, which the db-reset guard treats as an upgrade (one-time opencode.db reset per agent). Set `"image"` to opt out. Mirrors `claudeCodeVersion` in paperclip-adapter-claude-k8s.
+
 ### Skill Materialization (`src/server/skills.ts` + `src/server/execute.ts`)
 
 Skills operate in **ephemeral** mode: no symlinks are written to PVC. Instead, `execute()` reads the markdown content of each desired skill at run time using `readPaperclipRuntimeSkillEntries` + `entry.source`, concatenates them (separated by `---`), and passes the bundle to `buildJobManifest` as `skillsBundleContent`. The content is prepended to the prompt so OpenCode receives it as system context.

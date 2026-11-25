@@ -1,5 +1,26 @@
-import { describe, it, expect } from "vitest";
-import { buildJobManifest, sanitizeLabelValue, type JobBuildInput } from "./job-manifest.js";
+import { describe, it, expect, vi } from "vitest";
+import {
+  buildJobManifest,
+  findServerOnlyEnvVarsInPodSpec,
+  sanitizeLabelValue,
+  type JobBuildInput,
+  validatePonytailPluginPath,
+} from "./job-manifest.js";
+import { DEFAULT_OPENCODE_VERSION } from "./runtime-pin.js";
+import { ENV_GUARD_PLUGIN_SCRIPT } from "./env-guard-plugin.js";
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    readFileSync: vi.fn((file: Parameters<typeof actual.readFileSync>[0], ...args: unknown[]) => {
+      if (file === "/paperclip/.mcp.json") {
+        throw new Error("test baseline absent");
+      }
+      return actual.readFileSync(file, ...(args as [Parameters<typeof actual.readFileSync>[1]]));
+    }),
+  };
+});
 
 const mockSelfPod: JobBuildInput["selfPod"] = {
   namespace: "paperclip",
@@ -31,6 +52,28 @@ const mockCtx: JobBuildInput["ctx"] = {
   },
   onLog: async () => {},
 };
+
+function withRuntimeIsolation(
+  ctx: JobBuildInput["ctx"],
+  isolation: Record<string, unknown>,
+): JobBuildInput["ctx"] {
+  return {
+    ...ctx,
+    runtime: {
+      ...ctx.runtime,
+      isolation,
+    } as unknown as JobBuildInput["ctx"]["runtime"],
+  };
+}
+
+function runtimeStorage(kind: "ephemeral" | "persistent") {
+  return {
+    workspace: kind,
+    home: kind,
+    session: kind,
+    cache: "ephemeral",
+  };
+}
 
 describe("buildJobManifest — context-overflow auto-remediation (/compact prefix)", () => {
   // Pairs with parse.ts isOpenCodeContextOverflowResult + execute.ts which
@@ -99,6 +142,13 @@ describe("buildJobManifest — context-overflow auto-remediation (/compact prefi
 });
 
 describe("buildJobManifest", () => {
+  it("accepts the packaged Ponytail OpenCode module and rejects a directory path", () => {
+    expect(validatePonytailPluginPath("/opt/penstock/ponytail/.opencode/plugins/ponytail.mjs"))
+      .toBe("/opt/penstock/ponytail/.opencode/plugins/ponytail.mjs");
+    expect(() => validatePonytailPluginPath("/opt/penstock/ponytail"))
+      .toThrow("absolute .mjs file path");
+  });
+
   it("creates job with agent-opencode- prefix in name", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
 
@@ -123,21 +173,15 @@ describe("buildJobManifest", () => {
     expect(container?.image).toBe("my-custom-image:v1.2.3");
   });
 
-  it("sets fsGroupChangePolicy to OnRootMismatch", () => {
-    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
-
-    const securityContext = result.job.spec?.template?.spec?.securityContext;
-    expect(securityContext?.fsGroupChangePolicy).toBe("OnRootMismatch");
-  });
-
-  it("sets runAsNonRoot and runAsUser 1000", () => {
+  it("sets the non-root uid and primary gid without requesting volume ownership changes", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
 
     const securityContext = result.job.spec?.template?.spec?.securityContext;
     expect(securityContext?.runAsNonRoot).toBe(true);
     expect(securityContext?.runAsUser).toBe(1000);
     expect(securityContext?.runAsGroup).toBe(1000);
-    expect(securityContext?.fsGroup).toBe(1000);
+    expect(securityContext?.fsGroup).toBeUndefined();
+    expect(securityContext?.fsGroupChangePolicy).toBeUndefined();
   });
 
   it("maps labels to job metadata", () => {
@@ -208,12 +252,373 @@ describe("buildJobManifest", () => {
     expect(homeEnv?.value).toBe("/paperclip");
   });
 
+  it("uses server-supplied isolated roots for HOME, caches, workdir, labels, and pod logs", () => {
+    const ctx = {
+      ...mockCtx,
+      context: {
+        ...mockCtx.context,
+        taskId: "task-123",
+        k8sRunIsolation: {
+          isolationMode: "isolated",
+          isolationKey: "co123:agent-abc:task-123",
+          workspaceRoot: "/paperclip/isolated/task-123/workspace",
+          homeRoot: "/paperclip/isolated/task-123/home",
+          cacheRoot: "/paperclip/isolated/task-123/cache",
+          sessionScope: "co123:agent-abc:task-123",
+        },
+      },
+    };
+
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const labels = result.job.metadata?.labels ?? {};
+    const container = result.job.spec?.template?.spec?.containers?.[0];
+    const env = container?.env ?? [];
+    const envValue = (name: string) => env.find((e) => e.name === name)?.value;
+
+    expect(labels["paperclip.io/isolation-mode"]).toBe("isolated");
+    expect(labels["paperclip.io/isolation-key-hash"]).toMatch(/^[0-9a-f]{16}$/);
+    expect(container?.workingDir).toBe("/paperclip/isolated/task-123/workspace");
+    expect(envValue("HOME")).toBe("/paperclip/isolated/task-123/home");
+    expect(envValue("XDG_CACHE_HOME")).toBe("/paperclip/isolated/task-123/cache/xdg");
+    expect(envValue("TMPDIR")).toBe("/paperclip/isolated/task-123/cache/tmp");
+    expect(envValue("TMP")).toBe("/paperclip/isolated/task-123/cache/tmp");
+    expect(envValue("TEMP")).toBe("/paperclip/isolated/task-123/cache/tmp");
+    const isolationKeyEnv = env.find((e) => e.name === "PAPERCLIP_K8S_ISOLATION_KEY");
+    expect(isolationKeyEnv?.value).toBeUndefined();
+    expect(isolationKeyEnv?.valueFrom?.secretKeyRef?.name).toBe(result.envSecret?.name);
+    expect(isolationKeyEnv?.valueFrom?.secretKeyRef?.key).toBe("PAPERCLIP_K8S_ISOLATION_KEY");
+    expect(result.envSecret?.data.PAPERCLIP_K8S_ISOLATION_KEY).toBe("co123:agent-abc:task-123");
+    expect(result.podLogPath).toBe("/paperclip/isolated/task-123/cache/run-logs/run123456.pod.ndjson");
+  });
+
+  it("prefers run-scoped runtime isolation and clones an independent workspace", () => {
+    const ctx = withRuntimeIsolation({
+      ...mockCtx,
+      config: {
+        isolation: {
+          isolationMode: "isolated",
+          isolationKey: "legacy-config",
+          workspaceRoot: "/paperclip/legacy-workspace",
+        },
+      },
+      context: {
+        ...mockCtx.context,
+        paperclipWorkspace: { cwd: "/paperclip/source-worktree" },
+      },
+    }, {
+      isolationMode: "run",
+      isolationKey: "run:run123456",
+      workspaceRoot: "/runtime-cache/paperclip-runs/run123456/workspace",
+      homeRoot: "/runtime-cache/paperclip-runs/run123456/home",
+      sessionRoot: "/runtime-cache/paperclip-runs/run123456/session",
+      cacheRoot: "/runtime-cache/paperclip-runs/run123456/cache",
+      tmpRoot: "/runtime-cache/paperclip-runs/run123456/tmp",
+      storage: runtimeStorage("ephemeral"),
+      sessionScope: { taskKey: "pr-review-42", isolationKey: "run:run123456" },
+    });
+
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod, agentDbClaimName: null });
+    const container = result.job.spec?.template?.spec?.containers?.[0];
+    const env = container?.env ?? [];
+    const value = (name: string) => env.find((entry) => entry.name === name)?.value;
+    const command = container?.command?.[2] ?? "";
+    expect(result.job.metadata?.labels?.["paperclip.io/isolation-mode"]).toBe("run");
+    // The source checkout must be the Kubernetes-level cwd. If workspaceRoot
+    // is used here, the runtime creates it as root before uid 1000 starts and
+    // the process cannot create sibling HOME/session/cache roots.
+    expect(container?.workingDir).toBe("/paperclip/source-worktree");
+    expect(value("HOME")).toBe("/runtime-cache/paperclip-runs/run123456/home");
+    expect(value("XDG_CONFIG_HOME")).toBe("/runtime-cache/paperclip-runs/run123456/session/xdg/config");
+    expect(value("XDG_CACHE_HOME")).toBe("/runtime-cache/paperclip-runs/run123456/cache/xdg");
+    expect(value("TMPDIR")).toBe("/runtime-cache/paperclip-runs/run123456/tmp");
+    expect(value("TMP")).toBe("/runtime-cache/paperclip-runs/run123456/tmp");
+    expect(value("TEMP")).toBe("/runtime-cache/paperclip-runs/run123456/tmp");
+    expect(value("PAPERCLIP_WORKSPACE_CWD")).toBe("/runtime-cache/paperclip-runs/run123456/workspace");
+    expect(command).toContain("git clone --shared --no-checkout -- '/paperclip/source-worktree' '/runtime-cache/paperclip-runs/run123456/workspace'");
+    expect(command).toContain("mkdir -p '/runtime-cache/paperclip-runs/run123456/home'");
+    expect(command).toContain("'/runtime-cache/paperclip-runs/run123456/tmp'");
+    expect(command).toContain("failed to prepare isolated runtime roots");
+    expect(command).toContain("failed to prepare isolated workspace");
+    expect(command).not.toContain("paperclip-runs/run123456/workspace' 2>/dev/null || true");
+    expect(command).not.toContain("/paperclip/legacy-workspace");
+    expect(result.podLogPath).toBe("/paperclip/instances/default/data/run-logs/co123/agent-abc/run123456.pod.ndjson");
+    expect(result.job.spec?.template?.spec?.volumes?.find((volume) => volume.name === "opencode-db")?.emptyDir).toEqual({});
+  });
+
+  it("creates a private empty run workspace when the fallback cwd is not a git checkout", () => {
+    const ctx = withRuntimeIsolation({
+      ...mockCtx,
+      context: {
+        ...mockCtx.context,
+        paperclipWorkspace: { cwd: "/paperclip/agent-fallback" },
+      },
+    }, {
+      isolationMode: "run",
+      isolationKey: "run:run123456",
+      workspaceRoot: "/runtime-cache/paperclip-runs/run123456/workspace",
+      homeRoot: "/runtime-cache/paperclip-runs/run123456/home",
+      sessionRoot: "/runtime-cache/paperclip-runs/run123456/session",
+      cacheRoot: "/runtime-cache/paperclip-runs/run123456/cache",
+      tmpRoot: "/runtime-cache/paperclip-runs/run123456/tmp",
+      storage: runtimeStorage("ephemeral"),
+      sessionScope: { taskKey: "issue-monitor", isolationKey: "run:run123456" },
+    });
+
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod, agentDbClaimName: null });
+    const container = result.job.spec?.template?.spec?.containers?.[0];
+    const command = container?.command?.[2] ?? "";
+
+    expect(container?.workingDir).toBe("/paperclip/agent-fallback");
+    expect(command).toContain("if git -C '/paperclip/agent-fallback' rev-parse --verify HEAD >/dev/null 2>&1; then");
+    expect(command).toContain("git clone --shared --no-checkout -- '/paperclip/agent-fallback' '/runtime-cache/paperclip-runs/run123456/workspace'");
+    expect(command).toContain("else rm -rf '/runtime-cache/paperclip-runs/run123456/workspace' && mkdir -p '/runtime-cache/paperclip-runs/run123456/workspace';");
+    expect(command).toContain("fi && cd '/runtime-cache/paperclip-runs/run123456/workspace'");
+    expect(command).toContain("failed to prepare isolated workspace");
+  });
+
+  it("gives two concurrent stateless runs distinct, non-colliding TMPDIR/TMP/TEMP values", () => {
+    const buildForRun = (runId: string) => {
+      const runCtx = withRuntimeIsolation({ ...mockCtx, runId }, {
+        isolationMode: "run",
+        isolationKey: `run:${runId}`,
+        workspaceRoot: `/runtime-cache/paperclip-runs/${runId}/workspace`,
+        homeRoot: `/runtime-cache/paperclip-runs/${runId}/home`,
+        sessionRoot: `/runtime-cache/paperclip-runs/${runId}/session`,
+        cacheRoot: `/runtime-cache/paperclip-runs/${runId}/cache`,
+        tmpRoot: `/runtime-cache/paperclip-runs/${runId}/tmp`,
+        storage: runtimeStorage("ephemeral"),
+        sessionScope: { taskKey: "pr-review-42", isolationKey: `run:${runId}` },
+      });
+      const result = buildJobManifest({ ctx: runCtx, selfPod: mockSelfPod, agentDbClaimName: null });
+      const env = result.job.spec?.template?.spec?.containers?.[0]?.env ?? [];
+      const value = (name: string) => env.find((entry) => entry.name === name)?.value;
+      return { TMPDIR: value("TMPDIR"), TMP: value("TMP"), TEMP: value("TEMP") };
+    };
+
+    const first = buildForRun("run-11111111");
+    const second = buildForRun("run-22222222");
+
+    expect(first.TMPDIR).toBe("/runtime-cache/paperclip-runs/run-11111111/tmp");
+    expect(second.TMPDIR).toBe("/runtime-cache/paperclip-runs/run-22222222/tmp");
+    expect(first.TMPDIR).not.toBe(second.TMPDIR);
+    expect(first.TMP).toBe(first.TMPDIR);
+    expect(first.TEMP).toBe(first.TMPDIR);
+    expect(second.TMP).toBe(second.TMPDIR);
+    expect(second.TEMP).toBe(second.TMPDIR);
+  });
+
+  it("keeps durable workspace XDG session state persistent and writable caches ephemeral", () => {
+    const ctx = withRuntimeIsolation({
+      ...mockCtx,
+      context: {
+        ...mockCtx.context,
+        paperclipWorkspace: { cwd: "/paperclip/workspaces/workspace-1" },
+      },
+    }, {
+      isolationMode: "workspace",
+      isolationKey: "workspace:workspace-1",
+      workspaceRoot: "/paperclip/workspaces/workspace-1",
+      homeRoot: "/paperclip/k8s-isolation/workspace-1/home",
+      sessionRoot: "/paperclip/k8s-isolation/workspace-1/session",
+      cacheRoot: "/runtime-cache/paperclip-workspaces/workspace-1/cache",
+      tmpRoot: "/runtime-cache/paperclip-workspaces/workspace-1/tmp",
+      storage: runtimeStorage("persistent"),
+      sessionScope: { taskKey: "issue-1", isolationKey: "workspace:workspace-1" },
+    });
+
+    const result = buildJobManifest({
+      ctx,
+      selfPod: { ...mockSelfPod, pvcClaimName: "paperclip-data" },
+      agentDbWorkspaceSubPath: ".opencode-db/co123/agent-abc/isolation/abc123",
+    });
+    const container = result.job.spec?.template?.spec?.containers?.[0];
+    const env = container?.env ?? [];
+    const value = (name: string) => env.find((entry) => entry.name === name)?.value;
+    expect(container?.workingDir).toBe("/paperclip/workspaces/workspace-1");
+    expect(value("XDG_CONFIG_HOME")).toBe("/paperclip/k8s-isolation/workspace-1/session/xdg/config");
+    expect(value("XDG_DATA_HOME")).toBe("/paperclip/k8s-isolation/workspace-1/session/xdg/data");
+    expect(value("XDG_STATE_HOME")).toBe("/paperclip/k8s-isolation/workspace-1/session/xdg/state");
+    expect(value("XDG_CACHE_HOME")).toBe("/runtime-cache/paperclip-workspaces/workspace-1/cache/xdg");
+    expect(value("TMPDIR")).toBe("/runtime-cache/paperclip-workspaces/workspace-1/tmp");
+    expect(value("TMP")).toBe("/runtime-cache/paperclip-workspaces/workspace-1/tmp");
+    expect(value("TEMP")).toBe("/runtime-cache/paperclip-workspaces/workspace-1/tmp");
+    expect(container?.command?.[2]).not.toContain("git clone --shared");
+    expect(container?.volumeMounts?.find((mount) => mount.mountPath === "/opencode-db")).toMatchObject({
+      name: "data",
+      subPath: ".opencode-db/co123/agent-abc/isolation/abc123",
+    });
+  });
+
+  it("lets runtime shared mode override legacy isolation metadata", () => {
+    const ctx = withRuntimeIsolation({
+      ...mockCtx,
+      context: {
+        ...mockCtx.context,
+        paperclipWorkspace: { cwd: "/paperclip/shared-workspace" },
+        k8sRunIsolation: {
+          isolationMode: "isolated",
+          isolationKey: "legacy-key",
+          workspaceRoot: "/paperclip/legacy-workspace",
+        },
+      },
+    }, { isolationMode: "shared" });
+
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    expect(result.job.metadata?.labels?.["paperclip.io/isolation-mode"]).toBe("shared");
+    expect(result.job.metadata?.labels?.["paperclip.io/isolation-key-hash"]).toBeUndefined();
+    expect(result.job.spec?.template?.spec?.containers?.[0]?.workingDir).toBe("/paperclip/shared-workspace");
+  });
+
+  it("falls back to shared mode when isolation metadata is incomplete", () => {
+    const ctx = {
+      ...mockCtx,
+      context: {
+        ...mockCtx.context,
+        k8sRunIsolation: { isolationMode: "isolated" },
+      },
+    };
+
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const labels = result.job.metadata?.labels ?? {};
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+
+    expect(labels["paperclip.io/isolation-mode"]).toBe("shared");
+    expect(labels["paperclip.io/isolation-key-hash"]).toBeUndefined();
+    expect(env.find((e) => e.name === "HOME")?.value).toBe("/paperclip");
+    expect(env.find((e) => e.name === "TMPDIR")?.value).toBe("/runtime-cache/tmp");
+  });
+
   it("sets OPENCODE_DISABLE_PROJECT_CONFIG=true", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
 
     const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
     const opencodeEnv = env.find((e) => e.name === "OPENCODE_DISABLE_PROJECT_CONFIG");
     expect(opencodeEnv?.value).toBe("true");
+  });
+
+  // The base paperclip image bakes NODE_ENV=production. In an agent workspace
+  // that breaks `npm install`/`npm ci` (devDependencies omitted), so source
+  // builds that need dev tooling fail to bootstrap (e.g. shaka's
+  // closure-make-deps). Agent jobs do dev/build work, so default them to a
+  // non-production NODE_ENV. See BLO-8661.
+  it("defaults NODE_ENV to development so agent npm installs include devDependencies", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    const nodeEnv = env.find((e) => e.name === "NODE_ENV");
+    expect(nodeEnv?.value).toBe("development");
+  });
+
+  it("lets config.env override the default NODE_ENV", () => {
+    const ctx = { ...mockCtx, config: { env: { NODE_ENV: "production" } } };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    const nodeEnv = env.find((e) => e.name === "NODE_ENV");
+    expect(nodeEnv?.value).toBe("production");
+  });
+
+  it("respects NODE_ENV inherited from the Deployment env", () => {
+    const selfPod = { ...mockSelfPod, inheritedEnv: { NODE_ENV: "staging" } };
+    const result = buildJobManifest({ ctx: mockCtx, selfPod });
+
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    const nodeEnv = env.find((e) => e.name === "NODE_ENV");
+    expect(nodeEnv?.value).toBe("staging");
+  });
+
+  it("keeps agent cache dirs under the job-local runtime-cache emptyDir (PEN-389)", () => {
+    // The server pod also points its cache env at /runtime-cache. Agent Jobs now
+    // mount their own emptyDir there instead of rebasing caches onto the PVC.
+    const selfPod = {
+      ...mockSelfPod,
+      inheritedEnv: {
+        BUN_INSTALL_CACHE: "/runtime-cache/bun",
+        XDG_CACHE_HOME: "/runtime-cache/xdg",
+        GOCACHE: "/runtime-cache/go-build",
+        GOMODCACHE: "/runtime-cache/gomod",
+        npm_config_cache: "/runtime-cache/npm",
+        PIP_CACHE_DIR: "/runtime-cache/pip",
+        PLAYWRIGHT_BROWSERS_PATH: "/runtime-cache/ms-playwright",
+        TMPDIR: "/runtime-cache/tmp",
+      },
+    };
+    const result = buildJobManifest({ ctx: mockCtx, selfPod });
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    const val = (name: string) => env.find((e) => e.name === name)?.value;
+
+    expect(val("BUN_INSTALL_CACHE")).toBe("/runtime-cache/bun");
+    expect(val("XDG_CACHE_HOME")).toBe("/runtime-cache/xdg");
+    expect(val("GOCACHE")).toBe("/runtime-cache/go-build");
+    expect(val("TMPDIR")).toBe("/runtime-cache/tmp");
+    expect(val("PLAYWRIGHT_BROWSERS_PATH")).toBe("/runtime-cache/ms-playwright");
+    // Not in inheritedEnv above, so this only passes if the Job sets it itself.
+    expect(val("CARGO_TARGET_DIR")).toBe("/runtime-cache/cargo-target");
+    // The toolchain homes are deliberately left alone (see AGENT_CACHE_ENV_LEAVES).
+    expect(val("CARGO_HOME")).toBeUndefined();
+    expect(val("RUSTUP_HOME")).toBeUndefined();
+  });
+
+  it("reserves opencode XDG config/data/state onto runtime-cache so it can't crash at boot (BLO-14003)", () => {
+    // opencode mkdir's its XDG config/data/state dirs at startup; if they land
+    // on an unwritable path it dies with EACCES before any model call. Reserve
+    // them onto the writable runtime-cache emptyDir, matching the values that
+    // were applied as a per-agent env workaround and verified booting clean.
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    const val = (name: string) => env.find((e) => e.name === name)?.value;
+
+    expect(val("XDG_CONFIG_HOME")).toBe("/runtime-cache/xdg/config");
+    expect(val("XDG_DATA_HOME")).toBe("/runtime-cache/xdg/data");
+    expect(val("XDG_STATE_HOME")).toBe("/runtime-cache/xdg/state");
+    // still under the same writable mount as the cache leaf
+    expect(val("XDG_CACHE_HOME")).toBe("/runtime-cache/xdg");
+  });
+
+  it("forces opencode XDG dirs onto runtime-cache even when adapterConfig.env sets stale unwritable paths (BLO-14003)", () => {
+    const ctx = {
+      ...mockCtx,
+      config: {
+        env: {
+          XDG_CONFIG_HOME: "/runtime-config",
+          XDG_DATA_HOME: "/runtime-data",
+          XDG_STATE_HOME: "/runtime-state",
+        },
+      },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    const val = (name: string) => env.find((e) => e.name === name)?.value;
+
+    expect(val("XDG_CONFIG_HOME")).toBe("/runtime-cache/xdg/config");
+    expect(val("XDG_DATA_HOME")).toBe("/runtime-cache/xdg/data");
+    expect(val("XDG_STATE_HOME")).toBe("/runtime-cache/xdg/state");
+  });
+
+  it("keeps reserved cache envs on runtime-cache even when adapterConfig.env has stale PVC overrides", () => {
+    const ctx = {
+      ...mockCtx,
+      config: {
+        env: {
+          BUN_INSTALL_CACHE: "/paperclip/.runtime-cache/bun",
+          XDG_CACHE_HOME: "/paperclip/.runtime-cache/xdg",
+          GOCACHE: "/paperclip/.runtime-cache/go-build",
+          TMPDIR: "/paperclip/.runtime-cache/tmp",
+        },
+      },
+    };
+    const selfPod = {
+      ...mockSelfPod,
+      inheritedEnv: { BUN_INSTALL_CACHE: "/runtime-cache/bun" },
+    };
+    const result = buildJobManifest({ ctx, selfPod });
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    const val = (name: string) => env.find((e) => e.name === name)?.value;
+
+    expect(val("BUN_INSTALL_CACHE")).toBe("/runtime-cache/bun");
+    expect(val("XDG_CACHE_HOME")).toBe("/runtime-cache/xdg");
+    expect(val("GOCACHE")).toBe("/runtime-cache/go-build");
+    expect(val("TMPDIR")).toBe("/runtime-cache/tmp");
   });
 
   it("applies default ttlSecondsAfterFinished of 300", () => {
@@ -296,19 +701,49 @@ describe("buildJobManifest", () => {
     expect(result.job.spec?.template?.spec?.nodeSelector).toEqual({ "kubernetes.io/arch": "amd64" });
   });
 
-  it("forwards inheritedEnvValueFrom entries onto the opencode container env", () => {
+  it("forwards the allowlisted Penstock Secret reference onto the opencode container env", () => {
     const selfPod = {
       ...mockSelfPod,
       inheritedEnvValueFrom: [
-        { name: "MY_SECRET", valueFrom: { secretKeyRef: { name: "my-secret", key: "token" } } },
+        {
+          name: "PENSTOCK_API_KEY",
+          valueFrom: {
+            secretKeyRef: { name: "paperclip-penstock-org-key", key: "token" },
+          },
+        },
       ],
     };
     const result = buildJobManifest({ ctx: mockCtx, selfPod });
 
     const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
-    const secretEnv = env.find((e) => e.name === "MY_SECRET");
-    expect(secretEnv?.valueFrom?.secretKeyRef?.name).toBe("my-secret");
+    const secretEnv = env.find((e) => e.name === "PENSTOCK_API_KEY");
+    expect(secretEnv?.valueFrom?.secretKeyRef?.name).toBe("paperclip-penstock-org-key");
     expect(secretEnv?.valueFrom?.secretKeyRef?.key).toBe("token");
+  });
+
+  it("drops server-only and unknown valueFrom entries", () => {
+    const selfPod = {
+      ...mockSelfPod,
+      inheritedEnv: {
+        DATABASE_URL: "postgres://must-not-propagate",
+        UNKNOWN_SERVER_SETTING: "must-not-propagate",
+      },
+      inheritedEnvValueFrom: [
+        {
+          name: "DATABASE_URL",
+          valueFrom: { secretKeyRef: { name: "paperclip", key: "databaseUrl" } },
+        },
+        {
+          name: "PAPERCLIP_AGENT_JWT_SECRET",
+          valueFrom: { secretKeyRef: { name: "paperclip", key: "agentJwtSecret" } },
+        },
+      ],
+    };
+    const result = buildJobManifest({ ctx: mockCtx, selfPod });
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    expect(env.map((entry) => entry.name)).not.toEqual(
+      expect.arrayContaining(["DATABASE_URL", "UNKNOWN_SERVER_SETTING", "PAPERCLIP_AGENT_JWT_SECRET"]),
+    );
   });
 
   it("does not duplicate an inheritedEnvValueFrom entry if the name is already set as a literal", () => {
@@ -327,7 +762,7 @@ describe("buildJobManifest", () => {
     expect(homeEntries.every((e) => e.value !== undefined)).toBe(true);
   });
 
-  it("forwards inheritedEnvFrom onto the opencode container envFrom", () => {
+  it("drops inheritedEnvFrom because whole-object env injection is not allowlisted", () => {
     const selfPod = {
       ...mockSelfPod,
       inheritedEnvFrom: [{ secretRef: { name: "my-config-secret" } }],
@@ -335,7 +770,7 @@ describe("buildJobManifest", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod });
 
     const container = result.job.spec?.template?.spec?.containers?.[0];
-    expect(container?.envFrom).toEqual([{ secretRef: { name: "my-config-secret" } }]);
+    expect(container?.envFrom).toBeUndefined();
   });
 
   it("omits envFrom when inheritedEnvFrom is empty", () => {
@@ -522,6 +957,51 @@ describe("init container is unchanged by agentDbClaimName", () => {
   });
 });
 
+describe("opencode-db schema-compat reset guard", () => {
+  function mainScript(result: ReturnType<typeof buildJobManifest>) {
+    const main = (result.job.spec?.template?.spec?.containers ?? []).find((c) => c.name === "opencode");
+    return main?.command?.[2] ?? "";
+  }
+
+  it("injects the version-stamped reset guard when an agent DB is mounted", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, agentDbClaimName: "opencode-db-agent-abc" });
+    const script = mainScript(result);
+    expect(script).toContain("opencode --version");
+    expect(script).toContain(".opencode-version");
+    expect(script).toContain('rm -f "$__ocdb" "$__ocdb-shm" "$__ocdb-wal"');
+    // Guard must run BEFORE the prompt is piped into opencode, so a stale-schema
+    // DB is reset before any session insert is attempted.
+    expect(script.indexOf(".opencode-version")).toBeLessThan(script.indexOf("cat /tmp/prompt/prompt.txt"));
+    expect(script.indexOf(".opencode-version")).toBeGreaterThan(-1);
+  });
+
+  it("only resets on a version change (guarded by .opencode-version comparison, not unconditional)", () => {
+    const script = mainScript(
+      buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, agentDbClaimName: "opencode-db-agent-abc" }),
+    );
+    // The rm is inside a `[ "$__ocver" != "$__ocprev" ]` branch — never a bare wipe.
+    expect(script).toContain('"$__ocver" != "$__ocprev"');
+  });
+
+  it("resets unchanged DBs when main DB plus WAL/SHM exceeds 500 MiB", () => {
+    const script = mainScript(
+      buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, agentDbClaimName: "opencode-db-agent-abc" }),
+    );
+    expect(script).toContain("524288000");
+    expect(script).toContain('for __ocf in "$__ocdb" "$__ocdb-wal" "$__ocdb-shm"');
+    expect(script).toContain('wc -c < "$__ocf"');
+    expect(script).toContain('"$__ocbytes" -gt 524288000');
+    expect(script).toContain("to cap growth");
+    expect(script.indexOf('"$__ocver" != "$__ocprev"')).toBeLessThan(script.indexOf('"$__ocbytes" -gt 524288000'));
+  });
+
+  it("does NOT inject the guard when no agent DB is mounted", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+    expect(mainScript(result)).not.toContain(".opencode-version");
+    expect(mainScript(result)).not.toContain("524288000");
+  });
+});
+
 describe("sanitizeLabelValue", () => {
   it("passes through clean values unchanged", () => {
     expect(sanitizeLabelValue("abc-123")).toBe("abc-123");
@@ -602,6 +1082,67 @@ describe("buildJobManifest — env wiring branches", () => {
     expect(env.find((e) => e.name === "AGENT_HOME")?.value).toBe("/home/agent");
   });
 
+  it("points AGENT_HOME at instructionsRootPath for an external instructions bundle (companions resolve)", () => {
+    const ctx = {
+      ...mockCtx,
+      config: {
+        instructionsBundleMode: "external",
+        instructionsRootPath: "/paperclip/.paperclip/instances/default/companies/Penstock/agents/devops",
+        instructionsEntryFile: "AGENTS.md",
+      },
+      context: {
+        ...mockCtx.context,
+        // server pointed agentHome at the per-task workspace (the broken default
+        // that made every `Read $AGENT_HOME/HEARTBEAT.md` miss); the external
+        // bundle root must win so the companions resolve.
+        paperclipWorkspace: { agentHome: "/paperclip/instances/default/workspaces/agent-abc" },
+      },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const env = result.job.spec?.template.spec?.containers[0]?.env ?? [];
+    expect(env.find((e) => e.name === "AGENT_HOME")?.value).toBe(
+      "/paperclip/.paperclip/instances/default/companies/Penstock/agents/devops",
+    );
+  });
+
+  it("leaves AGENT_HOME as the workspace agentHome when no external bundle is configured", () => {
+    const ctx = {
+      ...mockCtx,
+      config: { instructionsFilePath: "/paperclip/.paperclip/.../agents/ceo/AGENTS.md" },
+      context: {
+        ...mockCtx.context,
+        paperclipWorkspace: { agentHome: "/home/agent" },
+      },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const env = result.job.spec?.template.spec?.containers[0]?.env ?? [];
+    expect(env.find((e) => e.name === "AGENT_HOME")?.value).toBe("/home/agent");
+  });
+
+  it("symlinks company shared-docs into cwd for an external bundle (BLO-10315), and skips otherwise", () => {
+    const shell = (r: ReturnType<typeof buildJobManifest>) =>
+      (r.job.spec?.template?.spec?.containers?.find((c) => c.name === "opencode")?.command?.[2] ?? "");
+    const ext = buildJobManifest({
+      ctx: {
+        ...mockCtx,
+        config: {
+          instructionsBundleMode: "external",
+          instructionsRootPath: "/paperclip/.paperclip/instances/default/companies/Penstock/agents/devops",
+        },
+      },
+      selfPod: mockSelfPod,
+    });
+    const c = shell(ext);
+    expect(c).toContain("[ -e docs ]");
+    expect(c).toContain('ln -sfn "$__pcd" docs');
+    expect(c).toContain('"$(dirname "$(dirname "${AGENT_HOME:-/nonexistent}")")/docs"');
+    // no external bundle → no shared-docs symlink bridge (the unrelated
+    // Chrome BrowserMetrics redirect also uses `ln -sfn`, so match the docs
+    // bridge specifically rather than any symlink).
+    const plain = buildJobManifest({ ctx: { ...mockCtx, config: { instructionsFilePath: "/x/AGENTS.md" } }, selfPod: mockSelfPod });
+    expect(shell(plain)).not.toContain('ln -sfn "$__pcd" docs');
+  });
+
   it("sets PAPERCLIP_LINKED_ISSUE_IDS from non-empty issueIds array (skipping blanks)", () => {
     const ctx = { ...mockCtx, context: { ...mockCtx.context, issueIds: ["a", "  ", "b", null as unknown as string, "c"] } };
     const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
@@ -632,7 +1173,11 @@ describe("buildJobManifest — env wiring branches", () => {
     const ctx = { ...mockCtx, authToken: "tok_abc" };
     const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
     const env = result.job.spec?.template.spec?.containers[0]?.env ?? [];
-    expect(env.find((e) => e.name === "PAPERCLIP_API_KEY")?.value).toBe("tok_abc");
+    const apiKeyEnv = env.find((e) => e.name === "PAPERCLIP_API_KEY");
+    expect(apiKeyEnv?.value).toBeUndefined();
+    expect(apiKeyEnv?.valueFrom?.secretKeyRef?.name).toBe(result.envSecret?.name);
+    expect(apiKeyEnv?.valueFrom?.secretKeyRef?.key).toBe("PAPERCLIP_API_KEY");
+    expect(result.envSecret?.data.PAPERCLIP_API_KEY).toBe("tok_abc");
   });
 
   it("inherits PAPERCLIP_API_URL from selfPod inheritedEnv", () => {
@@ -647,10 +1192,13 @@ describe("buildJobManifest — env wiring branches", () => {
 });
 
 describe("buildJobManifest — volume wiring branches", () => {
-  it("mounts the prompt secret volume when promptSecretName is provided", () => {
+  it("mounts and decompresses the prompt Secret in the init container", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, promptSecretName: "prompt-x" });
     const volumes = result.job.spec?.template.spec?.volumes ?? [];
     expect(volumes.find((v) => v.name === "prompt-secret")?.secret?.secretName).toBe("prompt-x");
+    const init = result.job.spec?.template.spec?.initContainers?.[0];
+    expect(init?.command?.[2]).toContain("gzip -dc /tmp/prompt-secret/prompt.gz > /tmp/prompt/prompt.txt");
+    expect(init?.env?.find((env) => env.name === "PROMPT_CONTENT")).toBeUndefined();
   });
 
   it("mounts the data PVC at /paperclip when selfPod has a pvcClaimName", () => {
@@ -660,18 +1208,68 @@ describe("buildJobManifest — volume wiring branches", () => {
     expect(volumes.find((v) => v.name === "data")?.persistentVolumeClaim?.claimName).toBe("paperclip-data");
     const mounts = result.job.spec?.template.spec?.containers[0]?.volumeMounts ?? [];
     expect(mounts.find((m) => m.name === "data")?.mountPath).toBe("/paperclip");
+    const securityContext = result.job.spec?.template.spec?.securityContext;
+    expect(securityContext?.fsGroup).toBeUndefined();
+    expect(securityContext?.fsGroupChangePolicy).toBeUndefined();
   });
 
-  it("mounts inherited secret volumes from selfPod.secretVolumes", () => {
+  it("mounts the runtime-cache emptyDir at /runtime-cache for agent caches", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+    const volumes = result.job.spec?.template.spec?.volumes ?? [];
+    expect(volumes.find((v) => v.name === "runtime-cache")?.emptyDir?.sizeLimit).toBe("20Gi");
+    const mounts = result.job.spec?.template.spec?.containers[0]?.volumeMounts ?? [];
+    expect(mounts.find((m) => m.name === "runtime-cache")?.mountPath).toBe("/runtime-cache");
+  });
+
+  it("mounts only approved inherited Secret volumes and preserves key selectors", () => {
     const selfPod = {
       ...mockSelfPod,
-      secretVolumes: [{ volumeName: "tls", secretName: "tls-secret", mountPath: "/etc/tls", defaultMode: 0o400 }],
+      secretVolumes: [
+        {
+          volumeName: "github-token",
+          secretName: "paperclip-github-mcp-token",
+          mountPath: "/paperclip/.secrets/github-token",
+          defaultMode: 0o400,
+          items: [{ key: "token", path: "token" }],
+        },
+        { volumeName: "tls", secretName: "tls-secret", mountPath: "/etc/tls", defaultMode: 0o400 },
+      ],
     };
     const result = buildJobManifest({ ctx: mockCtx, selfPod });
     const volumes = result.job.spec?.template.spec?.volumes ?? [];
-    expect(volumes.find((v) => v.name === "tls")?.secret?.secretName).toBe("tls-secret");
+    expect(volumes.find((v) => v.name === "github-token")?.secret).toMatchObject({
+      secretName: "paperclip-github-mcp-token",
+      items: [{ key: "token", path: "token" }],
+    });
+    expect(volumes.find((v) => v.name === "tls")).toBeUndefined();
     const mounts = result.job.spec?.template.spec?.containers[0]?.volumeMounts ?? [];
-    expect(mounts.find((m) => m.name === "tls")).toEqual({ name: "tls", mountPath: "/etc/tls", readOnly: true });
+    expect(mounts.find((m) => m.name === "github-token")).toEqual({
+      name: "github-token",
+      mountPath: "/paperclip/.secrets/github-token",
+      readOnly: true,
+    });
+    expect(mounts.find((m) => m.name === "tls")).toBeUndefined();
+  });
+
+  it("detects server-only names across assembled pod containers", () => {
+    expect(
+      findServerOnlyEnvVarsInPodSpec({
+        containers: [
+          {
+            name: "opencode",
+            image: "paperclip:test",
+            env: [
+              {
+                name: "PAPERCLIP_AGENT_JWT_SECRET",
+                valueFrom: {
+                  secretKeyRef: { name: "paperclip", key: "agentJwtSecret" },
+                },
+              },
+            ],
+          },
+        ],
+      }),
+    ).toEqual(["opencode/PAPERCLIP_AGENT_JWT_SECRET"]);
   });
 });
 
@@ -691,7 +1289,7 @@ describe("buildJobManifest — MCP fleet wiring", () => {
     expect(initCmd).not.toContain("opencode.json");
   });
 
-  it("translates per-agent mcpServers (claude shape + native opencode shape) and ships OPENCODE_CONFIG", () => {
+  it("translates per-agent mcpServers and ships OPENCODE_CONFIG through a Secret", () => {
     const ctx: JobBuildInput["ctx"] = {
       ...mockCtx,
       config: {
@@ -712,6 +1310,12 @@ describe("buildJobManifest — MCP fleet wiring", () => {
             type: "http",
             url: "http://prometheus-mcp-server.paperclip.svc.cluster.local:8080/mcp",
           },
+          // claude http with auth headers
+          gbrain: {
+            type: "http",
+            url: "http://gbrain-mcp-admin.paperclip.svc.cluster.local:3130/mcp",
+            headers: { Authorization: "Bearer test-token" },
+          },
           // claude sse — translates to remote (best-effort)
           kubernetes: {
             type: "sse",
@@ -731,9 +1335,8 @@ describe("buildJobManifest — MCP fleet wiring", () => {
     expect(mainEnv.find((e) => e.name === "OPENCODE_CONFIG")?.value).toBe("/tmp/prompt/opencode.json");
 
     const init = result.job.spec!.template.spec!.initContainers![0]!;
-    const cfgEnv = (init.env ?? []).find((e) => e.name === "OPENCODE_CONFIG_JSON");
-    expect(cfgEnv).toBeDefined();
-    const parsed = JSON.parse(cfgEnv!.value!) as {
+    expect(result.mcpConfigSecret).not.toBeNull();
+    const parsed = JSON.parse(result.mcpConfigSecret!.data["opencode.json"]!) as {
       $schema: string;
       permission: { external_directory: string };
       disabled_providers: string[];
@@ -767,6 +1370,13 @@ describe("buildJobManifest — MCP fleet wiring", () => {
       url: "http://prometheus-mcp-server.paperclip.svc.cluster.local:8080/mcp",
     });
 
+    // auth headers are preserved for Bearer-protected remote MCPs
+    expect(parsed.mcp.gbrain).toEqual({
+      type: "remote",
+      url: "http://gbrain-mcp-admin.paperclip.svc.cluster.local:3130/mcp",
+      headers: { Authorization: "Bearer test-token" },
+    });
+
     // sse → remote (lossy translation, documented)
     expect(parsed.mcp.kubernetes).toEqual({
       type: "remote",
@@ -780,7 +1390,43 @@ describe("buildJobManifest — MCP fleet wiring", () => {
     });
 
     const initCmd = (init.command ?? []).join(" ");
-    expect(initCmd).toContain('printf \'%s\' "$OPENCODE_CONFIG_JSON" > /tmp/prompt/opencode.json');
+    expect(initCmd).toContain("cp /tmp/mcp-secret/opencode.json /tmp/prompt/opencode.json");
+    expect((init.env ?? []).map((entry) => entry.name)).not.toContain("OPENCODE_CONFIG_JSON");
+    expect(result.job.spec!.template.spec!.volumes).toContainEqual({
+      name: "mcp-config-secret",
+      secret: { secretName: result.mcpConfigSecret!.name, optional: false },
+    });
+    expect(init.volumeMounts).toContainEqual({
+      name: "mcp-config-secret",
+      mountPath: "/tmp/mcp-secret",
+      readOnly: true,
+    });
+  });
+
+  it("keeps MCP bearer material out of the serialized Job and shell command", () => {
+    const bearer = "Bearer mcp-secret-only-7f3a";
+    const ctx: JobBuildInput["ctx"] = {
+      ...mockCtx,
+      config: {
+        mcpServers: {
+          private: {
+            type: "http",
+            url: "https://private-mcp.example.test/mcp",
+            headers: { Authorization: bearer },
+          },
+        },
+      },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const serializedJob = JSON.stringify(result.job);
+    const serializedCommands = JSON.stringify(
+      result.job.spec?.template.spec?.containers?.flatMap((container) => container.command ?? []) ?? [],
+    );
+
+    expect(result.mcpConfigSecret?.data["opencode.json"]).toContain(bearer);
+    expect(serializedJob).not.toContain(bearer);
+    expect(serializedCommands).not.toContain(bearer);
+    expect(serializedJob).not.toContain("OPENCODE_CONFIG_JSON");
   });
 });
 
@@ -853,13 +1499,13 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       };
       const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
       const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command;
-      expect(cmd?.[2]).toMatch(/ccrotate next --yes --target codex --accounts a@b\.net,c@d\.net/);
+      expect(cmd?.[2]).toMatch(/timeout 30s ccrotate next --yes --target codex --accounts a@b\.net,c@d\.net/);
     });
 
     it("falls through to global ccrotate when providers is undefined", () => {
       const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
       const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command;
-      expect(cmd?.[2]).toMatch(/ccrotate next --yes --target codex(?! --accounts)/);
+      expect(cmd?.[2]).toMatch(/timeout 30s ccrotate next --yes --target codex(?! --accounts)/);
     });
 
     it("falls through to global ccrotate when only providers.anthropic is set (wrong key for opencode)", () => {
@@ -889,12 +1535,24 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
     it("emits the auth bootstrap step between ccrotateRefresh and the opencode invocation", () => {
       const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
       const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
-      const ccrotateIdx = cmd.indexOf("ccrotate next --yes --target codex");
-      const bootstrapIdx = cmd.indexOf(".local/share/opencode");
+      const ccrotateIdx = cmd.indexOf("timeout 30s ccrotate next --yes --target codex");
+      const bootstrapIdx = cmd.indexOf("XDG_DATA_HOME");
       const opencodeIdx = cmd.indexOf("| opencode ");
       expect(ccrotateIdx).toBeGreaterThan(-1);
       expect(bootstrapIdx).toBeGreaterThan(ccrotateIdx);
       expect(opencodeIdx).toBeGreaterThan(bootstrapIdx);
+    });
+
+    it("redirects Chrome BrowserMetrics to the runtime-cache emptyDir before the agent runs (BLO-10699)", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const redirectIdx = cmd.indexOf("ln -sfn /runtime-cache/chrome-browser-metrics");
+      const opencodeIdx = cmd.indexOf("| opencode ");
+      // Only BrowserMetrics is redirected, idempotently, off the shared PVC.
+      expect(cmd).toContain('[ -L "$HOME/.config/google-chrome/BrowserMetrics" ]');
+      expect(redirectIdx).toBeGreaterThan(-1);
+      // Redirect runs before the agent invocation.
+      expect(opencodeIdx).toBeGreaterThan(redirectIdx);
     });
 
     it("translates the codex auth.json shape (auth_mode=chatgpt + tokens) into the openai-OAuth shape opencode expects", () => {
@@ -903,12 +1561,34 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       // Reads codex auth + checks chatgpt mode + writes opencode auth.json
       expect(cmd).toContain('".codex","auth.json"');
       expect(cmd).toContain('auth_mode!=="chatgpt"');
-      expect(cmd).toContain('"share","opencode","auth.json"');
+      expect(cmd).toContain('D=process.env.XDG_DATA_HOME||p.join(H,".local","share")');
+      expect(cmd).toContain('p.join(D,"opencode","auth.json")');
       // Output keys: openai provider, oauth type, expiry from id_token exp claim
       expect(cmd).toContain('openai:{type:"oauth"');
       expect(cmd).toContain("payload.exp");
       // Best-effort: never fail the pod on bootstrap errors
       expect(cmd).toContain("|| true");
+    });
+
+    it("skips OAuth bootstrap and clears stale opencode auth when OPENAI_API_KEY is configured", () => {
+      const ctx = {
+        ...mockCtx,
+        config: {
+          env: {
+            OPENAI_API_KEY: "test-key",
+            OPENAI_BASE_URL: "http://opencode-ccrotate-responses-shim.paperclip.svc.cluster.local:8080/v1",
+          },
+        },
+      };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+
+      expect(cmd).not.toContain('".codex","auth.json"');
+      expect(cmd).not.toContain('auth_mode!=="chatgpt"');
+      expect(cmd).toContain('rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/opencode/auth.json" "${XDG_DATA_HOME:-$HOME/.local/share}/opencode/account.json"');
+      expect(cmd.indexOf('rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/opencode/auth.json"')).toBeLessThan(
+        cmd.indexOf("cat /tmp/prompt/prompt.txt"),
+      );
     });
   });
 
@@ -917,11 +1597,223 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
       const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
       // The default-path config is inlined into the main command via
-      // `echo '...' > ~/.config/opencode/opencode.json`. Extract and parse.
-      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > ~\/\.config\/opencode\/opencode\.json/);
+      // `echo '...' > "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json"`. Extract and parse.
+      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > \S*opencode\/opencode\.json/);
       expect(match).toBeTruthy();
       const parsed = JSON.parse(match![1].replace(/'\\''/g, "'")) as { disabled_providers?: string[] };
       expect(parsed.disabled_providers).toEqual(["opencode"]);
+    });
+
+    it("includes the Ponytail module in both OpenCode config paths", () => {
+      const pluginPath = "/opt/penstock/ponytail/.opencode/plugins/ponytail.mjs";
+      const defaultResult = buildJobManifest({
+        ctx: { ...mockCtx, config: { ponytailPluginPath: pluginPath } },
+        selfPod: mockSelfPod,
+      });
+      const defaultCommand = defaultResult.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const defaultMatch = defaultCommand.match(/echo '([^']+(?:'\\''[^']*)*)' > \S*opencode\/opencode\.json/);
+      expect(defaultMatch).toBeTruthy();
+      const defaultConfig = JSON.parse(defaultMatch![1].replace(/'\\''/g, "'")) as {
+        plugin?: string[];
+      };
+      expect(defaultConfig.plugin).toEqual([pluginPath]);
+
+      const mcpResult = buildJobManifest({
+        ctx: {
+          ...mockCtx,
+          config: {
+            ponytailPluginPath: pluginPath,
+            mcpServers: { paperclip: { command: "node", args: ["/app/mcp.js"] } },
+          },
+        },
+        selfPod: mockSelfPod,
+      });
+      const mcpConfig = JSON.parse(mcpResult.mcpConfigSecret!.data["opencode.json"]!) as {
+        plugin?: string[];
+      };
+      expect(mcpConfig.plugin).toEqual([pluginPath]);
+    });
+
+    it("denies env-dump bash commands (PEN-1305) without blocking legit forms", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > \S*opencode\/opencode\.json/);
+      expect(match).toBeTruthy();
+      const parsed = JSON.parse(match![1].replace(/'\\''/g, "'")) as {
+        permission?: { external_directory?: string; bash?: Record<string, string> };
+      };
+      const bash = parsed.permission?.bash ?? {};
+      // Default stays allow (unattended Job pods must not prompt).
+      expect(bash["*"]).toBe("allow");
+      // Dump forms are denied.
+      for (const p of ["env", "printenv", "set", "export -p", "declare -x", "cat /proc/*/environ"]) {
+        expect(bash[p]).toBe("deny");
+      }
+      // Legit set-and-run / flag forms are NOT present as deny keys (bare-token
+      // globs never match args-carrying commands).
+      expect(bash["env *"]).toBeUndefined();
+      expect(bash["set *"]).toBeUndefined();
+      expect(bash["printenv *"]).toBeUndefined();
+      // external_directory bypass preserved under skipPermissions.
+      expect(parsed.permission?.external_directory).toBe("allow");
+    });
+
+    // PEN-1305 plugin arm — canary-gated behind adapter config envGuardPlugin.
+    it("cleans up stale env-guard plugin artifacts by default (canary gate off)", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      expect(cmd).toContain('GUARD_OC_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"');
+      expect(cmd).toContain('rm -f "$GUARD_OC_DIR/plugin/paperclip-env-guard.js" "$GUARD_OC_DIR/safe-env-inspect.mjs"');
+      expect(cmd).not.toContain("base64 -d >");
+    });
+
+    it("installs the env-guard plugin into the global opencode plugin dir when envGuardPlugin=true", () => {
+      const ctx: JobBuildInput["ctx"] = {
+        ...mockCtx,
+        config: { envGuardPlugin: true },
+      };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      // Targets the same XDG base the runtime opencode.json setup uses, so the
+      // plugin lands in the dir opencode's {plugin,plugins}/*.{ts,js} glob scans.
+      expect(cmd).toContain('GUARD_OC_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"');
+      expect(cmd).toContain('"$GUARD_OC_DIR/plugin/paperclip-env-guard.js"');
+      expect(cmd).toContain('"$GUARD_OC_DIR/safe-env-inspect.mjs"');
+      // The exact plugin artifact ships base64-embedded and round-trips.
+      const pluginB64 = Buffer.from(ENV_GUARD_PLUGIN_SCRIPT, "utf8").toString("base64");
+      expect(cmd).toContain(pluginB64);
+      // Install runs before opencode starts, and fails open.
+      expect(cmd.indexOf("GUARD_OC_DIR")).toBeLessThan(cmd.indexOf("cat /tmp/prompt/prompt.txt"));
+      expect(cmd).toContain('|| echo "[paperclip-env-guard] plugin install skipped" >&2');
+    });
+
+    // BLO-14758: opencode's turn-zero workspace snapshot (`git add --all
+    // --sparse` into a shadow git store) pegs a core in uninterruptible
+    // disk I/O for 20-30+ minutes against large/cold agent workspace dirs,
+    // before the first LLM turn starts. Both config paths must disable it.
+    it("default opencode.json (no per-agent MCP) sets snapshot=false", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > \S*opencode\/opencode\.json/);
+      expect(match).toBeTruthy();
+      const parsed = JSON.parse(match![1].replace(/'\\''/g, "'")) as { snapshot?: boolean };
+      expect(parsed.snapshot).toBe(false);
+    });
+
+    it("sets snapshot=false on the MCP-path Secret-backed opencode.json", () => {
+      const ctx: JobBuildInput["ctx"] = {
+        ...mockCtx,
+        config: {
+          mcpServers: {
+            paperclip: { command: "node", args: ["/app/packages/mcp-server/dist/stdio.js"] },
+          },
+        },
+      };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      const parsed = JSON.parse(result.mcpConfigSecret!.data["opencode.json"]!) as { snapshot?: boolean };
+      expect(parsed.snapshot).toBe(false);
+    });
+
+    // Reasoning models (gpt-5.5) can pause for long stretches between SSE
+    // chunks while thinking. OpenCode's default inter-chunk idle guard
+    // (provider.options.chunkTimeout) aborts the stream on these gaps,
+    // surfacing "API Error: Stream idle timeout - partial response" and
+    // persisting a TRUNCATED assistant turn (an issue body cut mid-sentence).
+    // Both config paths must set a generous chunkTimeout so a healthy-but-slow
+    // reasoning stream is never aborted.
+    it("sets provider.openai.options.chunkTimeout on the default (no-MCP) opencode.json", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > \S*opencode\/opencode\.json/);
+      expect(match).toBeTruthy();
+      const parsed = JSON.parse(match![1].replace(/'\\''/g, "'")) as {
+        provider?: { openai?: { options?: { chunkTimeout?: number } } };
+      };
+      expect(parsed.provider?.openai?.options?.chunkTimeout).toBe(240_000);
+    });
+
+    it("sets provider.openai.options.chunkTimeout on the MCP-path Secret-backed opencode.json", () => {
+      const ctx: JobBuildInput["ctx"] = {
+        ...mockCtx,
+        config: {
+          mcpServers: {
+            paperclip: { command: "node", args: ["/app/packages/mcp-server/dist/stdio.js"] },
+          },
+        },
+      };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      const parsed = JSON.parse(result.mcpConfigSecret!.data["opencode.json"]!) as {
+        provider?: { openai?: { options?: { chunkTimeout?: number } } };
+      };
+      expect(parsed.provider?.openai?.options?.chunkTimeout).toBe(240_000);
+    });
+    // Per-agent Penstock attribution: every agent Job shares the one org API
+    // key, so without a per-agent client-session header the whole fleet melts
+    // into a single UNTAGGED bucket on the org_penstock consumption dashboard.
+    type ProviderHeaderShape = {
+      provider?: {
+        anthropic?: { options?: { headers?: Record<string, string> } };
+        openai?: { options?: { headers?: Record<string, string>; chunkTimeout?: number } };
+      };
+    };
+
+    it("stamps x-penstock-session: agent:<name> on both providers (default path)", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > \S*opencode\/opencode\.json/);
+      expect(match).toBeTruthy();
+      const parsed = JSON.parse(match![1].replace(/'\\''/g, "'")) as ProviderHeaderShape;
+      expect(parsed.provider?.anthropic?.options?.headers).toEqual({
+        "x-penstock-session": "agent:Test Agent",
+      });
+      expect(parsed.provider?.openai?.options?.headers).toEqual({
+        "x-penstock-session": "agent:Test Agent",
+      });
+      // The identity headers must not displace the reasoning chunkTimeout.
+      expect(parsed.provider?.openai?.options?.chunkTimeout).toBe(240_000);
+    });
+
+    it("stamps x-penstock-session on the MCP-path Secret-backed opencode.json too", () => {
+      const ctx: JobBuildInput["ctx"] = {
+        ...mockCtx,
+        config: {
+          mcpServers: {
+            paperclip: { command: "node", args: ["/app/packages/mcp-server/dist/stdio.js"] },
+          },
+        },
+      };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      const parsed = JSON.parse(result.mcpConfigSecret!.data["opencode.json"]!) as ProviderHeaderShape;
+      expect(parsed.provider?.anthropic?.options?.headers?.["x-penstock-session"]).toBe(
+        "agent:Test Agent",
+      );
+    });
+
+    it("falls back to the agent id and strips header-injection characters from the name", () => {
+      const ctx: JobBuildInput["ctx"] = {
+        ...mockCtx,
+        agent: { ...mockCtx.agent, id: "agent-xyz", name: "evil\r\nX-Injected: 1" },
+      };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > \S*opencode\/opencode\.json/);
+      const parsed = JSON.parse(match![1].replace(/'\\''/g, "'")) as ProviderHeaderShape;
+      // CR/LF stripped — the value stays a single header line.
+      expect(parsed.provider?.anthropic?.options?.headers?.["x-penstock-session"]).toBe(
+        "agent:evilX-Injected: 1",
+      );
+
+      const noName: JobBuildInput["ctx"] = {
+        ...mockCtx,
+        agent: { ...mockCtx.agent, id: "agent-noname", name: "" },
+      };
+      const result2 = buildJobManifest({ ctx: noName, selfPod: mockSelfPod });
+      const cmd2 = result2.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const match2 = cmd2.match(/echo '([^']+(?:'\\''[^']*)*)' > \S*opencode\/opencode\.json/);
+      const parsed2 = JSON.parse(match2![1].replace(/'\\''/g, "'")) as ProviderHeaderShape;
+      expect(parsed2.provider?.anthropic?.options?.headers?.["x-penstock-session"]).toBe(
+        "agent:agent-noname",
+      );
     });
   });
 
@@ -1055,5 +1947,160 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       expect(result.promptMetrics.wakePromptChars).toBeGreaterThan(0);
       expect(result.promptMetrics.heartbeatPromptChars).toBe(0);
     });
+  });
+});
+
+describe("buildJobManifest — resumeLastSession:false unifies fresh-session semantics", () => {
+  // Bug surfaced 2026-05-23 (originally Gotcha #6 in BLO-5492 handoff): the
+  // CLI gate `if (runtimeSessionId && resumeLastSession) push --session`
+  // skipped the flag when resumeLastSession was false, so opencode started
+  // a brand-new session. But three prompt-rendering paths used the weaker
+  // `Boolean(runtimeSessionId)` gate, so the prompt was still composed as
+  // a resume-delta (no bootstrap, wakePrompt rendered as delta, heartbeat
+  // prompt suppressed). Net effect: opencode came up cold but received a
+  // prompt that assumed prior context. Symptom on the fleet was the
+  // appearance of "stale session reuse" even with resumeLastSession:false
+  // explicitly set.
+  function buildResumeOffCtx(overrides: Partial<JobBuildInput["ctx"]["context"]> = {}) {
+    return {
+      ...mockCtx,
+      runtime: {
+        sessionId: "ses_should_not_resume",
+        sessionParams: { sessionId: "ses_should_not_resume" },
+        sessionDisplayId: "ses_should_not_resume",
+        taskKey: null,
+      },
+      config: {
+        resumeLastSession: false,
+        bootstrapPromptTemplate: "BOOTSTRAP-SENTINEL agent {{agent.id}}",
+      },
+      context: {
+        ...mockCtx.context,
+        ...overrides,
+      },
+    };
+  }
+
+  function getMainShellCommand(result: ReturnType<typeof buildJobManifest>) {
+    const containers = result.job.spec?.template?.spec?.containers ?? [];
+    const main = containers.find((c) => c.name === "opencode");
+    const cmd = main?.command ?? [];
+    return cmd[2] ?? "";
+  }
+
+  it("renders bootstrap prompt when resumeLastSession is false even with a tracked sessionId", () => {
+    const ctx = buildResumeOffCtx();
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    expect(result.prompt).toContain("BOOTSTRAP-SENTINEL");
+    expect(result.promptMetrics.bootstrapPromptChars).toBeGreaterThan(0);
+  });
+
+  it("does NOT pass --session to opencode when resumeLastSession is false", () => {
+    const ctx = buildResumeOffCtx();
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const script = getMainShellCommand(result);
+    expect(script).not.toContain("--session");
+  });
+
+  it("renders wakePrompt as a fresh (not resume-delta) prompt when resumeLastSession is false", () => {
+    // The wake-prompt renderer formats DIFFERENTLY depending on whether
+    // the session is being resumed. When starting fresh we want the full
+    // wake context, not a delta against a phantom prior session.
+    const ctx = buildResumeOffCtx({
+      paperclipWake: {
+        reason: "issue_assigned",
+        issue: { id: "iw", identifier: "BLO-9999", title: "test wake" },
+      },
+    });
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    expect(result.promptMetrics.wakePromptChars).toBeGreaterThan(0);
+    // Heartbeat prompt must NOT be suppressed by the resume-delta gate
+    // (which only applies to genuinely-resumed sessions).
+    expect(result.promptMetrics.heartbeatPromptChars).toBeGreaterThan(0);
+  });
+
+  it("preserves resume semantics when resumeLastSession is true (default)", () => {
+    // Regression guard for the unified flag: existing resumed-session
+    // behaviour must not change for agents that don't opt out.
+    const ctx = {
+      ...mockCtx,
+      runtime: {
+        sessionId: "ses_resuming",
+        sessionParams: { sessionId: "ses_resuming" },
+        sessionDisplayId: "ses_resuming",
+        taskKey: null,
+      },
+      config: {
+        bootstrapPromptTemplate: "BOOTSTRAP-SENTINEL",
+      },
+      context: {
+        ...mockCtx.context,
+        paperclipWake: {
+          reason: "issue_assigned",
+          issue: { id: "i2", identifier: "BLO-9998", title: "resume" },
+        },
+      },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const script = getMainShellCommand(result);
+    // Resuming path: --session passed, no bootstrap, heartbeat suppressed
+    expect(script).toContain("--session' 'ses_resuming'");
+    expect(result.promptMetrics.bootstrapPromptChars).toBe(0);
+    expect(result.promptMetrics.heartbeatPromptChars).toBe(0);
+  });
+});
+
+describe("buildJobManifest — adapter-managed OpenCode runtime (opencodeVersion)", () => {
+  // Job pods inherit the paperclip image, whose root-owned, layer-cached
+  // `opencode-ai` froze at 1.18.11 while Opus 5.5 / Sonnet 5.5 support lands
+  // in newer releases. The main command therefore bootstraps the pinned binary
+  // onto the data PVC and puts it first on PATH before anything resolves
+  // `opencode`. See runtime-pin.ts.
+  const shell = (r: ReturnType<typeof buildJobManifest>) =>
+    r.job.spec?.template?.spec?.containers?.find((c) => c.name === "opencode")?.command?.[2] ?? "";
+
+  it("bootstraps the default pin right after pipefail and before every opencode call", () => {
+    const built = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+    const command = shell(built);
+    expect(built.opencodeVersion).toBe(DEFAULT_OPENCODE_VERSION);
+    // The main command opens with the Chrome BrowserMetrics redirect (and the
+    // DinD wait when enabled); the runtime bootstrap is the first thing after
+    // `set -o pipefail;` so every later `opencode` resolves through its PATH.
+    expect(command).toContain("set -o pipefail; __pover=");
+    expect(command).toContain(`__pover='${DEFAULT_OPENCODE_VERSION}'`);
+    expect(command).toContain("__poroot='/paperclip/.local/lib/paperclip-k8s-runtimes/opencode'");
+    expect(command).toContain('export PATH="$__podir/node_modules/.bin:$PATH"');
+    const runtimeEnd = command.indexOf("falling back to the image opencode");
+    expect(runtimeEnd).toBeGreaterThan(-1);
+    for (const later of ["ccrotate next", "cat /tmp/prompt/prompt.txt | opencode"]) {
+      const idx = command.indexOf(later);
+      if (idx !== -1) expect(idx, later).toBeGreaterThan(runtimeEnd);
+    }
+    expect(command.indexOf("cat /tmp/prompt/prompt.txt | opencode")).toBeGreaterThan(runtimeEnd);
+  });
+
+  it("honours an explicit exact version", () => {
+    const built = buildJobManifest({ ctx: { ...mockCtx, config: { opencodeVersion: "1.19.0" } }, selfPod: mockSelfPod });
+    expect(built.opencodeVersion).toBe("1.19.0");
+    expect(shell(built)).toContain("__pover='1.19.0'");
+    expect(shell(built)).toContain('"opencode-ai@$__pover"');
+  });
+
+  it('"image" disables the bootstrap and keeps the command on the bundled binary', () => {
+    const built = buildJobManifest({ ctx: { ...mockCtx, config: { opencodeVersion: "image" } }, selfPod: mockSelfPod });
+    expect(built.opencodeVersion).toBe("");
+    expect(shell(built)).not.toContain("__pover=");
+    expect(shell(built)).not.toContain("paperclip-k8s-runtimes");
+  });
+
+  it("rejects a non-exact version instead of interpolating it into the shell", () => {
+    expect(() => buildJobManifest({ ctx: { ...mockCtx, config: { opencodeVersion: "latest" } }, selfPod: mockSelfPod })).toThrow(
+      /opencodeVersion must be an exact version/,
+    );
+  });
+
+  it("installs under the configured workspace mount path when the execution target overrides it", () => {
+    const built = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, workspaceVolumeClaim: "agent-data", workspaceMountPath: "/data" });
+    expect(shell(built)).toContain("__poroot='/data/.local/lib/paperclip-k8s-runtimes/opencode'");
   });
 });

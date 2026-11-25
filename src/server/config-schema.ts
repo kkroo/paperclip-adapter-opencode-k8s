@@ -1,4 +1,5 @@
 import type { AdapterConfigSchema } from "@paperclipai/adapter-utils";
+import { DEFAULT_OPENCODE_VERSION } from "./runtime-pin.js";
 
 export function getConfigSchema(): AdapterConfigSchema {
   return {
@@ -12,6 +13,33 @@ export function getConfigSchema(): AdapterConfigSchema {
         group: "Core",
       },
       {
+        key: "agentCommand",
+        label: "Agent Launcher",
+        type: "text",
+        hint: "Optional executable used to launch OpenCode. Set this to the reviewed Caveman/Penstock launcher path; arguments and shell syntax are rejected.",
+        group: "Core",
+      },
+      {
+        key: "ponytailPluginPath",
+        label: "Ponytail Plugin Path",
+        type: "text",
+        hint: "Absolute path to the installed Ponytail .mjs plugin file. It is included in both OpenCode config paths.",
+        group: "Core",
+      },
+      {
+        key: "ponytailDefaultMode",
+        label: "Ponytail Default Mode",
+        type: "select",
+        options: [
+          { label: "Off", value: "off" },
+          { label: "Lite", value: "lite" },
+          { label: "Full", value: "full" },
+          { label: "Ultra", value: "ultra" },
+        ],
+        hint: "Default Ponytail intensity for this agent. An explicit PONYTAIL_DEFAULT_MODE in env takes precedence.",
+        group: "Core",
+      },
+      {
         key: "dangerouslySkipPermissions",
         label: "Skip Permission Checks",
         type: "toggle",
@@ -20,15 +48,24 @@ export function getConfigSchema(): AdapterConfigSchema {
         group: "Core",
       },
       {
+        key: "envGuardPlugin",
+        label: "Env-Guard Plugin (PEN-1305)",
+        type: "toggle",
+        default: false,
+        hint: "Install the tool.execute.before env-dump guard plugin (blocks wrapped forms like sh -lc \"env\" that the permission.bash deny globs miss). Canary-gated: default off until fleet rollout.",
+        group: "Core",
+      },
+      {
         key: "agentDbMode",
         label: "Agent DB Mode",
         type: "select",
         options: [
-          { label: "Dedicated PVC (per-agent, persistent)", value: "dedicated_pvc" },
+          { label: "Workspace subPath (shared workspace data PVC, survives restart)", value: "workspace_subpath" },
+          { label: "Dedicated PVC (per-agent, persistent RWO)", value: "dedicated_pvc" },
           { label: "Ephemeral (emptyDir, lost on Job exit)", value: "ephemeral" },
         ],
-        default: "dedicated_pvc",
-        hint: "dedicated_pvc creates a long-lived PVC named opencode-db-<agentId> and mounts it at /opencode-db; ephemeral uses a Job-local emptyDir",
+        default: "workspace_subpath",
+        hint: "workspace_subpath (default) stores the agent DB under a per-(agent, task) subdir on the shared workspace data PVC (RWX) and survives pod restarts without a single-node-attach volume; dedicated_pvc is explicit opt-in and creates a long-lived RWO PVC named opencode-db-<agentId> mounted at /opencode-db (requires agentDbStorageClass); ephemeral uses a Job-local emptyDir",
         group: "Core",
       },
       {
@@ -82,6 +119,14 @@ export function getConfigSchema(): AdapterConfigSchema {
         group: "Kubernetes",
       },
       {
+        key: "opencodeVersion",
+        label: "OpenCode Version",
+        type: "text",
+        default: DEFAULT_OPENCODE_VERSION,
+        hint: `Exact opencode-ai version the Job installs once onto the shared data PVC and runs instead of the image's bundled binary (default ${DEFAULT_OPENCODE_VERSION}). Set to "image" to run the binary bundled in the container image. Changing it resets each agent's persistent opencode.db once (schema guard).`,
+        group: "Kubernetes",
+      },
+      {
         key: "kubeconfig",
         label: "Kubeconfig Path",
         type: "text",
@@ -114,6 +159,13 @@ export function getConfigSchema(): AdapterConfigSchema {
         label: "Memory Limit",
         type: "text",
         hint: "e.g. '8Gi' or '8G'",
+        group: "Kubernetes",
+      },
+      {
+        key: "compactThreshold",
+        label: "Compact Threshold",
+        type: "number",
+        hint: "Override the model-aware auto-compact input-token threshold. Leave unset to compact at 50% of the model context window.",
         group: "Kubernetes",
       },
       {
@@ -156,8 +208,8 @@ export function getConfigSchema(): AdapterConfigSchema {
         key: "reattachOrphanedJobs",
         label: "Reattach Orphaned Jobs",
         type: "toggle",
-        default: false,
-        hint: "When a running Job for the same task is found after a server restart, reattach (stream logs and await completion) instead of blocking",
+        default: true,
+        hint: "When a running Job for the same task is found after a server restart, reattach (stream logs and await completion) instead of blocking. Default on: a same-task orphan from a prior adapter restart should be reattached, not turned into a k8s_concurrent_run_blocked failure.",
         group: "Kubernetes",
       },
 
@@ -184,14 +236,14 @@ export function getConfigSchema(): AdapterConfigSchema {
         key: "dockerCpuLimit",
         label: "DinD CPU Limit",
         type: "text",
-        hint: "CPU limit for the DinD sidecar (default '2'). e.g. '2', '4000m'.",
+        hint: "CPU limit for the DinD sidecar (default '4'). e.g. '4', '4000m'.",
         group: "Docker",
       },
       {
         key: "dockerMemoryLimit",
         label: "DinD Memory Limit",
         type: "text",
-        hint: "Memory limit for the DinD sidecar (default '2Gi'). e.g. '2Gi', '4Gi'.",
+        hint: "Memory limit for the DinD sidecar (default '8Gi'). e.g. '4Gi', '8Gi'.",
         group: "Docker",
       },
 

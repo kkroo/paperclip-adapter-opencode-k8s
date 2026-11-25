@@ -4,6 +4,8 @@ import {
   isOpenCodeUnknownSessionError,
   isOpenCodeStepLimitResult,
   isOpenCodeContextOverflowResult,
+  isOpenCodeStreamEofResult,
+  isOpenCodeTypeDerefError,
 } from "./parse.js";
 
 describe("parseOpenCodeJsonl", () => {
@@ -59,17 +61,46 @@ describe("parseOpenCodeJsonl", () => {
     expect(result.errorMessage).toBe("Something went wrong");
   });
 
-  it("captures tool_use errors with error state", () => {
+  it("routes tool_use errors to toolErrorMessage, not errorMessage (PEN-906)", () => {
+    // A failed tool call (e.g. read of a missing file) is a normal result the
+    // agent recovers from — it must not be reported as a run-level failure.
     const stdout = [
       JSON.stringify({
         type: "tool_use",
-        part: { state: { status: "error", error: "Tool failed" } },
+        part: { state: { status: "error", error: "File not found: /docs/architecture-template.md" } },
       }),
     ].join("\n");
 
     const result = parseOpenCodeJsonl(stdout);
 
-    expect(result.errorMessage).toBe("Tool failed");
+    expect(result.errorMessage).toBeNull();
+    expect(result.toolErrorMessage).toBe("File not found: /docs/architecture-template.md");
+  });
+
+  it("marks completedCleanly when the last step_finish reason is stop (PEN-906)", () => {
+    const stdout = [
+      JSON.stringify({ type: "tool_use", part: { state: { status: "error", error: "File not found: /docs/x-template.md" } } }),
+      JSON.stringify({ type: "step_finish", part: { reason: "tool-calls", tokens: { input: 10, output: 5 } } }),
+      JSON.stringify({ type: "text", part: { text: "Done." } }),
+      JSON.stringify({ type: "step_finish", part: { reason: "stop", tokens: { input: 1, output: 2 } } }),
+    ].join("\n");
+
+    const result = parseOpenCodeJsonl(stdout);
+
+    expect(result.completedCleanly).toBe(true);
+    expect(result.errorMessage).toBeNull();
+    expect(result.toolErrorMessage).toContain("x-template.md");
+    expect(result.summary).toBe("Done.");
+  });
+
+  it("does not mark completedCleanly when the run ended mid-step or on a limit (PEN-906)", () => {
+    const stdout = [
+      JSON.stringify({ type: "step_finish", part: { reason: "max_turns", tokens: { input: 1, output: 1 } } }),
+    ].join("\n");
+
+    const result = parseOpenCodeJsonl(stdout);
+
+    expect(result.completedCleanly).toBe(false);
   });
 
   it("extracts sessionId from any event", () => {
@@ -296,5 +327,90 @@ describe("isOpenCodeContextOverflowResult", () => {
       part: { state: { status: "ok", output: "{\"code\":\"context_length_exceeded\"}" } },
     });
     expect(isOpenCodeContextOverflowResult(stdout)).toBe(false);
+  });
+});
+
+describe("isOpenCodeStreamEofResult", () => {
+  it("detects opencode UnknownError stream EOF after clean step_finish output", () => {
+    const stdout = [
+      JSON.stringify({
+        type: "step_finish",
+        part: { reason: "end_turn", tokens: { input: 100, output: 25, cache: { read: 90 } } },
+        sessionID: "ses_eof",
+      }),
+      JSON.stringify({
+        type: "error",
+        error: {
+          name: "UnknownError",
+          data: { message: "JSON Parse error: Unexpected EOF" },
+        },
+        sessionID: "ses_eof",
+      }),
+    ].join("\n");
+
+    expect(isOpenCodeStreamEofResult(stdout)).toBe(true);
+  });
+
+  it("returns false for clean step_finish output without an EOF error", () => {
+    const stdout = JSON.stringify({
+      type: "step_finish",
+      part: { reason: "end_turn", tokens: { input: 100, output: 25, cache: { read: 90 } } },
+      sessionID: "ses_clean",
+    });
+
+    expect(isOpenCodeStreamEofResult(stdout)).toBe(false);
+  });
+
+  it("returns false for UnknownError with a non-EOF message", () => {
+    const stdout = JSON.stringify({
+      type: "error",
+      error: {
+        name: "UnknownError",
+        data: { message: "Provider returned HTTP 502" },
+      },
+      sessionID: "ses_other",
+    });
+
+    expect(isOpenCodeStreamEofResult(stdout)).toBe(false);
+  });
+});
+
+describe("isOpenCodeTypeDerefError", () => {
+  it("detects JavaScriptCore 'undefined is not an object (evaluating M.type)' from parsedError", () => {
+    const parsedError = "undefined is not an object (evaluating 'M.type')";
+    expect(isOpenCodeTypeDerefError("", parsedError)).toBe(true);
+  });
+
+  it("detects the pattern in stdout NDJSON error event", () => {
+    const stdout = JSON.stringify({
+      type: "error",
+      error: { message: "undefined is not an object (evaluating 'M.type')" },
+      sessionID: "ses_x",
+    });
+    expect(isOpenCodeTypeDerefError(stdout, "")).toBe(true);
+  });
+
+  it("matches any minified variable name, not just M", () => {
+    const parsedError = "undefined is not an object (evaluating 'Q.type')";
+    expect(isOpenCodeTypeDerefError("", parsedError)).toBe(true);
+  });
+
+  it("detects V8-style 'Cannot read properties of undefined (reading type)'", () => {
+    const parsedError = "Cannot read properties of undefined (reading 'type')";
+    expect(isOpenCodeTypeDerefError("", parsedError)).toBe(true);
+  });
+
+  it("returns false for unrelated undefined-property errors", () => {
+    const parsedError = "undefined is not an object (evaluating 'M.name')";
+    expect(isOpenCodeTypeDerefError("", parsedError)).toBe(false);
+  });
+
+  it("returns false for empty inputs", () => {
+    expect(isOpenCodeTypeDerefError("", "")).toBe(false);
+  });
+
+  it("returns false for V8 undefined read on a non-type property", () => {
+    const parsedError = "Cannot read properties of undefined (reading 'id')";
+    expect(isOpenCodeTypeDerefError("", parsedError)).toBe(false);
   });
 });

@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { getConfigSchema } from "./config-schema.js";
+import { DEFAULT_OPENCODE_VERSION } from "./runtime-pin.js";
 
 interface ConfigFieldSchema {
   key: string;
@@ -35,6 +36,15 @@ describe("getConfigSchema", () => {
     expect(keys).not.toContain("graceSec");
   });
 
+  it("exposes opencodeVersion defaulting to the adapter pin", () => {
+    const schema = getConfigSchema();
+    const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "opencodeVersion");
+    expect(field).toBeDefined();
+    expect(field!.type).toBe("text");
+    expect(field!.default).toBe(DEFAULT_OPENCODE_VERSION);
+    expect(field!.group).toBe("Kubernetes");
+  });
+
   it("has imagePullPolicy as select with correct options", () => {
     const schema = getConfigSchema();
     const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "imagePullPolicy");
@@ -53,6 +63,20 @@ describe("getConfigSchema", () => {
     expect(field).toBeDefined();
     expect(field!.type).toBe("toggle");
     expect(field!.default).toBe(true);
+  });
+
+  it("exposes the Caveman and Ponytail fields", () => {
+    const schema = getConfigSchema();
+    const fields = new Map(schema.fields.map((field: ConfigFieldSchema) => [field.key, field]));
+    expect(fields.get("agentCommand")?.type).toBe("text");
+    expect(fields.get("ponytailPluginPath")?.type).toBe("text");
+    expect(fields.get("ponytailDefaultMode")?.type).toBe("select");
+    expect(fields.get("ponytailDefaultMode")?.options).toEqual([
+      { label: "Off", value: "off" },
+      { label: "Lite", value: "lite" },
+      { label: "Full", value: "full" },
+      { label: "Ultra", value: "ultra" },
+    ]);
   });
 
   it("ttlSecondsAfterFinished defaults to 300", () => {
@@ -85,12 +109,22 @@ describe("getConfigSchema", () => {
     }
   });
 
-  it("has agentDbMode as select with dedicated_pvc default", () => {
+  it("exposes compactThreshold as an optional number override", () => {
+    const schema = getConfigSchema();
+    const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "compactThreshold");
+    expect(field).toBeDefined();
+    expect(field!.type).toBe("number");
+    expect(field!.group).toBe("Kubernetes");
+    expect(field!.default).toBeUndefined();
+  });
+
+  it("has agentDbMode as select with workspace_subpath default and dedicated_pvc as explicit opt-in", () => {
     const schema = getConfigSchema();
     const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "agentDbMode");
     expect(field).toBeDefined();
     expect(field!.type).toBe("select");
-    expect(field!.default).toBe("dedicated_pvc");
+    expect(field!.default).toBe("workspace_subpath");
+    expect(field!.options).toContainEqual(expect.objectContaining({ value: "workspace_subpath" }));
     expect(field!.options).toContainEqual(expect.objectContaining({ value: "dedicated_pvc" }));
     expect(field!.options).toContainEqual(expect.objectContaining({ value: "ephemeral" }));
   });

@@ -4,6 +4,24 @@ import type { AdapterModel } from "@paperclipai/adapter-utils";
 import { asString, ensurePathInEnv, runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 
 export const STATIC_MODELS: AdapterModel[] = [
+  // OpenAI lineup as presented by Codex 0.154+ (2026-10): GPT-6.1 Sol is the
+  // current workhorse, GPT-6 Astra the frontier tier, GPT-6 Sol/Luna the
+  // previous workhorse and the fast/cheap tier, GPT-5.6 Sol/Terra/Luna and
+  // GPT-5.5 the older generations still served. GPT-6.2 Sol and Astra are the
+  // newest rows.
+  { id: "openai/gpt-6.2-sol", label: "openai/gpt-6.2-sol" },
+  { id: "openai/gpt-6.2-astra", label: "openai/gpt-6.2-astra" },
+  { id: "openai/gpt-6.1-sol", label: "openai/gpt-6.1-sol" },
+  { id: "openai/gpt-6-astra", label: "openai/gpt-6-astra" },
+  { id: "openai/gpt-6-sol", label: "openai/gpt-6-sol" },
+  { id: "openai/gpt-6-luna", label: "openai/gpt-6-luna" },
+  { id: "openai/gpt-5.6-sol", label: "openai/gpt-5.6-sol" },
+  { id: "openai/gpt-5.6-terra", label: "openai/gpt-5.6-terra" },
+  { id: "openai/gpt-5.6-luna", label: "openai/gpt-5.6-luna" },
+  { id: "openai/gpt-5.5", label: "openai/gpt-5.5" },
+  { id: "anthropic/claude-opus-5-5", label: "anthropic/claude-opus-5-5" },
+  { id: "anthropic/claude-sonnet-5-5", label: "anthropic/claude-sonnet-5-5" },
+  { id: "anthropic/claude-opus-5", label: "anthropic/claude-opus-5" },
   { id: "anthropic/claude-opus-4-7", label: "anthropic/claude-opus-4-7" },
   { id: "anthropic/claude-sonnet-4-6", label: "anthropic/claude-sonnet-4-6" },
   { id: "anthropic/claude-haiku-4-5", label: "anthropic/claude-haiku-4-5" },

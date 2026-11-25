@@ -25,15 +25,19 @@ DNS config, and PVC from the running Paperclip Deployment automatically.
 Core fields:
 - model (string, required): OpenCode model id in provider/model format (e.g. anthropic/claude-sonnet-4-6)
 - variant (string, optional): provider-specific reasoning/profile variant passed as --variant
+- agentCommand (string, optional): one executable used to launch OpenCode; set this to the reviewed Caveman/Penstock launcher to route the run through Penstock. Arguments and shell metacharacters are rejected.
+- ponytailPluginPath (string, optional): absolute path to the installed Ponytail .mjs plugin file; included in the generated OpenCode config
+- ponytailDefaultMode (string, optional): Ponytail default mode (off|lite|full|ultra); an explicit PONYTAIL_DEFAULT_MODE env value wins
 - dangerouslySkipPermissions (boolean, optional): inject runtime config with permission.external_directory=allow; defaults to true
 - instructionsFilePath (string, optional): absolute path to a markdown instructions file (e.g. AGENTS.md on the PVC); content is prepended to every run prompt as system instructions
 - promptTemplate (string, optional): run prompt template
 - extraArgs (string[], optional): additional CLI args appended to the opencode command
-- env (object, optional): KEY=VALUE environment variables; overrides inherited vars from the Deployment
+- env (object, optional): KEY=VALUE environment variables; overrides inherited vars from the Deployment. Credential-shaped literal values are staged in a per-run Kubernetes Secret; do not place raw provider credentials in source or comments.
 
 Kubernetes fields:
 - namespace (string, optional): namespace for Jobs; defaults to the Deployment namespace
 - image (string, optional): override container image; defaults to the running Deployment image
+- opencodeVersion (string, optional): exact opencode-ai version installed once onto the data PVC and used by Job pods; default 1.18.35; "image" runs the binary bundled in the container image
 - imagePullPolicy (string, optional): image pull policy; default "IfNotPresent"
 - kubeconfig (string, optional): absolute path to a kubeconfig file on disk; defaults to in-cluster service account auth
 - resources (object, optional): { requests: { cpu, memory }, limits: { cpu, memory } }
@@ -55,12 +59,15 @@ Inherited from Deployment (no config needed):
 
 Notes:
 - Session resume works via the shared /paperclip PVC (HOME=/paperclip)
+- The OpenCode binary is adapter-managed: Job pods install the pinned version under <data PVC>/.local/lib/paperclip-k8s-runtimes/opencode/<version> on first use and fall back to the image's bundled binary if that install cannot complete
 - Skills configured in Paperclip have their markdown content read from the PVC and prepended to each run prompt
 - Desired skills are resolved from config (paperclipSkills / paperclipRuntimeSkills) at execute time
 - instructionsFilePath content is prepended before skill content, then before the task prompt
 - Prompts are delivered via a busybox init container writing to an emptyDir volume
 - Runtime config (permission.external_directory=allow) is written inside the Job container
 - OPENCODE_DISABLE_PROJECT_CONFIG=true is always set to prevent config file pollution
+- When agentCommand points at an external launcher, the launcher receives PENSTOCK_AGENT_COMMAND=opencode and PENSTOCK_PROVIDER=openai by default, and OpenCode's own auth files are left untouched.
+- The Caveman/Penstock launcher and Ponytail assets are not activated by this configuration alone. Verify executable/plugin availability and a non-production smoke run before fleet rollout.
 `;
 
 export { createServerAdapter } from "./server/index.js";

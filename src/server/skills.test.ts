@@ -44,7 +44,7 @@ describe("listOpenCodeSkills", () => {
 
   it("marks desired available skills as configured", async () => {
     mockedReadEntries.mockResolvedValue([
-      { key: "paperclip/skill-a", runtimeName: "skill-a", source: "/skills/skill-a", required: false },
+      { key: "paperclip/skill-a", runtimeName: "skill-a", source: "/skills/skill-a", required: false } as never,
     ]);
     mockedResolveDesired.mockReturnValue(["paperclip/skill-a"]);
 
@@ -57,13 +57,13 @@ describe("listOpenCodeSkills", () => {
 
   it("marks required skills with paperclip_required origin", async () => {
     mockedReadEntries.mockResolvedValue([
-      { key: "paperclip/core", runtimeName: "core", source: "/skills/core", required: true, requiredReason: "Bundled" },
+      { key: "paperclip/core", runtimeName: "core", source: "/skills/core", required: true, requiredReason: "Bundled" } as never,
     ]);
     mockedResolveDesired.mockReturnValue(["paperclip/core"]);
 
     const snapshot = await listOpenCodeSkills(ctx);
     expect(snapshot.entries[0].origin).toBe("paperclip_required");
-    expect(snapshot.entries[0].required).toBe(true);
+    expect((snapshot.entries[0] as { required?: boolean }).required).toBe(true);
   });
 
   it("adds warning for desired skill not in available entries", async () => {
@@ -91,7 +91,7 @@ describe("listOpenCodeSkills", () => {
 
   it("does not duplicate externally installed skills that match available entries", async () => {
     mockedReadEntries.mockResolvedValue([
-      { key: "paperclip/skill-a", runtimeName: "skill-a", source: "/skills/skill-a", required: false },
+      { key: "paperclip/skill-a", runtimeName: "skill-a", source: "/skills/skill-a", required: false } as never,
     ]);
     mockedReadInstalled.mockResolvedValue(
       new Map([["skill-a", { targetPath: "/paperclip/.claude/skills/skill-a", kind: "directory" }]]),
@@ -104,8 +104,8 @@ describe("listOpenCodeSkills", () => {
 
   it("sorts entries alphabetically by key", async () => {
     mockedReadEntries.mockResolvedValue([
-      { key: "paperclip/zebra", runtimeName: "zebra", source: "/skills/zebra", required: false },
-      { key: "paperclip/alpha", runtimeName: "alpha", source: "/skills/alpha", required: false },
+      { key: "paperclip/zebra", runtimeName: "zebra", source: "/skills/zebra", required: false } as never,
+      { key: "paperclip/alpha", runtimeName: "alpha", source: "/skills/alpha", required: false } as never,
     ]);
 
     const snapshot = await listOpenCodeSkills(ctx);
@@ -124,14 +124,14 @@ describe("syncOpenCodeSkills", () => {
 
   it("returns same snapshot as listOpenCodeSkills (ephemeral pass-through)", async () => {
     mockedReadEntries.mockResolvedValue([
-      { key: "paperclip/skill-a", runtimeName: "skill-a", source: "/skills/skill-a", required: false },
+      { key: "paperclip/skill-a", runtimeName: "skill-a", source: "/skills/skill-a", required: false } as never,
     ]);
     mockedResolveDesired.mockReturnValue(["paperclip/skill-a"]);
 
     const listResult = await listOpenCodeSkills(ctx);
     vi.clearAllMocks();
     mockedReadEntries.mockResolvedValue([
-      { key: "paperclip/skill-a", runtimeName: "skill-a", source: "/skills/skill-a", required: false },
+      { key: "paperclip/skill-a", runtimeName: "skill-a", source: "/skills/skill-a", required: false } as never,
     ]);
     mockedResolveDesired.mockReturnValue(["paperclip/skill-a"]);
     mockedReadInstalled.mockResolvedValue(new Map());

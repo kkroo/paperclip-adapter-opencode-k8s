@@ -12,6 +12,29 @@ import path from "node:path";
 
 const SKILLS_HOME = "/paperclip/.claude/skills";
 
+/**
+ * Forward-compat view of the skill contract: the host marks bundled-core
+ * skills as required ("Required by Paperclip") and renders the
+ * `paperclip_required` origin plus `required`/`requiredReason` on snapshot
+ * entries, but the published adapter-utils types do not declare any of it
+ * yet. Read the input flag and emit the output fields defensively so the
+ * adapter tracks the host feature without pinning an unpublished library.
+ */
+type RequiredAwareSkillEntry = {
+  required?: boolean;
+  requiredReason?: string | null;
+};
+
+type RequiredAwareAdapterSkillEntry = Omit<AdapterSkillEntry, "origin"> & {
+  origin?: AdapterSkillEntry["origin"] | "paperclip_required";
+  required?: boolean;
+  requiredReason?: string | null;
+};
+
+function skillEntryRequired(entry: unknown): RequiredAwareSkillEntry {
+  return (entry ?? {}) as RequiredAwareSkillEntry;
+}
+
 async function buildOpenCodeSkillSnapshot(
   config: Record<string, unknown>,
 ): Promise<AdapterSkillSnapshot> {
@@ -21,23 +44,26 @@ async function buildOpenCodeSkillSnapshot(
   const desiredSet = new Set(desiredSkills);
   const installed = await readInstalledSkillTargets(SKILLS_HOME);
 
-  const entries: AdapterSkillEntry[] = availableEntries.map((entry) => ({
-    key: entry.key,
-    runtimeName: entry.runtimeName,
-    desired: desiredSet.has(entry.key),
-    managed: true,
-    state: desiredSet.has(entry.key) ? "configured" : "available",
-    origin: entry.required ? "paperclip_required" : "company_managed",
-    originLabel: entry.required ? "Required by Paperclip" : "Managed by Paperclip",
-    readOnly: false,
-    sourcePath: entry.source,
-    targetPath: null,
-    detail: desiredSet.has(entry.key)
-      ? "Injected via prompt bundle into ephemeral K8s Job pods."
-      : null,
-    required: Boolean(entry.required),
-    requiredReason: entry.requiredReason ?? null,
-  }));
+  const entries: RequiredAwareAdapterSkillEntry[] = availableEntries.map((entry) => {
+    const { required, requiredReason } = skillEntryRequired(entry);
+    return {
+      key: entry.key,
+      runtimeName: entry.runtimeName,
+      desired: desiredSet.has(entry.key),
+      managed: true,
+      state: desiredSet.has(entry.key) ? "configured" : "available",
+      origin: required ? "paperclip_required" : "company_managed",
+      originLabel: required ? "Required by Paperclip" : "Managed by Paperclip",
+      readOnly: false,
+      sourcePath: entry.source,
+      targetPath: null,
+      detail: desiredSet.has(entry.key)
+        ? "Injected via prompt bundle into ephemeral K8s Job pods."
+        : null,
+      required: Boolean(required),
+      requiredReason: requiredReason ?? null,
+    };
+  });
 
   const warnings: string[] = [];
 
@@ -84,7 +110,10 @@ async function buildOpenCodeSkillSnapshot(
     supported: true,
     mode: "ephemeral",
     desiredSkills,
-    entries,
+    // Additive forward-compat fields (required/requiredReason, the
+    // paperclip_required origin) ride through until the published
+    // AdapterSkillEntry type declares them.
+    entries: entries as AdapterSkillEntry[],
     warnings,
   };
 }

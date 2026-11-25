@@ -1,8 +1,18 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { execute, ensureAgentDbPvc, tailPodLogFile, mergeEnvironmentConfig } from "./execute.js";
+import {
+  execute,
+  buildAgentDbIsolationSubPath,
+  ensureAgentDbPvc,
+  tailPodLogFile,
+  mergeEnvironmentConfig,
+  captureContainerLogTail,
+  resolveCompactThreshold,
+  resolveModelContextWindow,
+} from "./execute.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
 import { PassThrough } from "node:stream";
+import { createHash, randomBytes } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import { buildJobManifest, buildPodLogPath } from "./job-manifest.js";
 
@@ -60,13 +70,137 @@ vi.mock("./k8s-client.js", () => ({
   createPvc: vi.fn().mockResolvedValue({}),
 }));
 
-vi.mock("./job-manifest.js", () => ({
-  buildJobManifest: vi.fn(),
-  buildPodLogPath: vi.fn((companyId: string, agentId: string, runId: string) =>
-    `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/${runId}.pod.ndjson`
-  ),
-  LARGE_PROMPT_THRESHOLD_BYTES: 256 * 1024,
-}));
+vi.mock("./job-manifest.js", async () => {
+  const { createHash } = await import("node:crypto");
+  return {
+    buildJobManifest: vi.fn(),
+    sanitizeLabelValue: vi.fn((value: string) => value),
+    buildPodLogPath: vi.fn((companyId: string, agentId: string, runId: string) =>
+      `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/${runId}.pod.ndjson`
+    ),
+    readRunIsolationDescriptor: vi.fn((ctx: AdapterExecutionContext, config: Record<string, unknown> = {}) => {
+      const context = (ctx.context ?? {}) as Record<string, unknown>;
+      const runtimeRaw = (ctx.runtime as unknown as { isolation?: Record<string, unknown> | null }).isolation;
+      const raw = runtimeRaw ?? [
+        context.k8sRunIsolation,
+        context.runIsolation,
+        context.isolation,
+        config.k8sRunIsolation,
+        config.runIsolation,
+        config.isolation,
+      ].find((candidate): candidate is Record<string, unknown> => Boolean(candidate && typeof candidate === "object" && !Array.isArray(candidate)));
+      const mode = typeof raw?.isolationMode === "string" ? raw.isolationMode : raw?.mode;
+      const key = typeof raw?.isolationKey === "string" && raw.isolationKey.trim()
+        ? raw.isolationKey.trim()
+        : typeof raw?.key === "string" && raw.key.trim()
+          ? raw.key.trim()
+          : null;
+      if (mode !== "isolated" && mode !== "run" && mode !== "workspace") {
+        return {
+          mode: "shared",
+          source: runtimeRaw ? "runtime" : "shared",
+          key: null,
+          keyHash: null,
+          workspaceRoot: null,
+          homeRoot: null,
+          sessionRoot: null,
+          cacheRoot: null,
+          sessionScope: null,
+          storage: { workspace: "persistent", home: "persistent", session: "ephemeral", cache: "ephemeral" },
+        };
+      }
+      if (!key) {
+        if (!runtimeRaw) {
+          return {
+            mode: "shared",
+            source: "shared",
+            key: null,
+            keyHash: null,
+            workspaceRoot: null,
+            homeRoot: null,
+            sessionRoot: null,
+            cacheRoot: null,
+            sessionScope: null,
+            storage: { workspace: "persistent", home: "persistent", session: "ephemeral", cache: "ephemeral" },
+          };
+        }
+        throw new Error(`runtime ${String(mode)} isolation descriptor is incomplete`);
+      }
+      return {
+        mode,
+        source: runtimeRaw ? "runtime" : "legacy",
+        key,
+        keyHash: createHash("sha256").update(key).digest("hex").slice(0, 16),
+        workspaceRoot: typeof raw?.workspaceRoot === "string" ? raw.workspaceRoot : null,
+        homeRoot: typeof raw?.homeRoot === "string" ? raw.homeRoot : null,
+        sessionRoot: typeof raw?.sessionRoot === "string" ? raw.sessionRoot : null,
+        cacheRoot: typeof raw?.cacheRoot === "string" ? raw.cacheRoot : null,
+        sessionScope: typeof raw?.sessionScope === "string"
+          ? raw.sessionScope
+          : typeof (raw?.sessionScope as { isolationKey?: unknown } | undefined)?.isolationKey === "string"
+            ? (raw?.sessionScope as { isolationKey: string }).isolationKey
+            : key,
+        storage: raw?.storage ?? { workspace: "persistent", home: "persistent", session: "persistent", cache: "persistent" },
+      };
+    }),
+    LARGE_PROMPT_THRESHOLD_BYTES: 256 * 1024,
+  };
+});
+
+describe("resolveCompactThreshold", () => {
+  it("uses half of the declared 1M window for the GPT-6 family", () => {
+    for (const model of ["openai/gpt-6.2-sol", "openai/gpt-6.2-astra", "openai/gpt-6.1-sol", "openai/gpt-6-astra", "openai/gpt-6-sol", "openai/gpt-6-luna"]) {
+      expect(resolveModelContextWindow(model), model).toBe(1_048_576);
+      expect(resolveCompactThreshold(model, {}), model).toEqual({
+        threshold: 524_288,
+        contextWindow: 1_048_576,
+        source: "model",
+      });
+    }
+  });
+
+  it("uses half of the declared model window for gpt-5.6-sol", () => {
+    expect(resolveModelContextWindow("openai/gpt-5.6-sol")).toBe(1_048_576);
+    expect(resolveCompactThreshold("openai/gpt-5.6-sol", {})).toEqual({
+      threshold: 524_288,
+      contextWindow: 1_048_576,
+      source: "model",
+    });
+  });
+
+  it("uses half of the declared model window for gpt-5.5", () => {
+    expect(resolveModelContextWindow("openai/gpt-5.5")).toBe(1_048_576);
+    expect(resolveCompactThreshold("openai/gpt-5.5", {})).toEqual({
+      threshold: 524_288,
+      contextWindow: 1_048_576,
+      source: "model",
+    });
+  });
+
+  it("uses model-aware 128k thresholds for common compact-window models", () => {
+    expect(resolveCompactThreshold("openai/o4-mini", {})).toEqual({
+      threshold: 64_000,
+      contextWindow: 128_000,
+      source: "model",
+    });
+  });
+
+  it("allows an operator override", () => {
+    expect(resolveCompactThreshold("openai/gpt-5.5", { compactThreshold: 123_456 })).toEqual({
+      threshold: 123_456,
+      contextWindow: null,
+      source: "config",
+    });
+  });
+
+  it("keeps the historical fallback for unknown models", () => {
+    expect(resolveCompactThreshold("custom/model", {})).toEqual({
+      threshold: 90_000,
+      contextWindow: null,
+      source: "default",
+    });
+  });
+});
 
 // Prevent skill loading from reading real SKILL.md files during tests — the
 // real filesystem read delays timer registration and breaks fake-timer tests.
@@ -126,7 +260,33 @@ function makeCtx(configOverrides: Record<string, unknown> = {}, contextOverrides
       ...contextOverrides,
     },
     onLog: vi.fn().mockResolvedValue(undefined),
+    onExternalRuntimeLaunched: vi.fn().mockResolvedValue(undefined),
   } as unknown as AdapterExecutionContext;
+}
+
+function setRuntimeIsolation(
+  ctx: AdapterExecutionContext,
+  isolationKey: string,
+  mode: "run" | "workspace" = "workspace",
+) {
+  ctx.runtime = {
+    ...ctx.runtime,
+    isolation: {
+      isolationMode: mode,
+      isolationKey,
+      workspaceRoot: mode === "run" ? "/runtime-cache/run/workspace" : "/paperclip/workspace",
+      homeRoot: mode === "run" ? "/runtime-cache/run/home" : "/paperclip/isolation/home",
+      sessionRoot: mode === "run" ? "/runtime-cache/run/session" : "/paperclip/isolation/session",
+      cacheRoot: "/runtime-cache/run/cache",
+      storage: {
+        workspace: mode === "run" ? "ephemeral" : "persistent",
+        home: mode === "run" ? "ephemeral" : "persistent",
+        session: mode === "run" ? "ephemeral" : "persistent",
+        cache: "ephemeral",
+      },
+      sessionScope: { taskKey: "this-task-id", isolationKey },
+    },
+  } as unknown as AdapterExecutionContext["runtime"];
 }
 
 /**
@@ -160,6 +320,42 @@ function makeLogApiFromFsMock() {
       stream.end();
       return { abort: vi.fn() } as unknown as AbortController;
     }),
+  };
+}
+
+/**
+ * Log API mock whose stream stays OPEN until the returned `endLogStream()` is
+ * called. Models a long-running agent that keeps streaming stdout for the whole
+ * run — the shape that exposed BLO-22997, where the log-exit grace timer was
+ * armed at construction instead of on log-stream exit.
+ *
+ * `started` resolves once `.log()` has actually been invoked, so tests can
+ * advance fake timers only after the tail is really attached.
+ */
+function makeHeldOpenLogApi() {
+  let stream: import("node:stream").Writable | null = null;
+  let endRequested = false;
+  let signalStarted!: () => void;
+  const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+  const logApi = {
+    log: vi.fn(async (
+      _namespace: string,
+      _podName: string,
+      _container: string,
+      writable: import("node:stream").Writable,
+    ) => {
+      const payload = getMockPayload();
+      if (payload) writable.write(payload);
+      stream = writable;
+      if (endRequested) writable.end();
+      signalStarted();
+      return { abort: vi.fn() } as unknown as AbortController;
+    }),
+  };
+  return {
+    logApi,
+    started,
+    endLogStream: () => { endRequested = true; stream?.end(); },
   };
 }
 
@@ -231,6 +427,35 @@ function makeCoreApi(
   };
 }
 
+function isoHash(key: string): string {
+  return createHash("sha256").update(key).digest("hex").slice(0, 16);
+}
+
+function mockManifestWithSecrets(
+  envSecret: { name: string; namespace: string; data: Record<string, string> } | null = {
+    name: `${JOB_NAME}-env`,
+    namespace: NAMESPACE,
+    data: { OPENAI_API_KEY: "env-secret-value" },
+  },
+  mcpConfigSecret: { name: string; namespace: string; data: Record<string, string> } | null = {
+    name: `${JOB_NAME}-mcp`,
+    namespace: NAMESPACE,
+    data: { "opencode.json": '{"mcp":{"paperclip":{"type":"remote"}}}' },
+  },
+) {
+  vi.mocked(buildJobManifest).mockReturnValue({
+    job: MOCK_JOB as ReturnType<typeof buildJobManifest>["job"],
+    jobName: JOB_NAME,
+    namespace: NAMESPACE,
+    prompt: "Test prompt",
+    opencodeArgs: [],
+    promptMetrics: null,
+    podLogPath: `/paperclip/instances/default/data/run-logs/co-1/agent-id-test/run-test-123.pod.ndjson`,
+    envSecret,
+    mcpConfigSecret,
+  } as unknown as ReturnType<typeof buildJobManifest>);
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   resetFsMocks();
@@ -244,6 +469,8 @@ beforeEach(() => {
     opencodeArgs: [],
     promptMetrics: null,
     podLogPath: `/paperclip/instances/default/data/run-logs/co-1/agent-id-test/run-test-123.pod.ndjson`,
+    envSecret: null,
+    mcpConfigSecret: null,
   } as unknown as ReturnType<typeof buildJobManifest>);
 
   const batchApi = makeBatchApi();
@@ -267,6 +494,72 @@ beforeEach(() => {
   );
 });
 
+describe("execute — budget enforcement", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.PAPERCLIP_API_URL;
+  });
+
+  it("fails fast and pauses the agent before creating a Job when the current agent is over budget", async () => {
+    process.env.PAPERCLIP_API_URL = "http://test-api";
+
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === "http://test-api/api/agents/agent-id-test" && (!init?.method || init.method === "GET")) {
+        return {
+          ok: true,
+          json: async () => ({
+            id: "agent-id-test",
+            name: "Test Agent",
+            spentMonthlyCents: 22_385,
+            budgetMonthlyCents: 20_000,
+            pauseReason: null,
+            pausedAt: null,
+          }),
+        } as Response;
+      }
+      if (url === "http://test-api/api/agents/agent-id-test" && init?.method === "PATCH") {
+        return { ok: true, json: async () => ({}) } as Response;
+      }
+      if (url === "http://test-api/api/issues/issue-test-456/comments" && init?.method === "POST") {
+        return { ok: true, json: async () => ({}) } as Response;
+      }
+      throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const batchApi = makeBatchApi();
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const ctx = makeCtx({}, { issueId: "issue-test-456" }, "run-jwt-token");
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("budget_exceeded");
+    expect(result.exitCode).toBeNull();
+    expect(result.errorMessage).toContain("Budget exceeded");
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://test-api/api/agents/agent-id-test",
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer run-jwt-token" }) }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://test-api/api/agents/agent-id-test",
+      expect.objectContaining({
+        method: "PATCH",
+        headers: expect.objectContaining({ Authorization: "Bearer run-jwt-token" }),
+        body: expect.stringContaining("budget exceeded"),
+      }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://test-api/api/issues/issue-test-456/comments",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ Authorization: "Bearer run-jwt-token" }),
+        body: expect.stringContaining("$223.85 spent / $200.00 cap"),
+      }),
+    );
+  });
+});
+
 describe("execute — concurrency guard", () => {
   it("blocks when a running job already exists for the agent", async () => {
     const batchApi = makeBatchApi([
@@ -280,7 +573,7 @@ describe("execute — concurrency guard", () => {
     const ctx = makeCtx();
     const result = await execute(ctx);
 
-    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+    expect(result.errorCode, result.errorMessage ?? undefined).toBe("k8s_concurrent_run_blocked");
     expect(result.exitCode).toBeNull();
     expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
   });
@@ -335,6 +628,31 @@ describe("execute — concurrency guard", () => {
     expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
   });
 
+  it("fails closed when listNamespacedJob never settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const batchApi = makeBatchApi();
+      let markGuardStarted!: () => void;
+      const guardStarted = new Promise<void>((resolve) => { markGuardStarted = resolve; });
+      batchApi.listNamespacedJob.mockImplementation(() => {
+        markGuardStarted();
+        return new Promise(() => {});
+      });
+      vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+      const resultPromise = execute(makeCtx());
+      await guardStarted;
+      await vi.advanceTimersByTimeAsync(15_000);
+      const result = await resultPromise;
+
+      expect(result.errorCode).toBe("k8s_concurrency_guard_unreachable");
+      expect(result.errorMessage).toContain("timed out after 15s");
+      expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("blocks (k8s_concurrent_run_blocked) when a different-task job is running even with reattachOrphanedJobs=true", async () => {
     const batchApi = makeBatchApi([
       {
@@ -352,7 +670,79 @@ describe("execute — concurrency guard", () => {
     expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
   });
 
-  it("reattaches and streams logs when same-task orphaned Job exists and reattachOrphanedJobs=true", async () => {
+  it("allows concurrent isolated jobs when isolation keys differ", async () => {
+    const batchApi = makeBatchApi([
+      {
+        metadata: {
+          name: "other-isolated-job",
+          labels: {
+            "paperclip.io/task-id": "other-task-id",
+            "paperclip.io/isolation-mode": "isolated",
+            "paperclip.io/isolation-key-hash": isoHash("agent:other-task"),
+          },
+        },
+        status: { conditions: [] },
+      },
+    ]);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const ctx = makeCtx({}, { taskId: "this-task-id" });
+    setRuntimeIsolation(ctx, "agent:this-task");
+
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBeUndefined();
+    expect(batchApi.createNamespacedJob).toHaveBeenCalled();
+  });
+
+  it("blocks concurrent isolated jobs when isolation keys match", async () => {
+    const key = "agent:same-task";
+    const batchApi = makeBatchApi([
+      {
+        metadata: {
+          name: "same-isolation-job",
+          labels: {
+            "paperclip.io/task-id": "other-task-id",
+            "paperclip.io/isolation-mode": "isolated",
+            "paperclip.io/isolation-key-hash": isoHash(key),
+          },
+        },
+        status: { conditions: [] },
+      },
+    ]);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const ctx = makeCtx({}, { taskId: "this-task-id" });
+    setRuntimeIsolation(ctx, key);
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+  });
+
+  it("blocks in shared mode even when the existing job is isolated", async () => {
+    const batchApi = makeBatchApi([
+      {
+        metadata: {
+          name: "isolated-job",
+          labels: {
+            "paperclip.io/task-id": "other-task-id",
+            "paperclip.io/isolation-mode": "isolated",
+            "paperclip.io/isolation-key-hash": isoHash("agent:other-task"),
+          },
+        },
+        status: { conditions: [] },
+      },
+    ]);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+  });
+
+  it("blocks a distinct same-task Job instead of trusting task identity", async () => {
     const TASK_ID = "task-uuid-123";
     const ORPHAN_JOB = "orphaned-job-abc";
     const batchApi = makeBatchApi([
@@ -372,20 +762,121 @@ describe("execute — concurrency guard", () => {
     } as unknown as AdapterExecutionContext;
     const result = await execute(ctx);
 
-    // Should NOT create a new Job — reattached to the orphan
     expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
-    // Should have succeeded by reattaching
+    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+  });
+
+  it("reattaches to the exact persisted lifecycle Job without recreating its prompt Secret or Job", async () => {
+    const TASK_ID = "task-uuid-default";
+    const batchApi = makeBatchApi([
+      {
+        metadata: {
+          name: "current-job",
+          uid: "current-uid",
+          labels: { "paperclip.io/task-id": TASK_ID, "paperclip.io/run-id": "run-test-123" },
+        },
+        spec: {
+          template: {
+            spec: {
+              volumes: [
+                { name: "prompt-secret", secret: { secretName: "current-job-prompt" } },
+                { name: "mcp-config-secret", secret: { secretName: "current-job-mcp" } },
+              ],
+              containers: [
+                {
+                  name: "opencode",
+                  env: [
+                    {
+                      name: "OPENAI_API_KEY",
+                      valueFrom: { secretKeyRef: { name: "current-job-env", key: "OPENAI_API_KEY" } },
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+        },
+        status: { conditions: [] },
+      },
+    ]);
+    const coreApi = makeCoreApi();
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+    const onExternalRuntimeLaunched = vi.fn().mockResolvedValue(undefined);
+    const ctx = {
+      ...makeCtx(),
+      onExternalRuntimeLaunched,
+      externalRuntime: { reservationId: "reservation-1", slotId: 0, jobName: "current-job", jobUid: "current-uid" },
+      context: { taskId: TASK_ID, issueId: null, paperclipWorkspace: null, issueIds: null, paperclipWorkspaces: null, paperclipRuntimeServiceIntents: null, paperclipRuntimeServices: null },
+    } as unknown as AdapterExecutionContext;
+    const result = await execute(ctx);
+
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+    expect(coreApi.createNamespacedSecret).not.toHaveBeenCalled();
+    expect(coreApi.deleteNamespacedSecret).toHaveBeenCalledWith({
+      name: "current-job-prompt",
+      namespace: NAMESPACE,
+    });
+    expect(coreApi.deleteNamespacedSecret).toHaveBeenCalledWith({
+      name: "current-job-env",
+      namespace: NAMESPACE,
+    });
+    expect(coreApi.deleteNamespacedSecret).toHaveBeenCalledWith({
+      name: "current-job-mcp",
+      namespace: NAMESPACE,
+    });
+    expect(buildJobManifest).not.toHaveBeenCalled();
+    expect(onExternalRuntimeLaunched).not.toHaveBeenCalled();
+    expect(ctx.onLog).toHaveBeenCalledWith(
+      "stdout",
+      expect.stringContaining("Reattaching to persisted K8s Job current-job"),
+    );
     expect(result.exitCode).toBe(0);
     expect(result.sessionId).toBe("ses_happy");
   });
 
-  it("blocks (k8s_concurrent_run_blocked) when same-task orphaned Job exists but reattachOrphanedJobs=false", async () => {
+  it("reattaches when the exact persisted lifecycle Job completed before recovery", async () => {
+    const batchApi = makeBatchApi([
+      {
+        metadata: {
+          name: "current-job",
+          uid: "current-uid",
+          labels: { "paperclip.io/run-id": "run-test-123" },
+        },
+        status: { conditions: [{ type: "Complete", status: "True" }] },
+      },
+    ]);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const ctx = {
+      ...makeCtx(),
+      externalRuntime: { reservationId: "reservation-1", slotId: 0, jobName: "current-job", jobUid: "current-uid" },
+    } as unknown as AdapterExecutionContext;
+    const result = await execute(ctx);
+
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+    expect(buildJobManifest).not.toHaveBeenCalled();
+    expect(result.exitCode).toBe(0);
+    expect(result.sessionId).toBe("ses_happy");
+  });
+
+  it("blocks a second same-run Job when the exact current Job is present", async () => {
     const TASK_ID = "task-uuid-456";
     const batchApi = makeBatchApi([
       {
         metadata: {
-          name: "orphaned-job-xyz",
-          labels: { "paperclip.io/task-id": TASK_ID },
+          name: "current-job",
+          uid: "current-uid",
+          labels: { "paperclip.io/task-id": TASK_ID, "paperclip.io/run-id": "run-test-123" },
+        },
+        status: { conditions: [] },
+      },
+      {
+        metadata: {
+          name: "duplicate-job",
+          uid: "duplicate-uid",
+          labels: { "paperclip.io/task-id": TASK_ID, "paperclip.io/run-id": "run-test-123" },
         },
         status: { conditions: [] },
       },
@@ -393,13 +884,40 @@ describe("execute — concurrency guard", () => {
     vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
 
     const ctx = {
-      ...makeCtx({ reattachOrphanedJobs: false }),
+      ...makeCtx(),
+      externalRuntime: { reservationId: "reservation-1", slotId: 0, jobName: "current-job", jobUid: "current-uid" },
       context: { taskId: TASK_ID, issueId: null, paperclipWorkspace: null, issueIds: null, paperclipWorkspaces: null, paperclipRuntimeServiceIntents: null, paperclipRuntimeServices: null },
     } as unknown as AdapterExecutionContext;
     const result = await execute(ctx);
 
     expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
     expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+  });
+
+  it("blocks a deleting nonterminal Job because its pod may still be running", async () => {
+    const batchApi = makeBatchApi([{
+      metadata: { name: "deleting-job", deletionTimestamp: new Date() },
+      status: { conditions: [] },
+    }]);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+  });
+
+  it("does not block on a deleting Job that is already terminal failed", async () => {
+    const batchApi = makeBatchApi([{
+      metadata: { name: "deleting-failed-job", deletionTimestamp: new Date() },
+      status: { conditions: [{ type: "Failed", status: "True" }] },
+    }]);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorCode).toBeUndefined();
+    expect(batchApi.createNamespacedJob).toHaveBeenCalled();
   });
 });
 
@@ -669,6 +1187,67 @@ describe("execute — pod scheduling failure", () => {
       expect.stringContaining("Waiting for PVC/volume binding before scheduling"),
     );
   });
+
+  it("does not apply the scheduler timeout after the pod is already assigned", async () => {
+    const nowSpy = vi.spyOn(Date, "now")
+      .mockReturnValueOnce(0)
+      .mockReturnValue(121_000);
+    try {
+      const coreApi = makeCoreApi();
+      coreApi.listNamespacedPod = vi.fn()
+        .mockResolvedValueOnce({
+          items: [
+            {
+              metadata: { name: POD_NAME },
+              spec: { nodeName: "k8s-paperclip-3" },
+              status: {
+                phase: "Pending",
+                conditions: [{ type: "PodScheduled", status: "True" }],
+                initContainerStatuses: [
+                  { name: "write-prompt", state: { running: {} } },
+                ],
+                containerStatuses: [
+                  { name: "opencode", state: { waiting: { reason: "PodInitializing" } } },
+                ],
+              },
+            },
+          ],
+        })
+        .mockResolvedValueOnce({
+          items: [
+            {
+              metadata: { name: POD_NAME },
+              spec: { nodeName: "k8s-paperclip-3" },
+              status: { phase: "Running" },
+            },
+          ],
+        })
+        .mockResolvedValueOnce({
+          items: [
+            {
+              status: {
+                containerStatuses: [
+                  { name: "opencode", state: { terminated: { exitCode: 0 } } },
+                ],
+              },
+            },
+          ],
+        });
+      vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+      const ctx = makeCtx();
+      const result = await execute(ctx);
+
+      expect(result.errorCode).toBeUndefined();
+      expect(result.exitCode).toBe(0);
+      expect(ctx.onLog).toHaveBeenCalledWith(
+        "stdout",
+        expect.stringContaining("scheduled; waiting for containers to start"),
+      );
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
 });
 
 describe("execute — happy path", () => {
@@ -722,6 +1301,112 @@ describe("execute — happy path", () => {
       expect.objectContaining({ adapterType: "opencode_k8s" }),
     );
   });
+
+  it("acknowledges the created Job identity before continuing", async () => {
+    const onExternalRuntimeLaunched = vi.fn().mockResolvedValue(undefined);
+    const ctx = { ...makeCtx(), onExternalRuntimeLaunched } as unknown as AdapterExecutionContext;
+
+    await execute(ctx);
+
+    expect(onExternalRuntimeLaunched).toHaveBeenCalledWith({
+      jobName: JOB_NAME,
+      jobUid: "test-job-uid",
+    });
+  });
+
+  it("deletes the Job when launch identity cannot be acknowledged", async () => {
+    const batchApi = makeBatchApi();
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+    const ctx = {
+      ...makeCtx(),
+      onExternalRuntimeLaunched: vi.fn().mockRejectedValue(new Error("reservation released")),
+    } as unknown as AdapterExecutionContext;
+
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("k8s_job_identity_unacknowledged");
+    expect(batchApi.deleteNamespacedJob).toHaveBeenCalledWith(
+      expect.objectContaining({ name: JOB_NAME, namespace: NAMESPACE }),
+    );
+  });
+});
+
+describe("execute — per-run Secret lifecycle", () => {
+  it("creates env and MCP Secrets before the Job, patches both, and deletes both after success", async () => {
+    mockManifestWithSecrets();
+    const coreApi = makeCoreApi();
+    const batchApi = makeBatchApi();
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    await execute(makeCtx());
+
+    const createdNames = coreApi.createNamespacedSecret.mock.calls.map(
+      ([request]) => request.body.metadata?.name,
+    );
+    expect(createdNames).toEqual([`${JOB_NAME}-env`, `${JOB_NAME}-mcp`]);
+    for (const call of coreApi.createNamespacedSecret.mock.invocationCallOrder) {
+      expect(call).toBeLessThan(batchApi.createNamespacedJob.mock.invocationCallOrder[0]!);
+    }
+    expect(coreApi.patchNamespacedSecret).toHaveBeenCalledTimes(2);
+    expect(coreApi.patchNamespacedSecret.mock.calls.map(([request]) => request.name)).toEqual([
+      `${JOB_NAME}-env`,
+      `${JOB_NAME}-mcp`,
+    ]);
+    expect(coreApi.deleteNamespacedSecret.mock.calls.map(([request]) => request.name)).toEqual(
+      expect.arrayContaining([`${JOB_NAME}-env`, `${JOB_NAME}-mcp`]),
+    );
+  });
+
+  it("deletes every prepared Secret when Job creation fails", async () => {
+    mockManifestWithSecrets();
+    const batchApi = makeBatchApi();
+    batchApi.createNamespacedJob.mockRejectedValue(new Error("quota exceeded"));
+    const coreApi = makeCoreApi();
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+    expect(coreApi.deleteNamespacedSecret.mock.calls.map(([request]) => request.name)).toEqual(
+      expect.arrayContaining([`${JOB_NAME}-env`, `${JOB_NAME}-mcp`]),
+    );
+  });
+
+  it("deletes every prepared Secret when launch acknowledgement fails", async () => {
+    mockManifestWithSecrets();
+    const batchApi = makeBatchApi();
+    const coreApi = makeCoreApi();
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+    const ctx = {
+      ...makeCtx(),
+      onExternalRuntimeLaunched: vi.fn().mockRejectedValue(new Error("reservation released")),
+    } as unknown as AdapterExecutionContext;
+
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("k8s_job_identity_unacknowledged");
+    expect(coreApi.deleteNamespacedSecret.mock.calls.map(([request]) => request.name)).toEqual(
+      expect.arrayContaining([`${JOB_NAME}-env`, `${JOB_NAME}-mcp`]),
+    );
+  });
+
+  it("deletes per-run Secrets even when the Job is retained", async () => {
+    mockManifestWithSecrets();
+    const batchApi = makeBatchApi();
+    const coreApi = makeCoreApi();
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+    await execute(makeCtx({ retainJobs: true }));
+
+    expect(batchApi.deleteNamespacedJob).not.toHaveBeenCalled();
+    expect(coreApi.deleteNamespacedSecret.mock.calls.map(([request]) => request.name)).toEqual(
+      expect.arrayContaining([`${JOB_NAME}-env`, `${JOB_NAME}-mcp`]),
+    );
+  });
 });
 
 describe("execute — session unavailable (reattach classification)", () => {
@@ -759,6 +1444,39 @@ describe("execute — session unavailable (reattach classification)", () => {
   });
 });
 
+describe("execute — stream EOF transient classification", () => {
+  it("preserves session params and tags opencode JSON EOF as transient", async () => {
+    const eofJsonl = [
+      JSON.stringify({
+        type: "step_finish",
+        part: { reason: "end_turn", tokens: { input: 100, output: 25, cache: { read: 20 } } },
+        sessionID: "ses_stream_eof",
+      }),
+      JSON.stringify({
+        type: "error",
+        error: {
+          name: "UnknownError",
+          data: { message: "JSON Parse error: Unexpected EOF" },
+        },
+        sessionID: "ses_stream_eof",
+      }),
+    ].join("\n");
+    setMockJsonl(eofJsonl);
+    const coreApi = makeCoreApi(1);
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+    const ctx = makeCtx({}, { paperclipWorkspace: { cwd: "/workspace" } });
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("stream_eof_transient");
+    expect(result.errorMessage).toMatch(/stream truncated/i);
+    expect(result.sessionId).toBe("ses_stream_eof");
+    expect(result.sessionParams).toEqual({ sessionId: "ses_stream_eof", cwd: "/workspace" });
+    expect(result.sessionParams && "needsCompactBeforeNextRun" in result.sessionParams).toBe(false);
+    expect(result.clearSession).toBeUndefined();
+  });
+});
+
 describe("execute — timeout", () => {
   it("returns timedOut=true when job reports DeadlineExceeded", async () => {
     const batchApi = makeBatchApi();
@@ -766,12 +1484,115 @@ describe("execute — timeout", () => {
       status: { conditions: [{ type: "Failed", status: "True", reason: "DeadlineExceeded" }] },
     });
     vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+    vi.mocked(getCoreApi).mockReturnValue(
+      makeCoreApi(137, "DeadlineExceeded") as unknown as ReturnType<typeof getCoreApi>,
+    );
 
     const ctx = makeCtx({ timeoutSec: 300 });
     const result = await execute(ctx);
 
     expect(result.timedOut).toBe(true);
     expect(result.errorCode).toBe("timeout");
+  });
+
+  it("does not report timedOut when the pod has a confirmed successful exit", async () => {
+    const batchApi = makeBatchApi();
+    batchApi.readNamespacedJob.mockResolvedValue({
+      status: { conditions: [{ type: "Failed", status: "True", reason: "DeadlineExceeded" }] },
+    });
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+    vi.mocked(getCoreApi).mockReturnValue(
+      makeCoreApi(0) as unknown as ReturnType<typeof getCoreApi>,
+    );
+
+    const ctx = makeCtx({ timeoutSec: 300 });
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.timedOut).toBe(false);
+    expect(result.errorCode).toBeUndefined();
+    expect(ctx.onLog).toHaveBeenCalledWith(
+      "stderr",
+      expect.stringContaining("Ignoring inconsistent timeout marker"),
+    );
+  });
+
+  // Production shape of BLO-22997: run 90ac448e ran 6m23s under timeoutSec=3600,
+  // streamed logs the whole time, exited 0 — and was still reported as
+  // "Timed out after 3600s" because LOG_EXIT_COMPLETION_GRACE_MS armed a 30s
+  // deadline at construction rather than on log-stream exit.
+  it("does not report a timeout when a long-running job completes successfully after the log-exit grace window (BLO-22997)", async () => {
+    vi.useFakeTimers();
+    try {
+      let jobComplete = false;
+      const batchApi = makeBatchApi();
+      batchApi.readNamespacedJob.mockImplementation(async () => ({
+        status: { conditions: jobComplete ? [{ type: "Complete", status: "True" }] : [] },
+      }));
+      vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+      vi.mocked(getCoreApi).mockReturnValue(
+        makeCoreApi(0) as unknown as ReturnType<typeof getCoreApi>,
+      );
+
+      const { logApi, started, endLogStream } = makeHeldOpenLogApi();
+      vi.mocked(getLogApi).mockReturnValue(logApi as unknown as ReturnType<typeof getLogApi>);
+
+      const ctx = makeCtx({ timeoutSec: 3600 });
+      const executePromise = execute(ctx);
+      await started;
+
+      // Well past LOG_EXIT_COMPLETION_GRACE_MS (30s) with the log stream still
+      // open: the grace countdown must not have started yet.
+      await vi.advanceTimersByTimeAsync(90_000);
+
+      jobComplete = true;
+      endLogStream();
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      const result = await executePromise;
+
+      expect(result.exitCode).toBe(0);
+      expect(result.timedOut).toBe(false);
+      expect(result.errorCode).toBeUndefined();
+      expect(result.errorMessage ?? "").not.toMatch(/Timed out/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still reports timedOut when the configured wall-clock deadline is exceeded", async () => {
+    vi.useFakeTimers();
+    try {
+      // Job never reaches a terminal condition, so waitForJobCompletion's own
+      // deadline is what fires. Pod is SIGKILLed, so exitCode is non-zero and
+      // the exit-code-0 consistency guard correctly stays out of the way.
+      const batchApi = makeBatchApi();
+      batchApi.readNamespacedJob.mockResolvedValue({ status: { conditions: [] } });
+      vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+      vi.mocked(getCoreApi).mockReturnValue(
+        makeCoreApi(137, "DeadlineExceeded") as unknown as ReturnType<typeof getCoreApi>,
+      );
+
+      const { logApi, started, endLogStream } = makeHeldOpenLogApi();
+      vi.mocked(getLogApi).mockReturnValue(logApi as unknown as ReturnType<typeof getLogApi>);
+
+      // completionTimeoutMs = (timeoutSec + graceSec) * 1000 = 75s.
+      const ctx = makeCtx({ timeoutSec: 60, graceSec: 15 });
+      const executePromise = execute(ctx);
+      await started;
+
+      await vi.advanceTimersByTimeAsync(90_000);
+      endLogStream();
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      const result = await executePromise;
+
+      expect(result.timedOut).toBe(true);
+      expect(result.errorCode).toBe("timeout");
+      expect(result.errorMessage).toBe("Timed out after 60s");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -1097,17 +1918,19 @@ describe("execute — external cancel polling", () => {
 });
 
 describe("execute — large-prompt Secret path", () => {
-  const LARGE_PROMPT = "x".repeat(300 * 1024); // 300 KiB > 256 KiB threshold
+  const LARGE_PROMPT = "Project context 📄\n".repeat(64 * 1024);
 
-  function mockLargePrompt() {
+  function mockLargePrompt(prompt = LARGE_PROMPT) {
     vi.mocked(buildJobManifest).mockReturnValue({
       job: MOCK_JOB as ReturnType<typeof buildJobManifest>["job"],
       jobName: JOB_NAME,
       namespace: NAMESPACE,
-      prompt: LARGE_PROMPT,
+      prompt,
       opencodeArgs: [],
       promptMetrics: null,
       podLogPath: `/paperclip/instances/default/data/run-logs/co-1/agent-id-test/run-test-123.pod.ndjson`,
+      envSecret: null,
+      mcpConfigSecret: null,
     } as unknown as ReturnType<typeof buildJobManifest>);
   }
 
@@ -1122,8 +1945,9 @@ describe("execute — large-prompt Secret path", () => {
     expect(secondCall.promptSecretName).toBe(`${JOB_NAME}-prompt`);
   });
 
-  it("creates a Secret with the prompt content before creating the Job", async () => {
+  it("fits a prompt over 1 MiB into a Secret before creating the Job", async () => {
     mockLargePrompt();
+    expect(Buffer.byteLength(LARGE_PROMPT)).toBeGreaterThan(1024 * 1024);
     const coreApi = makeCoreApi();
     vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
     const batchApi = makeBatchApi();
@@ -1137,16 +1961,34 @@ describe("execute — large-prompt Secret path", () => {
         namespace: NAMESPACE,
         body: expect.objectContaining({
           metadata: expect.objectContaining({ name: `${JOB_NAME}-prompt` }),
-          stringData: expect.objectContaining({ "prompt.gz.b64": expect.any(String) }),
+          data: { "prompt.gz": expect.any(String) },
         }),
       }),
     );
-    const secret = vi.mocked(coreApi.createNamespacedSecret).mock.calls[0][0].body;
-    expect(gunzipSync(Buffer.from(secret.stringData!["prompt.gz.b64"], "base64")).toString()).toBe(LARGE_PROMPT);
+    const secret = coreApi.createNamespacedSecret.mock.calls[0][0].body;
+    const compressed = Buffer.from(secret.data["prompt.gz"], "base64");
+    expect(compressed.byteLength).toBeLessThanOrEqual(1024 * 1024);
+    expect(gunzipSync(compressed).toString("utf8")).toBe(LARGE_PROMPT);
     // Secret must be created before Job
     const secretOrder = coreApi.createNamespacedSecret.mock.invocationCallOrder[0];
     const jobOrder = batchApi.createNamespacedJob.mock.invocationCallOrder[0];
     expect(secretOrder).toBeLessThan(jobOrder);
+  });
+
+  it("reports the size limit before creating a Secret or Job when compression is insufficient", async () => {
+    mockLargePrompt(randomBytes(1536 * 1024).toString("base64"));
+    const coreApi = makeCoreApi();
+    const batchApi = makeBatchApi();
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+    expect(result.errorMessage).toContain("exceeds the Kubernetes Secret limit of 1048576 bytes");
+    expect(coreApi.createNamespacedSecret).not.toHaveBeenCalled();
+    expect(coreApi.deleteNamespacedSecret).not.toHaveBeenCalled();
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
   });
 
   it("patches the Secret with a Job ownerReference after Job creation", async () => {
@@ -1301,11 +2143,11 @@ describe("ensureAgentDbPvc — unit", () => {
     expect(vi.mocked(createPvc)).not.toHaveBeenCalled();
   });
 
-  it("defaults to dedicated_pvc when agentDbMode is not set", async () => {
-    vi.mocked(getPvc).mockResolvedValueOnce({ metadata: { name: EXPECTED_PVC_NAME } } as Awaited<ReturnType<typeof getPvc>>);
-
+  it("defaults to workspace_subpath when agentDbMode is not set (no dedicated PVC provisioned)", async () => {
     const result = await ensureAgentDbPvc(AGENT_ID, NAMESPACE, {});
-    expect(result).toBe(EXPECTED_PVC_NAME);
+    expect(result).toBeNull();
+    expect(vi.mocked(getPvc)).not.toHaveBeenCalled();
+    expect(vi.mocked(createPvc)).not.toHaveBeenCalled();
   });
 
   it("derives PVC name from agent ID, keeping alphanumeric and hyphens", async () => {
@@ -1403,7 +2245,7 @@ describe("completionWithGrace", () => {
     expect(result).toEqual({ succeeded: true, timedOut: false, jobGone: false });
   });
 
-  it("returns timedOut result when grace expires first", async () => {
+  it("returns outcome unknown, not timedOut, when log-exit grace expires first", async () => {
     const { completionWithGrace } = await import("./execute.js");
     vi.useFakeTimers();
     try {
@@ -1411,16 +2253,75 @@ describe("completionWithGrace", () => {
       const racePromise = completionWithGrace(slowCompletion, 50);
       await vi.advanceTimersByTimeAsync(60);
       const result = await racePromise;
-      expect(result).toEqual({ succeeded: false, timedOut: true, jobGone: false });
+      expect(result).toEqual({ succeeded: false, timedOut: false, jobGone: false });
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("returns timedOut result when completion promise rejects", async () => {
+  it("does not start the grace timer until the log stream exits", async () => {
     const { completionWithGrace } = await import("./execute.js");
-    const result = await completionWithGrace(Promise.reject(new Error("boom")), 1000);
-    expect(result).toEqual({ succeeded: false, timedOut: true, jobGone: false });
+    vi.useFakeTimers();
+    try {
+      const slowCompletion = new Promise<{ succeeded: boolean; timedOut: boolean; jobGone: boolean }>(() => {});
+      let finishLogStream!: () => void;
+      const logStream = new Promise<void>((resolve) => {
+        finishLogStream = resolve;
+      });
+      const racePromise = completionWithGrace(slowCompletion, 50, logStream);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      const beforeLogExit = await Promise.race([
+        racePromise.then(() => "race-resolved" as const),
+        Promise.resolve("still-pending" as const),
+      ]);
+      expect(beforeLogExit).toBe("still-pending");
+
+      finishLogStream();
+      await vi.advanceTimersByTimeAsync(60);
+      await expect(racePromise).resolves.toEqual({
+        succeeded: false,
+        timedOut: false,
+        jobGone: false,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns a late successful completion instead of capping it, while the log stream is still open (BLO-22997)", async () => {
+    const { completionWithGrace } = await import("./execute.js");
+    vi.useFakeTimers();
+    try {
+      let finishCompletion!: (r: { succeeded: boolean; timedOut: boolean; jobGone: boolean }) => void;
+      const completion = new Promise<{ succeeded: boolean; timedOut: boolean; jobGone: boolean }>(
+        (resolve) => { finishCompletion = resolve; },
+      );
+      // Log stream never exits — the agent is still streaming stdout.
+      const logStream = new Promise<void>(() => {});
+      const graced = completionWithGrace(completion, 30_000, logStream);
+
+      // 6m23s, the real elapsed time of production run 90ac448e.
+      await vi.advanceTimersByTimeAsync(383_000);
+      finishCompletion({ succeeded: true, timedOut: false, jobGone: false });
+
+      await expect(graced).resolves.toEqual({ succeeded: true, timedOut: false, jobGone: false });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does NOT report a timeout when the completion promise rejects — a poll error is not a deadline (BLO-10448)", async () => {
+    const { completionWithGrace } = await import("./execute.js");
+    // With a grace cap configured: a rejected completion poll must surface as
+    // "outcome unknown" (timedOut:false), not a spurious deadline. The caller
+    // adjudicates via the pod's real exit code.
+    const withGrace = await completionWithGrace(Promise.reject(new Error("boom")), 1000);
+    expect(withGrace).toEqual({ succeeded: false, timedOut: false, jobGone: false });
+    // And in the no-timeout-configured branch (graceMs <= 0) — this is the path
+    // that produced the bogus "Timed out after 0s" for timeoutSec:0 agents.
+    const noGrace = await completionWithGrace(Promise.reject(new Error("boom")), 0);
+    expect(noGrace).toEqual({ succeeded: false, timedOut: false, jobGone: false });
   });
 
   it("does not apply grace cap when graceMs <= 0 (no timeout configured) — BLO-2436", async () => {
@@ -1452,7 +2353,107 @@ describe("completionWithGrace", () => {
   });
 });
 
+describe("waitForJobCompletion — transient read tolerance (BLO-10448)", () => {
+  it("rides out a transient read error and then observes completion", async () => {
+    const { waitForJobCompletion } = await import("./execute.js");
+    const readNamespacedJob = vi.fn()
+      .mockRejectedValueOnce(new Error("apiserver 500"))
+      .mockResolvedValueOnce({ status: { conditions: [{ type: "Complete", status: "True" }] } });
+    vi.mocked(getBatchApi).mockReturnValue(
+      { readNamespacedJob } as unknown as ReturnType<typeof getBatchApi>,
+    );
+    vi.useFakeTimers();
+    try {
+      const p = waitForJobCompletion(NAMESPACE, JOB_NAME, 0);
+      await vi.advanceTimersByTimeAsync(2000);
+      const result = await p;
+      expect(result).toEqual({ succeeded: true, timedOut: false, jobGone: false });
+      expect(readNamespacedJob).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("gives up by throwing (NOT masquerading as a timeout) after sustained read errors", async () => {
+    const { waitForJobCompletion } = await import("./execute.js");
+    const readNamespacedJob = vi.fn().mockRejectedValue(new Error("apiserver down"));
+    vi.mocked(getBatchApi).mockReturnValue(
+      { readNamespacedJob } as unknown as ReturnType<typeof getBatchApi>,
+    );
+    vi.useFakeTimers();
+    try {
+      const p = waitForJobCompletion(NAMESPACE, JOB_NAME, 0);
+      const expectation = expect(p).rejects.toThrow("apiserver down");
+      await vi.advanceTimersByTimeAsync(2000 * 5);
+      await expectation;
+      // MAX_CONSECUTIVE_READ_ERRORS reads, then it throws — the caller surfaces a
+      // truthful k8s error instead of a bogus "Timed out after 0s".
+      expect(readNamespacedJob).toHaveBeenCalledTimes(5);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("execute — config edge paths", () => {
+  it("builds a stable workspace-keyed OpenCode DB subpath", () => {
+    expect(buildAgentDbIsolationSubPath("co-1", "agent-1", "abc123")).toBe(
+      ".opencode-db/co-1/agent-1/isolation/abc123",
+    );
+  });
+
+  it("uses an ephemeral opencode DB for default workspace_subpath no-task runs", async () => {
+    const ctx = makeCtx({ agentDbMode: "workspace_subpath" });
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBeUndefined();
+    const buildArgs = vi.mocked(buildJobManifest).mock.calls[0][0];
+    expect(buildArgs.agentDbClaimName).toBeNull();
+    expect(buildArgs.agentDbWorkspaceSubPath).toBeUndefined();
+    expect(vi.mocked(getPvc)).not.toHaveBeenCalled();
+  });
+
+  it("keeps issue-scoped workspace_subpath opencode DB persistence", async () => {
+    const ctx = makeCtx({ agentDbMode: "workspace_subpath" });
+    (ctx.runtime as { taskKey: string | null }).taskKey = "BLO-11715";
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBeUndefined();
+    const buildArgs = vi.mocked(buildJobManifest).mock.calls[0][0];
+    expect(buildArgs.agentDbWorkspaceSubPath).toBe(".opencode-db/co-1/agent-id-test/blo-11715");
+    expect(buildArgs.agentDbClaimName).toBeUndefined();
+    expect(vi.mocked(getPvc)).not.toHaveBeenCalled();
+  });
+
+  it("forces stateless run isolation onto an ephemeral OpenCode DB", async () => {
+    const ctx = makeCtx({ agentDbMode: "dedicated_pvc", agentDbStorageClass: "fast" });
+    (ctx.runtime as { taskKey: string | null }).taskKey = "pr-review-42";
+    setRuntimeIsolation(ctx, "run:run-test-123", "run");
+
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBeUndefined();
+    const buildArgs = vi.mocked(buildJobManifest).mock.calls[0][0];
+    expect(buildArgs.agentDbClaimName).toBeNull();
+    expect(buildArgs.agentDbWorkspaceSubPath).toBeUndefined();
+    expect(vi.mocked(getPvc)).not.toHaveBeenCalled();
+  });
+
+  it("keys durable OpenCode DB persistence by workspace isolation", async () => {
+    const isolationKey = "workspace:workspace-1";
+    const ctx = makeCtx({ agentDbMode: "workspace_subpath" });
+    setRuntimeIsolation(ctx, isolationKey, "workspace");
+
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBeUndefined();
+    const buildArgs = vi.mocked(buildJobManifest).mock.calls[0][0];
+    expect(buildArgs.agentDbWorkspaceSubPath).toBe(
+      `.opencode-db/co-1/agent-id-test/isolation/${isoHash(isolationKey)}`,
+    );
+    expect(buildArgs.agentDbClaimName).toBeUndefined();
+  });
+
   it("logs a warning but continues when instructionsFilePath cannot be read", async () => {
     const ctx = makeCtx({ instructionsFilePath: "/does/not/exist/AGENTS.md" });
     const result = await execute(ctx);
@@ -1495,6 +2496,8 @@ describe("execute — large-prompt Secret create failure", () => {
       opencodeArgs: [],
       promptMetrics: null,
       podLogPath: `/paperclip/instances/default/data/run-logs/co-1/agent-id-test/run-test-123.pod.ndjson`,
+      envSecret: null,
+      mcpConfigSecret: null,
     } as unknown as ReturnType<typeof buildJobManifest>);
 
     const coreApi = makeCoreApi();
@@ -1732,10 +2735,25 @@ describe("execute — SIGTERM handler body (FAR-86 coverage)", () => {
         opencodeArgs: [],
         promptMetrics: null,
         podLogPath: `/paperclip/instances/default/data/run-logs/co-1/agent-id-test/run-test-123.pod.ndjson`,
+        envSecret: { name: "fresh-job-env", namespace: NAMESPACE, data: { OPENAI_API_KEY: "env-secret" } },
+        mcpConfigSecret: {
+          name: "fresh-job-mcp",
+          namespace: NAMESPACE,
+          data: { "opencode.json": '{"mcp":{"private":{"headers":{"Authorization":"Bearer secret"}}}}' },
+        },
       }),
       buildPodLogPath: vi.fn((companyId: string, agentId: string, runId: string) =>
         `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/${runId}.pod.ndjson`
       ),
+      readRunIsolationDescriptor: vi.fn(() => ({
+        mode: "shared",
+        key: null,
+        keyHash: null,
+        workspaceRoot: null,
+        homeRoot: null,
+        cacheRoot: null,
+        sessionScope: null,
+      })),
       LARGE_PROMPT_THRESHOLD_BYTES: 256 * 1024,
     }));
 
@@ -1763,6 +2781,14 @@ describe("execute — SIGTERM handler body (FAR-86 coverage)", () => {
     // Wait long enough for the async handler body to settle
     await new Promise((r) => setTimeout(r, 50));
     expect(batchApi.deleteNamespacedJob).toHaveBeenCalled();
+    expect(coreApi.deleteNamespacedSecret).toHaveBeenCalledWith({
+      name: "fresh-job-env",
+      namespace: NAMESPACE,
+    });
+    expect(coreApi.deleteNamespacedSecret).toHaveBeenCalledWith({
+      name: "fresh-job-mcp",
+      namespace: NAMESPACE,
+    });
     expect(exitSpy).toHaveBeenCalled();
 
     exitSpy.mockRestore();
@@ -1918,5 +2944,56 @@ describe("execute — environment.config (Phase E.2)", () => {
     // No executionTarget at all
     const result = await execute(ctx);
     expect(result.exitCode).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// captureContainerLogTail (BLO-10448 B): recover the failure cause when a pod
+// exits non-zero but the live follow-stream captured nothing, so the opaque
+// "Pod exited: Error (exit 1)" becomes self-explaining.
+// ---------------------------------------------------------------------------
+describe("captureContainerLogTail", () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  /** Log API mock that writes `payload` to the sink then ends, like Log.log. */
+  function logApiWithPayload(payload: string) {
+    return {
+      log: vi.fn(async (_ns: string, _pod: string, _c: string, stream: import("node:stream").Writable) => {
+        if (payload) stream.write(payload);
+        stream.end();
+        return { abort: vi.fn() } as unknown as AbortController;
+      }),
+    };
+  }
+
+  it("returns the container log tail (combined stdout+stderr) on a non-follow read", async () => {
+    vi.mocked(getLogApi).mockReturnValue(
+      logApiWithPayload("Traceback: boom\nfatal: config missing\n") as unknown as ReturnType<typeof getLogApi>,
+    );
+    const out = await captureContainerLogTail("ns", "pod-x", "opencode", { kubeconfigPath: "/kc" });
+    expect(out).toContain("fatal: config missing");
+    // non-follow read requested with a bounded tail
+    const logFn = vi.mocked(getLogApi).mock.results[0].value.log;
+    expect(logFn).toHaveBeenCalledWith("ns", "pod-x", "opencode", expect.anything(),
+      expect.objectContaining({ follow: false, tailLines: 80, previous: false }));
+  });
+
+  it("passes previous:true through for the restarted-container retry", async () => {
+    vi.mocked(getLogApi).mockReturnValue(
+      logApiWithPayload("prev-instance crash\n") as unknown as ReturnType<typeof getLogApi>,
+    );
+    const out = await captureContainerLogTail("ns", "pod-x", "opencode", { previous: true });
+    expect(out).toBe("prev-instance crash");
+    const logFn = vi.mocked(getLogApi).mock.results[0].value.log;
+    expect(logFn).toHaveBeenCalledWith("ns", "pod-x", "opencode", expect.anything(),
+      expect.objectContaining({ previous: true }));
+  });
+
+  it("is best-effort: returns '' when the log API throws (never masks the failure)", async () => {
+    vi.mocked(getLogApi).mockReturnValue({
+      log: vi.fn(async () => { throw new Error("logs unavailable"); }),
+    } as unknown as ReturnType<typeof getLogApi>);
+    await expect(captureContainerLogTail("ns", "pod-x", "opencode")).resolves.toBe("");
   });
 });
