@@ -1900,18 +1900,32 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const firstBuild = buildJobManifest(buildArgs);
   const { jobName, namespace, prompt, opencodeArgs, promptMetrics, podLogPath } = firstBuild;
 
-  // For prompts larger than the threshold, store in a K8s Secret
+  // Older hosts still use the environment or a prompt Secret.
+  const { stageRuntimePrompt } = ctx as AdapterExecutionContext & {
+    stageRuntimePrompt?: (prompt: string) => Promise<string>;
+  };
   let promptSecretName: string | undefined;
-  let job = firstBuild.job;
-  let envSecret = firstBuild.envSecret ?? null;
-  let mcpConfigSecret = firstBuild.mcpConfigSecret ?? null;
-  if (Buffer.byteLength(prompt, "utf-8") > LARGE_PROMPT_THRESHOLD_BYTES) {
+  let built = firstBuild;
+  if (stageRuntimePrompt) {
+    try {
+      const runtimePromptPath = await stageRuntimePrompt(prompt);
+      if (!runtimePromptPath) throw new Error("Missing runtime prompt path");
+      built = buildJobManifest({ ...buildArgs, runtimePromptPath });
+    } catch {
+      await onLog("stderr", "[paperclip] Failed to prepare the runtime prompt download\n");
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        errorMessage: "Failed to prepare the runtime prompt download",
+        errorCode: "k8s_job_create_failed",
+      };
+    }
+  } else if (Buffer.byteLength(prompt, "utf-8") > LARGE_PROMPT_THRESHOLD_BYTES) {
     promptSecretName = `${jobName}-prompt`;
-    const rebuilt = buildJobManifest({ ...buildArgs, promptSecretName });
-    job = rebuilt.job;
-    envSecret = rebuilt.envSecret ?? null;
-    mcpConfigSecret = rebuilt.mcpConfigSecret ?? null;
+    built = buildJobManifest({ ...buildArgs, promptSecretName });
   }
+  const { job, envSecret, mcpConfigSecret } = built;
 
   if (onMeta) {
     await onMeta({

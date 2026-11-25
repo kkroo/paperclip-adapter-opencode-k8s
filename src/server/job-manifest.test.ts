@@ -1,4 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
+import { execFile } from "node:child_process";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import {
   buildJobManifest,
   findServerOnlyEnvVarsInPodSpec,
@@ -1192,6 +1198,90 @@ describe("buildJobManifest — env wiring branches", () => {
 });
 
 describe("buildJobManifest — volume wiring branches", () => {
+  it("downloads the run prompt with a Secret-backed token and keeps the body out of the Job", () => {
+    const ctx = {
+      ...mockCtx,
+      authToken: "signed-run-token",
+      config: {
+        promptTemplate: "private rendered prompt",
+        env: { PAPERCLIP_API_URL: "https://agent-override.invalid", PAPERCLIP_API_KEY: "agent-override" },
+      },
+    };
+    const selfPod = { ...mockSelfPod, inheritedEnv: { PAPERCLIP_API_URL: "https://paperclip.example/paperclip/" } };
+    const result = buildJobManifest({
+      ctx,
+      selfPod,
+      runtimePromptPath: "/api/heartbeat-runs/run123456/runtime-prompt",
+    });
+    const pod = result.job.spec?.template.spec;
+    const init = pod?.initContainers?.[0];
+    expect(init?.image).toBe(selfPod.image);
+    expect(init?.env).toContainEqual({
+      name: "PAPERCLIP_RUNTIME_PROMPT_URL",
+      value: "https://paperclip.example/paperclip/api/heartbeat-runs/run123456/runtime-prompt",
+    });
+    expect(init?.env).toContainEqual({
+      name: "PAPERCLIP_RUNTIME_PROMPT_TOKEN",
+      valueFrom: {
+        secretKeyRef: { name: result.envSecret?.name, key: "PAPERCLIP_RUNTIME_PROMPT_TOKEN" },
+      },
+    });
+    expect(result.envSecret?.data.PAPERCLIP_RUNTIME_PROMPT_TOKEN).toBe("signed-run-token");
+    expect(pod?.volumes?.find((volume) => volume.name === "prompt-secret")).toBeUndefined();
+    expect(JSON.stringify(pod)).not.toContain("signed-run-token");
+    expect(JSON.stringify(pod)).not.toContain("private rendered prompt");
+  });
+
+  it("refuses to forward the signed token outside the Paperclip API origin", () => {
+    const ctx = { ...mockCtx, authToken: "signed-run-token" };
+    const selfPod = { ...mockSelfPod, inheritedEnv: { PAPERCLIP_API_URL: "https://paperclip.example" } };
+    expect(() => buildJobManifest({
+      ctx,
+      selfPod,
+      runtimePromptPath: "//other.example/api/heartbeat-runs/run123456/runtime-prompt",
+    })).toThrow("requires the Paperclip API origin and a run token");
+  });
+
+  it("streams a runtime prompt over 1 MiB into the init container file", async () => {
+    const prompt = "Project context 📄\n".repeat(64 * 1024);
+    const dir = await mkdtemp(join(tmpdir(), "opencode-runtime-prompt-"));
+    const server = createServer((req, res) => {
+      if (req.headers.authorization !== "Bearer signed-run-token" ||
+          req.url !== "/api/heartbeat-runs/run123456/runtime-prompt") {
+        res.writeHead(403).end();
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" }).end(prompt);
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject).listen(0, "127.0.0.1", resolve);
+      });
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Missing test server address");
+      const result = buildJobManifest({
+        ctx: { ...mockCtx, authToken: "signed-run-token" },
+        selfPod: { ...mockSelfPod, inheritedEnv: { PAPERCLIP_API_URL: `http://127.0.0.1:${address.port}` } },
+        runtimePromptPath: "/api/heartbeat-runs/run123456/runtime-prompt",
+      });
+      const init = result.job.spec!.template.spec!.initContainers![0];
+      const url = init.env!.find((entry) => entry.name === "PAPERCLIP_RUNTIME_PROMPT_URL")!.value!;
+      const promptFile = join(dir, "prompt.txt");
+      const command = init.command![2].replace("/tmp/prompt/prompt.txt", promptFile);
+      await promisify(execFile)("sh", ["-c", command], {
+        env: {
+          ...process.env,
+          PAPERCLIP_RUNTIME_PROMPT_URL: url,
+          PAPERCLIP_RUNTIME_PROMPT_TOKEN: result.envSecret!.data.PAPERCLIP_RUNTIME_PROMPT_TOKEN,
+        },
+      });
+      expect(await readFile(promptFile, "utf8")).toBe(prompt);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("mounts and decompresses the prompt Secret in the init container", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, promptSecretName: "prompt-x" });
     const volumes = result.job.spec?.template.spec?.volumes ?? [];

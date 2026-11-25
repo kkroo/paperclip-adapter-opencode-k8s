@@ -1975,6 +1975,38 @@ describe("execute — large-prompt Secret path", () => {
     expect(secretOrder).toBeLessThan(jobOrder);
   });
 
+  it("stages the rendered prompt through the host before creating a Job without a prompt Secret", async () => {
+    mockLargePrompt();
+    const stageRuntimePrompt = vi.fn().mockResolvedValue("/api/heartbeat-runs/run-test-123/runtime-prompt");
+    const coreApi = makeCoreApi();
+    const batchApi = makeBatchApi();
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    await execute({ ...makeCtx(), stageRuntimePrompt } as AdapterExecutionContext);
+
+    expect(stageRuntimePrompt).toHaveBeenCalledExactlyOnceWith(LARGE_PROMPT);
+    expect(vi.mocked(buildJobManifest).mock.calls[1][0]).toMatchObject({
+      runtimePromptPath: "/api/heartbeat-runs/run-test-123/runtime-prompt",
+    });
+    expect(coreApi.createNamespacedSecret).not.toHaveBeenCalled();
+    expect(stageRuntimePrompt.mock.invocationCallOrder[0]).toBeLessThan(
+      batchApi.createNamespacedJob.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("stops before creating a Job if the host refuses to stage the prompt", async () => {
+    mockLargePrompt();
+    const stageRuntimePrompt = vi.fn().mockRejectedValue(new Error("private prompt"));
+    const ctx = makeCtx();
+    const result = await execute({ ...ctx, stageRuntimePrompt } as AdapterExecutionContext);
+
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+    expect(result.errorMessage).toBe("Failed to prepare the runtime prompt download");
+    expect(getBatchApi().createNamespacedJob).not.toHaveBeenCalled();
+    expect(getCoreApi().createNamespacedSecret).not.toHaveBeenCalled();
+  });
+
   it("reports the size limit before creating a Secret or Job when compression is insufficient", async () => {
     mockLargePrompt(randomBytes(1536 * 1024).toString("base64"));
     const coreApi = makeCoreApi();
