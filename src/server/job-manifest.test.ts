@@ -1232,13 +1232,17 @@ describe("buildJobManifest — volume wiring branches", () => {
     expect(JSON.stringify(pod)).not.toContain("private rendered prompt");
   });
 
-  it("refuses to forward the signed token outside the Paperclip API origin", () => {
+  it.each([
+    "//other.example/api/heartbeat-runs/run123456/runtime-prompt",
+    "/api/heartbeat-runs/different-run/runtime-prompt",
+    "/api/heartbeat-runs/run123456/runtime-prompt?extra=1",
+  ])("refuses to forward the signed token to %s", (runtimePromptPath) => {
     const ctx = { ...mockCtx, authToken: "signed-run-token" };
     const selfPod = { ...mockSelfPod, inheritedEnv: { PAPERCLIP_API_URL: "https://paperclip.example" } };
     expect(() => buildJobManifest({
       ctx,
       selfPod,
-      runtimePromptPath: "//other.example/api/heartbeat-runs/run123456/runtime-prompt",
+      runtimePromptPath,
     })).toThrow("requires the Paperclip API origin and a run token");
   });
 
@@ -1267,8 +1271,9 @@ describe("buildJobManifest — volume wiring branches", () => {
       const init = result.job.spec!.template.spec!.initContainers![0];
       const url = init.env!.find((entry) => entry.name === "PAPERCLIP_RUNTIME_PROMPT_URL")!.value!;
       const promptFile = join(dir, "prompt.txt");
-      const command = init.command![2].replace("/tmp/prompt/prompt.txt", promptFile);
-      await promisify(execFile)("sh", ["-c", command], {
+      const args = init.command!.slice(1).map((arg) => arg.replace("/tmp/prompt/prompt.txt", promptFile));
+      expect(init.command![0]).toBe("node");
+      await promisify(execFile)(process.execPath, args, {
         env: {
           ...process.env,
           PAPERCLIP_RUNTIME_PROMPT_URL: url,

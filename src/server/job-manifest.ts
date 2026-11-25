@@ -109,11 +109,16 @@ export const LARGE_PROMPT_THRESHOLD_BYTES = 100 * 1024;
 
 const RUNTIME_PROMPT_TOKEN = "PAPERCLIP_RUNTIME_PROMPT_TOKEN";
 const DOWNLOAD_RUNTIME_PROMPT = `
-const { createWriteStream } = require("node:fs");
+const { copyFileSync, createWriteStream, rmSync } = require("node:fs");
 const { Readable } = require("node:stream");
+const { Transform } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
 const { setTimeout: delay } = require("node:timers/promises");
+if (process.argv[1] === "copy-mcp") {
+  copyFileSync("/tmp/mcp-secret/opencode.json", "/tmp/prompt/opencode.json");
+}
 async function download() {
+  const maxBytes = 16 * 1024 * 1024;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const response = await fetch(process.env.PAPERCLIP_RUNTIME_PROMPT_URL, {
@@ -136,12 +141,19 @@ async function download() {
         process.exitCode = 1;
         return;
       }
-      await pipeline(
-        Readable.fromWeb(response.body),
-        createWriteStream("/tmp/prompt/prompt.txt", { mode: 0o600 }),
-      );
+      const contentLength = Number(response.headers.get("content-length") || 0);
+      if (contentLength > maxBytes) throw new Error("Prompt response exceeds the runtime limit");
+      let bytes = 0;
+      const bounded = new Transform({
+        transform(chunk, _encoding, callback) {
+          bytes += chunk.length;
+          callback(bytes > maxBytes ? new Error("Prompt response exceeds the runtime limit") : null, chunk);
+        },
+      });
+      await pipeline(Readable.fromWeb(response.body), bounded, createWriteStream("/tmp/prompt/prompt.txt", { mode: 0o600 }));
       return;
     } catch {
+      rmSync("/tmp/prompt/prompt.txt", { force: true });
       if (attempt < 2) await delay(1000 * (attempt + 1));
     }
   }
@@ -1131,12 +1143,12 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   let runtimePromptUrl: string | undefined;
   if (input.runtimePromptPath) {
     const base = new URL(selfPod.inheritedEnv.PAPERCLIP_API_URL || process.env.PAPERCLIP_API_URL || "");
-    const url = new URL(input.runtimePromptPath, base);
-    if (!["http:", "https:"].includes(url.protocol) || url.origin !== base.origin ||
-        url.username || url.password || !ctx.authToken) {
+    const expectedPath = `/api/heartbeat-runs/${encodeURIComponent(ctx.runId)}/runtime-prompt`;
+    if (input.runtimePromptPath !== expectedPath || !["http:", "https:"].includes(base.protocol) ||
+        base.username || base.password || !ctx.authToken) {
       throw new Error("Runtime prompt download requires the Paperclip API origin and a run token");
     }
-    url.pathname = base.pathname.replace(/\/+$/, "") + url.pathname;
+    const url = new URL(base.pathname.replace(/\/+$/, "") + expectedPath, base);
     runtimePromptUrl = url.href;
     builtEnv.sensitiveEnvData[RUNTIME_PROMPT_TOKEN] = ctx.authToken;
   }
@@ -1597,7 +1609,6 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
               const cmdParts: string[] = [];
               const initEnv: k8s.V1EnvVar[] = [];
               if (runtimePromptUrl) {
-                cmdParts.push(`node -e ${shellQuote(DOWNLOAD_RUNTIME_PROMPT)}`);
                 initEnv.push(
                   { name: "PAPERCLIP_RUNTIME_PROMPT_URL", value: runtimePromptUrl },
                   { name: RUNTIME_PROMPT_TOKEN, valueFrom: { secretKeyRef: { name: envSecretName, key: RUNTIME_PROMPT_TOKEN } } },
@@ -1608,7 +1619,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
                 cmdParts.push(`printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt`);
                 initEnv.push({ name: "PROMPT_CONTENT", value: prompt });
               }
-              if (mcpConfigSecret) {
+              if (mcpConfigSecret && !runtimePromptUrl) {
                 cmdParts.push("cp /tmp/mcp-secret/opencode.json /tmp/prompt/opencode.json");
               }
               const initVolumeMounts: k8s.V1VolumeMount[] = [
@@ -1624,7 +1635,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
                 name: "write-prompt",
                 image: runtimePromptUrl ? selfPod.image : "busybox:1.36",
                 imagePullPolicy: "IfNotPresent",
-                command: ["sh", "-c", cmdParts.join(" && ")],
+                command: runtimePromptUrl
+                  ? ["node", "-e", DOWNLOAD_RUNTIME_PROMPT, ...(mcpConfigSecret ? ["copy-mcp"] : [])]
+                  : ["sh", "-c", cmdParts.join(" && ")],
                 ...(initEnv.length > 0 ? { env: initEnv } : {}),
                 volumeMounts: initVolumeMounts,
                 securityContext,
