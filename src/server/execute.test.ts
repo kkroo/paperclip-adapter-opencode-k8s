@@ -12,7 +12,8 @@ import {
 } from "./execute.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
 import { PassThrough } from "node:stream";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { gunzipSync } from "node:zlib";
 import { buildJobManifest, buildPodLogPath } from "./job-manifest.js";
 
 // Mock node:fs/promises so tailPodLogFile (used by execute()) reads a
@@ -1917,14 +1918,14 @@ describe("execute — external cancel polling", () => {
 });
 
 describe("execute — large-prompt Secret path", () => {
-  const LARGE_PROMPT = "x".repeat(300 * 1024); // 300 KiB > 256 KiB threshold
+  const LARGE_PROMPT = "Project context 📄\n".repeat(64 * 1024);
 
-  function mockLargePrompt() {
+  function mockLargePrompt(prompt = LARGE_PROMPT) {
     vi.mocked(buildJobManifest).mockReturnValue({
       job: MOCK_JOB as ReturnType<typeof buildJobManifest>["job"],
       jobName: JOB_NAME,
       namespace: NAMESPACE,
-      prompt: LARGE_PROMPT,
+      prompt,
       opencodeArgs: [],
       promptMetrics: null,
       podLogPath: `/paperclip/instances/default/data/run-logs/co-1/agent-id-test/run-test-123.pod.ndjson`,
@@ -1944,8 +1945,9 @@ describe("execute — large-prompt Secret path", () => {
     expect(secondCall.promptSecretName).toBe(`${JOB_NAME}-prompt`);
   });
 
-  it("creates a Secret with the prompt content before creating the Job", async () => {
+  it("fits a prompt over 1 MiB into a Secret before creating the Job", async () => {
     mockLargePrompt();
+    expect(Buffer.byteLength(LARGE_PROMPT)).toBeGreaterThan(1024 * 1024);
     const coreApi = makeCoreApi();
     vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
     const batchApi = makeBatchApi();
@@ -1959,14 +1961,66 @@ describe("execute — large-prompt Secret path", () => {
         namespace: NAMESPACE,
         body: expect.objectContaining({
           metadata: expect.objectContaining({ name: `${JOB_NAME}-prompt` }),
-          stringData: expect.objectContaining({ prompt: LARGE_PROMPT }),
+          data: { "prompt.gz": expect.any(String) },
         }),
       }),
     );
+    const secret = coreApi.createNamespacedSecret.mock.calls[0][0].body;
+    const compressed = Buffer.from(secret.data["prompt.gz"], "base64");
+    expect(compressed.byteLength).toBeLessThanOrEqual(1024 * 1024);
+    expect(gunzipSync(compressed).toString("utf8")).toBe(LARGE_PROMPT);
     // Secret must be created before Job
     const secretOrder = coreApi.createNamespacedSecret.mock.invocationCallOrder[0];
     const jobOrder = batchApi.createNamespacedJob.mock.invocationCallOrder[0];
     expect(secretOrder).toBeLessThan(jobOrder);
+  });
+
+  it("stages the rendered prompt through the host before creating a Job without a prompt Secret", async () => {
+    mockLargePrompt();
+    const stageRuntimePrompt = vi.fn().mockResolvedValue("/api/heartbeat-runs/run-test-123/runtime-prompt");
+    const coreApi = makeCoreApi();
+    const batchApi = makeBatchApi();
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    await execute({ ...makeCtx(), stageRuntimePrompt } as AdapterExecutionContext);
+
+    expect(stageRuntimePrompt).toHaveBeenCalledExactlyOnceWith(LARGE_PROMPT);
+    expect(vi.mocked(buildJobManifest).mock.calls[1][0]).toMatchObject({
+      runtimePromptPath: "/api/heartbeat-runs/run-test-123/runtime-prompt",
+    });
+    expect(coreApi.createNamespacedSecret).not.toHaveBeenCalled();
+    expect(stageRuntimePrompt.mock.invocationCallOrder[0]).toBeLessThan(
+      batchApi.createNamespacedJob.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("stops before creating a Job if the host refuses to stage the prompt", async () => {
+    mockLargePrompt();
+    const stageRuntimePrompt = vi.fn().mockRejectedValue(new Error("private prompt"));
+    const ctx = makeCtx();
+    const result = await execute({ ...ctx, stageRuntimePrompt } as AdapterExecutionContext);
+
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+    expect(result.errorMessage).toBe("Failed to prepare the runtime prompt download");
+    expect(getBatchApi().createNamespacedJob).not.toHaveBeenCalled();
+    expect(getCoreApi().createNamespacedSecret).not.toHaveBeenCalled();
+  });
+
+  it("reports the size limit before creating a Secret or Job when compression is insufficient", async () => {
+    mockLargePrompt(randomBytes(1536 * 1024).toString("base64"));
+    const coreApi = makeCoreApi();
+    const batchApi = makeBatchApi();
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+    expect(result.errorMessage).toContain("exceeds the Kubernetes Secret limit of 1048576 bytes");
+    expect(coreApi.createNamespacedSecret).not.toHaveBeenCalled();
+    expect(coreApi.deleteNamespacedSecret).not.toHaveBeenCalled();
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
   });
 
   it("patches the Secret with a Job ownerReference after Job creation", async () => {

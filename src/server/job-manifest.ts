@@ -107,6 +107,62 @@ function buildOpencodeMcpSection(merged: Record<string, unknown>): Record<string
 // MAX_ARG_STRLEN with headroom for command line + other env values.
 export const LARGE_PROMPT_THRESHOLD_BYTES = 100 * 1024;
 
+const RUNTIME_PROMPT_TOKEN = "PAPERCLIP_RUNTIME_PROMPT_TOKEN";
+const DOWNLOAD_RUNTIME_PROMPT = `
+const { copyFileSync, createWriteStream, rmSync } = require("node:fs");
+const { Readable } = require("node:stream");
+const { Transform } = require("node:stream");
+const { pipeline } = require("node:stream/promises");
+const { setTimeout: delay } = require("node:timers/promises");
+if (process.argv[1] === "copy-mcp") {
+  copyFileSync("/tmp/mcp-secret/opencode.json", "/tmp/prompt/opencode.json");
+}
+async function download() {
+  const maxBytes = 16 * 1024 * 1024;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const response = await fetch(process.env.PAPERCLIP_RUNTIME_PROMPT_URL, {
+        headers: { Authorization: "Bearer " + process.env.PAPERCLIP_RUNTIME_PROMPT_TOKEN },
+        redirect: "error",
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (response.status !== 200 || !response.body) {
+        await response.body?.cancel();
+        if (response.status < 500 && response.status !== 429) {
+          console.error("[paperclip] Prompt download returned HTTP " + response.status);
+          process.exitCode = 1;
+          return;
+        }
+        throw new Error("Prompt endpoint temporarily unavailable");
+      }
+      if (!response.headers.get("content-type")?.startsWith("text/plain")) {
+        await response.body.cancel();
+        console.error("[paperclip] Prompt endpoint did not return plain text");
+        process.exitCode = 1;
+        return;
+      }
+      const contentLength = Number(response.headers.get("content-length") || 0);
+      if (contentLength > maxBytes) throw new Error("Prompt response exceeds the runtime limit");
+      let bytes = 0;
+      const bounded = new Transform({
+        transform(chunk, _encoding, callback) {
+          bytes += chunk.length;
+          callback(bytes > maxBytes ? new Error("Prompt response exceeds the runtime limit") : null, chunk);
+        },
+      });
+      await pipeline(Readable.fromWeb(response.body), bounded, createWriteStream("/tmp/prompt/prompt.txt", { mode: 0o600 }));
+      return;
+    } catch {
+      rmSync("/tmp/prompt/prompt.txt", { force: true });
+      if (attempt < 2) await delay(1000 * (attempt + 1));
+    }
+  }
+  console.error("[paperclip] Failed to download the runtime prompt");
+  process.exitCode = 1;
+}
+void download();
+`;
+
 const RUNTIME_CACHE_VOLUME_NAME = "runtime-cache";
 const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
 const RUNTIME_CACHE_SIZE_LIMIT = "20Gi";
@@ -376,10 +432,12 @@ export interface JobBuildInput {
   skillsBundleContent?: string;
   /**
    * When set, the prompt is stored in this K8s Secret (already created by the caller)
-   * and the init container mounts and copies it instead of using an env var.
-   * Required when the prompt exceeds LARGE_PROMPT_THRESHOLD_BYTES.
+   * and the init container mounts and decompresses it instead of using an env var.
+   * Used for prompts above LARGE_PROMPT_THRESHOLD_BYTES on older hosts.
    */
   promptSecretName?: string;
+  /** Private run prompt staged by the Paperclip host before this Job is created. */
+  runtimePromptPath?: string;
   /**
    * Claim name of the dedicated agent DB PVC (dedicated_pvc mode) or null for ephemeral emptyDir.
    * When provided (string or null), mounts /opencode-db and sets OPENCODE_DB=/opencode-db.
@@ -1082,6 +1140,18 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const envSecretName = `${jobName}-env`;
   const builtEnv = buildEnvVars(ctx, selfPod, config, isolation, envSecretName);
   const envVars = builtEnv.envVars;
+  let runtimePromptUrl: string | undefined;
+  if (input.runtimePromptPath) {
+    const base = new URL(selfPod.inheritedEnv.PAPERCLIP_API_URL || process.env.PAPERCLIP_API_URL || "");
+    const expectedPath = `/api/heartbeat-runs/${encodeURIComponent(ctx.runId)}/runtime-prompt`;
+    if (input.runtimePromptPath !== expectedPath || !["http:", "https:"].includes(base.protocol) ||
+        base.username || base.password || !ctx.authToken) {
+      throw new Error("Runtime prompt download requires the Paperclip API origin and a run token");
+    }
+    const url = new URL(base.pathname.replace(/\/+$/, "") + expectedPath, base);
+    runtimePromptUrl = url.href;
+    builtEnv.sensitiveEnvData[RUNTIME_PROMPT_TOKEN] = ctx.authToken;
+  }
   const envSecret: EnvSecret | null = Object.keys(builtEnv.sensitiveEnvData).length > 0
     ? { name: envSecretName, namespace, data: builtEnv.sensitiveEnvData }
     : null;
@@ -1536,13 +1606,20 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
               // Ponytail-only configuration stays in the safe XDG config that
               // the main container writes; OPENCODE_CONFIG is only needed when
               // MCP entries replace that config source.
-              const cmdParts = input.promptSecretName
-                ? ["cp /tmp/prompt-secret/prompt /tmp/prompt/prompt.txt"]
-                : [`printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt`];
-              const initEnv: k8s.V1EnvVar[] = input.promptSecretName
-                ? []
-                : [{ name: "PROMPT_CONTENT", value: prompt }];
-              if (mcpConfigSecret) {
+              const cmdParts: string[] = [];
+              const initEnv: k8s.V1EnvVar[] = [];
+              if (runtimePromptUrl) {
+                initEnv.push(
+                  { name: "PAPERCLIP_RUNTIME_PROMPT_URL", value: runtimePromptUrl },
+                  { name: RUNTIME_PROMPT_TOKEN, valueFrom: { secretKeyRef: { name: envSecretName, key: RUNTIME_PROMPT_TOKEN } } },
+                );
+              } else if (input.promptSecretName) {
+                cmdParts.push("gzip -dc /tmp/prompt-secret/prompt.gz > /tmp/prompt/prompt.txt");
+              } else {
+                cmdParts.push(`printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt`);
+                initEnv.push({ name: "PROMPT_CONTENT", value: prompt });
+              }
+              if (mcpConfigSecret && !runtimePromptUrl) {
                 cmdParts.push("cp /tmp/mcp-secret/opencode.json /tmp/prompt/opencode.json");
               }
               const initVolumeMounts: k8s.V1VolumeMount[] = [
@@ -1556,15 +1633,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
               }
               const initContainer: k8s.V1Container = {
                 name: "write-prompt",
-                image: "busybox:1.36",
+                image: runtimePromptUrl ? selfPod.image : "busybox:1.36",
                 imagePullPolicy: "IfNotPresent",
-                command: ["sh", "-c", cmdParts.join("; ")],
+                command: runtimePromptUrl
+                  ? ["node", "-e", DOWNLOAD_RUNTIME_PROMPT, ...(mcpConfigSecret ? ["copy-mcp"] : [])]
+                  : ["sh", "-c", cmdParts.join(" && ")],
                 ...(initEnv.length > 0 ? { env: initEnv } : {}),
                 volumeMounts: initVolumeMounts,
                 securityContext,
                 resources: {
                   requests: { cpu: "10m", memory: "16Mi" },
-                  limits: { cpu: "100m", memory: "64Mi" },
+                  limits: { cpu: "100m", memory: runtimePromptUrl ? "128Mi" : "64Mi" },
                 },
               };
               return initContainer;

@@ -63,7 +63,8 @@ Notes:
 - Skills configured in Paperclip have their markdown content read from the PVC and prepended to each run prompt
 - Desired skills are resolved from config (paperclipSkills / paperclipRuntimeSkills) at execute time
 - instructionsFilePath content is prepended before skill content, then before the task prompt
-- Prompts are delivered via a busybox init container writing to an emptyDir volume
+- On Paperclip hosts with runtime prompt staging, the init container downloads the prompt from the Paperclip API with the signed run token. The API URL must be reachable from the Job.
+- Older hosts deliver the prompt through the init container environment or a mounted prompt Secret.
 - Runtime config (permission.external_directory=allow) is written inside the Job container
 - OPENCODE_DISABLE_PROJECT_CONFIG=true is always set to prevent config file pollution
 - When agentCommand points at an external launcher, the launcher receives PENSTOCK_AGENT_COMMAND=opencode and PENSTOCK_PROVIDER=openai by default, and OpenCode's own auth files are left untouched.

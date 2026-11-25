@@ -4,6 +4,7 @@ import { asString, asNumber, asBoolean, parseObject, readPaperclipRuntimeSkillEn
 import { readFile, open as fsOpen, stat as fsStat, writeFile as fsWriteFile, mkdtemp, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { gzipSync } from "node:zlib";
 import {
   parseOpenCodeJsonl,
   isOpenCodeUnknownSessionError,
@@ -24,6 +25,7 @@ const POLL_INTERVAL_MS = 2000;
 // brief apiserver blips without aborting a healthy run (BLO-10448).
 const MAX_CONSECUTIVE_READ_ERRORS = 5;
 const KEEPALIVE_INTERVAL_MS = 15_000;
+const MAX_SECRET_DATA_BYTES = 1024 * 1024;
 const K8S_CONCURRENCY_GUARD_TIMEOUT_MS = 15_000;
 const LOG_EXIT_COMPLETION_GRACE_MS = parseInt(process.env.LOG_EXIT_COMPLETION_GRACE_MS ?? "30000", 10);
 const DEFAULT_COMPACT_THRESHOLD = 90_000;
@@ -1898,18 +1900,32 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const firstBuild = buildJobManifest(buildArgs);
   const { jobName, namespace, prompt, opencodeArgs, promptMetrics, podLogPath } = firstBuild;
 
-  // For prompts larger than the threshold, store in a K8s Secret
+  // Older hosts still use the environment or a prompt Secret.
+  const { stageRuntimePrompt } = ctx as AdapterExecutionContext & {
+    stageRuntimePrompt?: (prompt: string) => Promise<string>;
+  };
   let promptSecretName: string | undefined;
-  let job = firstBuild.job;
-  let envSecret = firstBuild.envSecret ?? null;
-  let mcpConfigSecret = firstBuild.mcpConfigSecret ?? null;
-  if (Buffer.byteLength(prompt, "utf-8") > LARGE_PROMPT_THRESHOLD_BYTES) {
+  let built = firstBuild;
+  if (stageRuntimePrompt) {
+    try {
+      const runtimePromptPath = await stageRuntimePrompt(prompt);
+      if (!runtimePromptPath) throw new Error("Missing runtime prompt path");
+      built = buildJobManifest({ ...buildArgs, runtimePromptPath });
+    } catch {
+      await onLog("stderr", "[paperclip] Failed to prepare the runtime prompt download\n");
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        errorMessage: "Failed to prepare the runtime prompt download",
+        errorCode: "k8s_job_create_failed",
+      };
+    }
+  } else if (Buffer.byteLength(prompt, "utf-8") > LARGE_PROMPT_THRESHOLD_BYTES) {
     promptSecretName = `${jobName}-prompt`;
-    const rebuilt = buildJobManifest({ ...buildArgs, promptSecretName });
-    job = rebuilt.job;
-    envSecret = rebuilt.envSecret ?? null;
-    mcpConfigSecret = rebuilt.mcpConfigSecret ?? null;
+    built = buildJobManifest({ ...buildArgs, promptSecretName });
   }
+  const { job, envSecret, mcpConfigSecret } = built;
 
   if (onMeta) {
     await onMeta({
@@ -1946,18 +1962,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   // Create the prompt Secret before the Job
   if (promptSecretName) {
-    const promptSecret: k8s.V1Secret = {
-      apiVersion: "v1",
-      kind: "Secret",
-      metadata: { name: promptSecretName, namespace, labels: job.metadata?.labels },
-      stringData: { prompt },
-    };
     try {
-      await coreApi.createNamespacedSecret({ namespace, body: promptSecret });
+      const compressedPrompt = gzipSync(prompt);
+      // shortcut: one Secret holds at most 1 MiB after compression, shard prompts if they exceed that in practice.
+      if (compressedPrompt.length > MAX_SECRET_DATA_BYTES) {
+        throw new Error(`Compressed prompt is ${compressedPrompt.length} bytes and exceeds the Kubernetes Secret limit of ${MAX_SECRET_DATA_BYTES} bytes`);
+      }
+      const promptSecret: k8s.V1Secret = {
+        apiVersion: "v1",
+        kind: "Secret",
+        metadata: { name: promptSecretName, namespace, labels: job.metadata?.labels },
+        data: { "prompt.gz": compressedPrompt.toString("base64") },
+      };
       preparedSecretNames.add(promptSecretName);
+      await coreApi.createNamespacedSecret({ namespace, body: promptSecret });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      await cleanupPreparedSecrets([promptSecretName]);
+      await cleanupPreparedSecrets();
       await onLog("stderr", `[paperclip] Failed to create prompt Secret: ${msg}\n`);
       return {
         exitCode: null,
