@@ -833,7 +833,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
               // small (a few kB) so it travels via env var even when prompt itself
               // goes the Secret-volume route.
               const cmdParts = input.promptSecretName
-                ? ["cp /tmp/prompt-secret/prompt /tmp/prompt/prompt.txt"]
+                ? ["base64 -d /tmp/prompt-secret/prompt.gz.b64 | gzip -d > /tmp/prompt/prompt.txt"]
                 : [`printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt`];
               const initEnv: k8s.V1EnvVar[] = input.promptSecretName
                 ? []

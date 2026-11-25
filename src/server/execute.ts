@@ -4,6 +4,7 @@ import { asString, asNumber, asBoolean, parseObject, readPaperclipRuntimeSkillEn
 import { readFile, open as fsOpen, stat as fsStat, writeFile as fsWriteFile, mkdtemp, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { gzipSync } from "node:zlib";
 import {
   parseOpenCodeJsonl,
   isOpenCodeUnknownSessionError,
@@ -1339,7 +1340,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       apiVersion: "v1",
       kind: "Secret",
       metadata: { name: promptSecretName, namespace, labels: job.metadata?.labels },
-      stringData: { prompt },
+      // Kubernetes rejects Secret objects larger than 1 MiB. Compress the
+      // prompt before storing it while keeping the payload text-safe.
+      stringData: { "prompt.gz.b64": gzipSync(prompt).toString("base64") },
     };
     try {
       await coreApi.createNamespacedSecret({ namespace, body: promptSecret });

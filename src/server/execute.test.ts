@@ -3,6 +3,7 @@ import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { execute, ensureAgentDbPvc, tailPodLogFile, mergeEnvironmentConfig } from "./execute.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
 import { PassThrough } from "node:stream";
+import { gunzipSync } from "node:zlib";
 import { buildJobManifest, buildPodLogPath } from "./job-manifest.js";
 
 // Mock node:fs/promises so tailPodLogFile (used by execute()) reads a
@@ -1136,10 +1137,12 @@ describe("execute — large-prompt Secret path", () => {
         namespace: NAMESPACE,
         body: expect.objectContaining({
           metadata: expect.objectContaining({ name: `${JOB_NAME}-prompt` }),
-          stringData: expect.objectContaining({ prompt: LARGE_PROMPT }),
+          stringData: expect.objectContaining({ "prompt.gz.b64": expect.any(String) }),
         }),
       }),
     );
+    const secret = vi.mocked(coreApi.createNamespacedSecret).mock.calls[0][0].body;
+    expect(gunzipSync(Buffer.from(secret.stringData!["prompt.gz.b64"], "base64")).toString()).toBe(LARGE_PROMPT);
     // Secret must be created before Job
     const secretOrder = coreApi.createNamespacedSecret.mock.invocationCallOrder[0];
     const jobOrder = batchApi.createNamespacedJob.mock.invocationCallOrder[0];
